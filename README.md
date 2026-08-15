@@ -57,6 +57,7 @@ $env:FCD_AUTH_FAILURE_ALERT_THRESHOLD="10"
 $env:FCD_RATE_LIMIT_ALERT_THRESHOLD="10"
 $env:FCD_SERVER_ERROR_ALERT_THRESHOLD="5"
 $env:FCD_MAX_UPLOAD_BYTES="5242880"
+$env:FCD_ALLOWED_UPLOAD_CONTENT_TYPES="application/pdf,text/plain,image/png,image/jpeg"
 ```
 
 Notes:
@@ -65,6 +66,7 @@ Notes:
 - Role levels: `viewer` (read), `operator` (write), `admin` (metrics/ops).
 - `FCD_MANIFEST_VERIFY_KEYS` enables key-rotation verification windows.
 - `FCD_MAX_UPLOAD_BYTES` enforces maximum uploaded artifact size.
+- `FCD_ALLOWED_UPLOAD_CONTENT_TYPES` restricts evidence uploads by MIME type.
 
 ### Web Interface
 - Open `http://127.0.0.1:8000/` for the in-app operations UI.

@@ -164,6 +164,10 @@ def _parse_key_map(raw: str, *, field_name: str) -> dict[str, str]:
     return keys
 
 
+def _parse_csv_tokens(raw: str) -> tuple[str, ...]:
+    return tuple(token.strip() for token in raw.split(",") if token.strip())
+
+
 def create_app(
     *,
     db_path: str = "data/escalator.db",
@@ -180,6 +184,7 @@ def create_app(
     rate_limit_alert_threshold: int | None = None,
     server_error_alert_threshold: int | None = None,
     max_upload_bytes: int | None = None,
+    allowed_upload_content_types: tuple[str, ...] | None = None,
 ) -> FastAPI:
     effective_env = (app_env or os.getenv("FCD_APP_ENV", "development")).strip().lower()
     if manifest_signing_key == "dev-only-signing-key":
@@ -218,6 +223,14 @@ def create_app(
     effective_max_upload_bytes = max_upload_bytes
     if effective_max_upload_bytes is None:
         effective_max_upload_bytes = int(os.getenv("FCD_MAX_UPLOAD_BYTES", "5242880"))
+    effective_allowed_upload_content_types = allowed_upload_content_types
+    if effective_allowed_upload_content_types is None:
+        raw_upload_types = os.getenv(
+            "FCD_ALLOWED_UPLOAD_CONTENT_TYPES",
+            "application/pdf,text/plain,image/png,image/jpeg",
+        )
+        effective_allowed_upload_content_types = _parse_csv_tokens(raw_upload_types)
+    allowed_upload_content_type_set = {item.lower() for item in effective_allowed_upload_content_types}
 
     app = FastAPI(title="Unpaid Invoice Escalator API")
     security = ApiSecurityController(
@@ -298,6 +311,17 @@ def create_app(
         "error",
         f"Max upload bytes set to {effective_max_upload_bytes}.",
     )
+    _append_check(
+        "allowed-upload-content-types",
+        len(effective_allowed_upload_content_types) > 0,
+        "error",
+        (
+            "Allowed upload content types configured: "
+            + ", ".join(effective_allowed_upload_content_types)
+            if effective_allowed_upload_content_types
+            else "No allowed upload content types configured."
+        ),
+    )
 
     def _runtime_readiness_checks() -> list[dict[str, str | bool]]:
         checks: list[dict[str, str | bool]] = []
@@ -338,6 +362,7 @@ def create_app(
             "verification_key_ids": sorted(verification_keys.keys()),
             "rate_limit_per_minute": effective_rate_limit,
             "max_upload_bytes": effective_max_upload_bytes,
+            "allowed_upload_content_types": list(effective_allowed_upload_content_types),
             "checks": combined_checks,
             "errors": errors,
             "warnings": warnings,
@@ -879,6 +904,15 @@ def create_app(
             raise HTTPException(
                 status_code=413,
                 detail=f"Uploaded file exceeds max allowed size ({effective_max_upload_bytes} bytes).",
+            )
+        content_type = (file.content_type or "").strip().lower()
+        if content_type not in allowed_upload_content_type_set:
+            raise HTTPException(
+                status_code=415,
+                detail=(
+                    "Unsupported file content type. Allowed types: "
+                    + ", ".join(effective_allowed_upload_content_types)
+                ),
             )
         output_path.write_bytes(content)
         artifact = ledger.record_evidence_artifact(

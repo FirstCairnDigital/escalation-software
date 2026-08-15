@@ -277,6 +277,40 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(upload_resp.status_code, 413)
 
+    def test_upload_content_type_allowlist_enforced(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-content-type.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=artifacts_dir,
+                bundles_dir=bundles_dir,
+                allowed_upload_content_types=("application/pdf",),
+            )
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-ct",
+                    "currency": "GBP",
+                    "principal_amount": "100",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            upload_resp = client.post(
+                "/invoices/inv-api-ct/evidence-artifacts",
+                data={"user_id": "client-1", "artifact_type": "CONTRACT"},
+                files={"file": ("contract.txt", b"contract terms", "text/plain")},
+            )
+            self.assertEqual(upload_resp.status_code, 415)
+
 
 if __name__ == "__main__":
     unittest.main()
