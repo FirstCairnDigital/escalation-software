@@ -32,6 +32,45 @@ class TestApi(unittest.TestCase):
                 },
             )
             self.assertEqual(create_resp.status_code, 200)
+            legal_gate_resp = client.post(
+                "/invoices/inv-api-1/legal-safety-gate/confirm",
+                json={
+                    "user_id": "USER-102",
+                    "amount_claimed_gbp": "2800",
+                    "payments_recorded_gbp": "0",
+                    "authorised_to_act": True,
+                    "info_accurate": True,
+                    "invoice_unpaid": True,
+                    "payments_recorded_complete": True,
+                    "genuine_supporting_docs": True,
+                    "no_unresolved_dispute": True,
+                    "commercial_not_excluded": True,
+                },
+            )
+            self.assertEqual(legal_gate_resp.status_code, 200)
+            self.assertTrue(legal_gate_resp.json()["accepted"])
+
+            discrepancy_resp = client.post(
+                "/invoices/inv-api-1/discrepancy-check",
+                json={
+                    "claim_amount": "2800",
+                    "evidence_document_amount": "2800",
+                    "principal": "2800",
+                    "payments_recorded": "0",
+                    "outstanding_entered": "2800",
+                },
+            )
+            self.assertEqual(discrepancy_resp.status_code, 200)
+            self.assertEqual(discrepancy_resp.json()["status"], "VALIDATED")
+
+            compliance_resp = client.get("/invoices/inv-api-1/compliance-ledger")
+            self.assertEqual(compliance_resp.status_code, 200)
+            self.assertGreaterEqual(compliance_resp.json()["count"], 2)
+
+            five_ledger_resp = client.get("/invoices/inv-api-1/five-ledger-summary")
+            self.assertEqual(five_ledger_resp.status_code, 200)
+            self.assertEqual(five_ledger_resp.json()["compliance_ledger_events_count"], 2)
+
             fee_action_resp = client.post(
                 "/invoices/inv-api-1/client-fee-ledger/actions",
                 json={
@@ -310,6 +349,43 @@ class TestApi(unittest.TestCase):
                 files={"file": ("contract.txt", b"contract terms", "text/plain")},
             )
             self.assertEqual(upload_resp.status_code, 415)
+
+    def test_legal_safety_gate_requires_all_declarations(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-gate.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-gate",
+                    "currency": "GBP",
+                    "principal_amount": "100",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+            gate_resp = client.post(
+                "/invoices/inv-api-gate/legal-safety-gate/confirm",
+                json={
+                    "user_id": "USER-1",
+                    "amount_claimed_gbp": "100",
+                    "payments_recorded_gbp": "0",
+                    "authorised_to_act": True,
+                    "info_accurate": True,
+                    "invoice_unpaid": True,
+                    "payments_recorded_complete": False,
+                    "genuine_supporting_docs": True,
+                    "no_unresolved_dispute": True,
+                    "commercial_not_excluded": True,
+                },
+            )
+            self.assertEqual(gate_resp.status_code, 400)
 
     def test_upload_rejection_quarantine_and_metrics(self) -> None:
         with TemporaryDirectory() as tmp_dir:

@@ -168,3 +168,12 @@ class PreOverdueHygieneRecord:
     warning_tier: str = "NONE"
     format_warnings: tuple[str, ...] = ()
     notes: str = ""
+
+
+@dataclass(frozen=True)
+class ComplianceLedgerEntry:
+    entry_id: str
+    invoice_id: str
+    timestamp: datetime
+    event_type: str
+    details: dict[str, Any] = field(default_factory=dict)

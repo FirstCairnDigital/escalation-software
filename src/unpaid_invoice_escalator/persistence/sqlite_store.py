@@ -14,6 +14,7 @@ from unpaid_invoice_escalator.models import (
     ArtifactType,
     ClientFeeAction,
     ClientFeeEntry,
+    ComplianceLedgerEntry,
     DebtorLedgerEntry,
     DebtorLedgerEntryType,
     DebtorType,
@@ -163,6 +164,18 @@ class SQLiteStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS compliance_ledger_entries (
+                    entry_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
             hygiene_columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(pre_overdue_hygiene_records)").fetchall()
@@ -205,6 +218,12 @@ class SQLiteStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_hygiene_records_invoice_time
                 ON pre_overdue_hygiene_records(invoice_id, timestamp)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_compliance_ledger_invoice_time
+                ON compliance_ledger_entries(invoice_id, timestamp)
                 """
             )
             conn.execute(
@@ -318,6 +337,24 @@ class SQLiteStore:
                 BEFORE DELETE ON pre_overdue_hygiene_records
                 BEGIN
                     SELECT RAISE(ABORT, 'pre_overdue_hygiene_records is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_compliance_ledger_no_update
+                BEFORE UPDATE ON compliance_ledger_entries
+                BEGIN
+                    SELECT RAISE(ABORT, 'compliance_ledger_entries is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_compliance_ledger_no_delete
+                BEFORE DELETE ON compliance_ledger_entries
+                BEGIN
+                    SELECT RAISE(ABORT, 'compliance_ledger_entries is append-only');
                 END;
                 """
             )
@@ -700,6 +737,46 @@ class SQLiteStore:
                 warning_tier=row["warning_tier"],
                 format_warnings=tuple(json.loads(row["format_warnings_json"])),
                 notes=row["notes"],
+            )
+            for row in rows
+        )
+
+    def append_compliance_entry(self, entry: ComplianceLedgerEntry) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO compliance_ledger_entries (
+                    entry_id, invoice_id, timestamp, event_type, details_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    entry.entry_id,
+                    entry.invoice_id,
+                    entry.timestamp.isoformat(),
+                    entry.event_type,
+                    json.dumps(entry.details, sort_keys=True, separators=(",", ":"), default=str),
+                ),
+            )
+            conn.commit()
+
+    def compliance_entries_for_invoice(self, invoice_id: str) -> tuple[ComplianceLedgerEntry, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT entry_id, invoice_id, timestamp, event_type, details_json
+                FROM compliance_ledger_entries
+                WHERE invoice_id = ?
+                ORDER BY timestamp ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            ComplianceLedgerEntry(
+                entry_id=row["entry_id"],
+                invoice_id=row["invoice_id"],
+                timestamp=datetime.fromisoformat(row["timestamp"]),
+                event_type=row["event_type"],
+                details=json.loads(row["details_json"]),
             )
             for row in rows
         )

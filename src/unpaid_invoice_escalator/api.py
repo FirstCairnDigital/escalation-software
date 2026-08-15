@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 import json
 import os
@@ -18,6 +18,7 @@ from unpaid_invoice_escalator.models import (
     Actor,
     ArtifactType,
     ClientFeeAction,
+    ComplianceLedgerEntry,
     DebtorLedgerEntryType,
     DebtorType,
     Invoice,
@@ -28,10 +29,13 @@ from unpaid_invoice_escalator.models import (
 from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
 from unpaid_invoice_escalator.rulepacks import RulePackLoader, RulePackValidationError
 from unpaid_invoice_escalator.services.dual_ledger_engine import DualLedgerEngine
+from unpaid_invoice_escalator.services.data_discrepancy_validator import DataDiscrepancyValidator
 from unpaid_invoice_escalator.services.escalation_runner import EscalationRunner
+from unpaid_invoice_escalator.services.five_ledger_engine import FiveLedgerEngine
 from unpaid_invoice_escalator.services.jurisdiction_engine import JurisdictionFacts
 from unpaid_invoice_escalator.services.ledger_manifest_exporter import LedgerManifestExporter
 from unpaid_invoice_escalator.services.late_payment_engine import LatePaymentEngine
+from unpaid_invoice_escalator.services.legal_safety_gate_manager import LegalSafetyGateManager
 from unpaid_invoice_escalator.services.pre_overdue_hygiene_engine import PreOverdueHygieneEngine
 from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
 from unpaid_invoice_escalator.security import ApiSecurityController, ROLE_RANK
@@ -133,6 +137,27 @@ class PreOverdueHygieneRequest(BaseModel):
     proof_of_delivery_required: bool = True
     suggested_clause_text: str | None = None
     notes: str = ""
+
+
+class LegalSafetyGateConfirmRequest(BaseModel):
+    user_id: str
+    amount_claimed_gbp: Decimal
+    payments_recorded_gbp: Decimal = Decimal("0")
+    authorised_to_act: bool
+    info_accurate: bool
+    invoice_unpaid: bool
+    payments_recorded_complete: bool
+    genuine_supporting_docs: bool
+    no_unresolved_dispute: bool
+    commercial_not_excluded: bool
+
+
+class DiscrepancyCheckRequest(BaseModel):
+    claim_amount: Decimal
+    evidence_document_amount: Decimal
+    principal: Decimal
+    payments_recorded: Decimal
+    outstanding_entered: Decimal
 
 
 def _parse_api_keys(raw: str) -> dict[str, str]:
@@ -266,6 +291,9 @@ def create_app(
     rule_pack_loader = RulePackLoader()
     dual_ledger_engine = DualLedgerEngine(store=store, event_ledger=ledger)
     hygiene_engine = PreOverdueHygieneEngine()
+    discrepancy_validator = DataDiscrepancyValidator()
+    legal_safety_gate_manager = LegalSafetyGateManager(store=store, event_ledger=ledger)
+    five_ledger_engine = FiveLedgerEngine(store=store)
     artifacts_root = Path(artifacts_dir)
     bundles_root = Path(bundles_dir)
     quarantine_root = Path(effective_quarantine_dir)
@@ -583,6 +611,107 @@ def create_app(
             "chain_valid": store.verify_chain(invoice_id),
         }
 
+    @app.get("/invoices/{invoice_id}/five-ledger-summary")
+    def get_five_ledger_summary(invoice_id: str) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        summary = five_ledger_engine.summarize(invoice_id=invoice_id)
+        return {
+            "invoice_id": invoice_id,
+            "financial_ledger_balance_gbp": str(summary.financial_balance_gbp),
+            "evidence_ledger_artifacts_count": summary.evidence_artifacts_count,
+            "event_audit_ledger_events_count": summary.event_audit_events_count,
+            "compliance_ledger_events_count": summary.compliance_events_count,
+            "fcd_billing_ledger_balance_gbp": str(summary.fcd_billing_balance_gbp),
+        }
+
+    @app.post("/invoices/{invoice_id}/legal-safety-gate/confirm")
+    def confirm_legal_safety_gate(invoice_id: str, payload: LegalSafetyGateConfirmRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        declarations = {
+            "authorised_to_act": payload.authorised_to_act,
+            "info_accurate": payload.info_accurate,
+            "invoice_unpaid": payload.invoice_unpaid,
+            "payments_recorded_complete": payload.payments_recorded_complete,
+            "genuine_supporting_docs": payload.genuine_supporting_docs,
+            "no_unresolved_dispute": payload.no_unresolved_dispute,
+            "commercial_not_excluded": payload.commercial_not_excluded,
+        }
+        missing = [key for key, value in declarations.items() if not value]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail="All legal safety declarations must be accepted before formal escalation.",
+            )
+        result = legal_safety_gate_manager.confirm(
+            invoice=invoice,
+            user_id=payload.user_id,
+            amount_claimed_gbp=payload.amount_claimed_gbp,
+            payments_recorded_gbp=payload.payments_recorded_gbp,
+            declarations=declarations,
+        )
+        return {
+            "invoice_id": invoice_id,
+            "accepted": result.accepted,
+            "declaration_version": result.declaration_version,
+            "disclaimer_text": result.disclaimer_text,
+            "compliance_entry_id": result.compliance_entry_id,
+            "recorded_at": result.recorded_at.isoformat(),
+            "chain_valid": store.verify_chain(invoice_id),
+        }
+
+    @app.post("/invoices/{invoice_id}/discrepancy-check")
+    def discrepancy_check(invoice_id: str, payload: DiscrepancyCheckRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        result = discrepancy_validator.validate(
+            claim_amount=payload.claim_amount,
+            evidence_document_amount=payload.evidence_document_amount,
+            principal=payload.principal,
+            payments_recorded=payload.payments_recorded,
+            outstanding_entered=payload.outstanding_entered,
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.SYSTEM,
+            event_type="DISCREPANCY_VALIDATION",
+            data_payload={
+                "valid": result.valid,
+                "status": result.status,
+                "reasons": list(result.reasons),
+                "circuit_breaker_triggered": result.circuit_breaker_triggered,
+                "suggested_state": result.suggested_state,
+            },
+        )
+        store.append_compliance_entry(
+            entry=ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=datetime.now(timezone.utc),
+                event_type="DISCREPANCY_VALIDATION",
+                details={
+                    "valid": result.valid,
+                    "status": result.status,
+                    "reasons": list(result.reasons),
+                    "circuit_breaker_triggered": result.circuit_breaker_triggered,
+                    "suggested_state": result.suggested_state,
+                },
+            )
+        )
+        return {
+            "invoice_id": invoice_id,
+            "valid": result.valid,
+            "status": result.status,
+            "reasons": list(result.reasons),
+            "circuit_breaker_triggered": result.circuit_breaker_triggered,
+            "suggested_state": result.suggested_state,
+            "chain_valid": store.verify_chain(invoice_id),
+        }
+
     @app.get("/invoices/{invoice_id}/evidence-artifacts")
     def list_evidence_artifacts(
         invoice_id: str,
@@ -660,6 +789,26 @@ def create_app(
                     "hash": event.hash,
                 }
                 for event in selected
+            ],
+        }
+
+    @app.get("/invoices/{invoice_id}/compliance-ledger")
+    def list_compliance_entries(invoice_id: str) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        entries = store.compliance_entries_for_invoice(invoice_id)
+        return {
+            "invoice_id": invoice_id,
+            "count": len(entries),
+            "entries": [
+                {
+                    "entry_id": entry.entry_id,
+                    "timestamp": entry.timestamp.isoformat(),
+                    "event_type": entry.event_type,
+                    "details": entry.details,
+                }
+                for entry in entries
             ],
         }
 
