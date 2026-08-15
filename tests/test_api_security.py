@@ -211,6 +211,7 @@ class TestApiSecurity(unittest.TestCase):
                 app_env="development",
                 max_upload_bytes=0,
                 allowed_upload_content_types=(),
+                allowed_upload_extensions=(),
             )
             with TestClient(app) as client:
                 ready_resp = client.get("/ready")
@@ -219,6 +220,7 @@ class TestApiSecurity(unittest.TestCase):
                 self.assertEqual(body["status"], "not_ready")
                 self.assertFalse(body["ready"])
                 self.assertIn("allowed-upload-content-types", {entry["check"] for entry in body["errors"]})
+                self.assertIn("allowed-upload-extensions", {entry["check"] for entry in body["errors"]})
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 

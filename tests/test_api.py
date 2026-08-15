@@ -311,6 +311,60 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(upload_resp.status_code, 415)
 
+    def test_upload_rejection_quarantine_and_metrics(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-quarantine.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            quarantine_dir = str(Path(tmp_dir) / "quarantine")
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=artifacts_dir,
+                bundles_dir=bundles_dir,
+                quarantine_dir=quarantine_dir,
+                allowed_upload_extensions=(".pdf",),
+                allowed_upload_content_types=("application/pdf",),
+            )
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-quarantine",
+                    "currency": "GBP",
+                    "principal_amount": "100",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            upload_resp = client.post(
+                "/invoices/inv-api-quarantine/evidence-artifacts",
+                data={"user_id": "client-1", "artifact_type": "CONTRACT"},
+                files={"file": ("payload.exe", b"malicious", "application/octet-stream")},
+            )
+            self.assertEqual(upload_resp.status_code, 415)
+            self.assertIn("Quarantine reference:", upload_resp.json()["detail"])
+
+            metrics_resp = client.get("/metrics")
+            self.assertEqual(metrics_resp.status_code, 200)
+            metrics_body = metrics_resp.json()
+            self.assertEqual(metrics_body["upload_rejected_total"], 1)
+            self.assertEqual(metrics_body["upload_quarantined_total"], 1)
+            self.assertGreaterEqual(
+                metrics_body["upload_rejections_by_reason"].get(
+                    "Unsupported file extension. Allowed extensions: .pdf",
+                    0,
+                ),
+                1,
+            )
+
+            quarantine_files = list((Path(quarantine_dir) / "inv-api-quarantine").glob("*"))
+            self.assertGreaterEqual(len(quarantine_files), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

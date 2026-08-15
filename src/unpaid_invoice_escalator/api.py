@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 from typing import Literal
 from uuid import uuid4
@@ -34,6 +36,8 @@ from unpaid_invoice_escalator.services.pre_overdue_hygiene_engine import PreOver
 from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
 from unpaid_invoice_escalator.security import ApiSecurityController, ROLE_RANK
 from unpaid_invoice_escalator.ui import render_home_html, render_invoice_workspace_html
+
+SAFE_UPLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class InvoiceCreateRequest(BaseModel):
@@ -185,6 +189,8 @@ def create_app(
     server_error_alert_threshold: int | None = None,
     max_upload_bytes: int | None = None,
     allowed_upload_content_types: tuple[str, ...] | None = None,
+    allowed_upload_extensions: tuple[str, ...] | None = None,
+    quarantine_dir: str | None = None,
 ) -> FastAPI:
     effective_env = (app_env or os.getenv("FCD_APP_ENV", "development")).strip().lower()
     if manifest_signing_key == "dev-only-signing-key":
@@ -231,6 +237,12 @@ def create_app(
         )
         effective_allowed_upload_content_types = _parse_csv_tokens(raw_upload_types)
     allowed_upload_content_type_set = {item.lower() for item in effective_allowed_upload_content_types}
+    effective_allowed_upload_extensions = allowed_upload_extensions
+    if effective_allowed_upload_extensions is None:
+        raw_upload_extensions = os.getenv("FCD_ALLOWED_UPLOAD_EXTENSIONS", ".pdf,.txt,.png,.jpg,.jpeg")
+        effective_allowed_upload_extensions = tuple(token.lower() for token in _parse_csv_tokens(raw_upload_extensions))
+    allowed_upload_extension_set = {token.lower() for token in effective_allowed_upload_extensions}
+    effective_quarantine_dir = quarantine_dir or os.getenv("FCD_QUARANTINE_DIR", "data/quarantine")
 
     app = FastAPI(title="Unpaid Invoice Escalator API")
     security = ApiSecurityController(
@@ -256,8 +268,10 @@ def create_app(
     hygiene_engine = PreOverdueHygieneEngine()
     artifacts_root = Path(artifacts_dir)
     bundles_root = Path(bundles_dir)
+    quarantine_root = Path(effective_quarantine_dir)
     artifacts_root.mkdir(parents=True, exist_ok=True)
     bundles_root.mkdir(parents=True, exist_ok=True)
+    quarantine_root.mkdir(parents=True, exist_ok=True)
 
     startup_checks: list[dict[str, str | bool]] = []
 
@@ -322,6 +336,22 @@ def create_app(
             else "No allowed upload content types configured."
         ),
     )
+    _append_check(
+        "allowed-upload-extensions",
+        len(effective_allowed_upload_extensions) > 0,
+        "error",
+        (
+            "Allowed upload extensions configured: " + ", ".join(effective_allowed_upload_extensions)
+            if effective_allowed_upload_extensions
+            else "No allowed upload extensions configured."
+        ),
+    )
+    _append_check(
+        "upload-filename-policy",
+        True,
+        "warning",
+        "Strict filename policy enforces alphanumeric/._- names and max length 128.",
+    )
 
     def _runtime_readiness_checks() -> list[dict[str, str | bool]]:
         checks: list[dict[str, str | bool]] = []
@@ -339,7 +369,11 @@ def create_app(
         except sqlite3.Error as exc:
             add_runtime_check("database-connectivity", False, f"SQLite connectivity failed: {exc}")
 
-        for check_name, directory in (("artifacts-directory-writable", artifacts_root), ("bundles-directory-writable", bundles_root)):
+        for check_name, directory in (
+            ("artifacts-directory-writable", artifacts_root),
+            ("bundles-directory-writable", bundles_root),
+            ("quarantine-directory-writable", quarantine_root),
+        ):
             probe_path = directory / ".readycheck.tmp"
             try:
                 probe_path.write_text("ok", encoding="utf-8")
@@ -363,6 +397,8 @@ def create_app(
             "rate_limit_per_minute": effective_rate_limit,
             "max_upload_bytes": effective_max_upload_bytes,
             "allowed_upload_content_types": list(effective_allowed_upload_content_types),
+            "allowed_upload_extensions": list(effective_allowed_upload_extensions),
+            "quarantine_dir": str(quarantine_root),
             "checks": combined_checks,
             "errors": errors,
             "warnings": warnings,
@@ -393,13 +429,16 @@ def create_app(
                 "title": "Validate runtime dependencies",
                 "completed": check_map.get("database-connectivity", False)
                 and check_map.get("artifacts-directory-writable", False)
-                and check_map.get("bundles-directory-writable", False),
+                and check_map.get("bundles-directory-writable", False)
+                and check_map.get("quarantine-directory-writable", False),
                 "detail": "Confirm DB access and writable storage locations.",
             },
             {
                 "step": 4,
                 "title": "Validate operational guardrails",
-                "completed": check_map.get("max-upload-bytes", False),
+                "completed": check_map.get("max-upload-bytes", False)
+                and check_map.get("allowed-upload-content-types", False)
+                and check_map.get("allowed-upload-extensions", False),
                 "detail": "Confirm upload size limits and request controls are active.",
             },
         ]
@@ -897,23 +936,93 @@ def create_app(
             raise HTTPException(status_code=404, detail="Invoice not found.")
         invoice_dir = artifacts_root / invoice_id
         invoice_dir.mkdir(parents=True, exist_ok=True)
-        output_name = f"{uuid4()}_{Path(file.filename or 'artifact.bin').name}"
-        output_path = invoice_dir / output_name
+        original_filename = Path(file.filename or "").name
         content = await file.read()
+
+        def quarantine_and_raise(*, status_code: int, reason: str) -> None:
+            quarantine_id = str(uuid4())
+            quarantine_invoice_dir = quarantine_root / invoice_id
+            quarantine_invoice_dir.mkdir(parents=True, exist_ok=True)
+            fallback_name = "unknown.bin" if not original_filename else original_filename
+            quarantine_name = f"{quarantine_id}_{Path(fallback_name).name}"
+            quarantine_path = quarantine_invoice_dir / quarantine_name
+            metadata_path = quarantine_invoice_dir / f"{quarantine_id}.json"
+            try:
+                quarantine_path.write_bytes(content)
+                metadata_path.write_text(
+                    json.dumps(
+                        {
+                            "quarantine_id": quarantine_id,
+                            "invoice_id": invoice_id,
+                            "reason": reason,
+                            "filename": fallback_name,
+                            "content_type": (file.content_type or "").strip(),
+                            "size_bytes": len(content),
+                        },
+                        ensure_ascii=True,
+                    ),
+                    encoding="utf-8",
+                )
+                ledger.append_event(
+                    invoice_id=invoice_id,
+                    actor=Actor.SYSTEM,
+                    event_type="EVIDENCE_UPLOAD_QUARANTINED",
+                    data_payload={
+                        "quarantine_id": quarantine_id,
+                        "reason": reason,
+                        "filename": fallback_name,
+                        "content_type": (file.content_type or "").strip(),
+                        "size_bytes": len(content),
+                        "quarantine_path": str(quarantine_path),
+                    },
+                )
+                security.record_upload_rejection(reason=reason, quarantined=True)
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=f"{reason} Quarantine reference: {quarantine_id}",
+                )
+            except OSError as exc:
+                security.record_upload_rejection(reason=reason, quarantined=False)
+                ledger.append_event(
+                    invoice_id=invoice_id,
+                    actor=Actor.SYSTEM,
+                    event_type="EVIDENCE_UPLOAD_REJECTED",
+                    data_payload={
+                        "reason": reason,
+                        "filename": fallback_name,
+                        "content_type": (file.content_type or "").strip(),
+                        "size_bytes": len(content),
+                        "quarantine_error": str(exc),
+                    },
+                )
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=f"{reason} Upload rejected and quarantine storage failed.",
+                )
+
+        if not original_filename or not SAFE_UPLOAD_FILENAME_RE.match(original_filename):
+            quarantine_and_raise(status_code=400, reason="Filename violates upload naming policy.")
+
+        extension = Path(original_filename).suffix.lower()
+        if extension not in allowed_upload_extension_set:
+            quarantine_and_raise(
+                status_code=415,
+                reason=("Unsupported file extension. Allowed extensions: " + ", ".join(effective_allowed_upload_extensions)),
+            )
+
         if len(content) > effective_max_upload_bytes:
-            raise HTTPException(
+            quarantine_and_raise(
                 status_code=413,
-                detail=f"Uploaded file exceeds max allowed size ({effective_max_upload_bytes} bytes).",
+                reason=f"Uploaded file exceeds max allowed size ({effective_max_upload_bytes} bytes).",
             )
         content_type = (file.content_type or "").strip().lower()
         if content_type not in allowed_upload_content_type_set:
-            raise HTTPException(
+            quarantine_and_raise(
                 status_code=415,
-                detail=(
-                    "Unsupported file content type. Allowed types: "
-                    + ", ".join(effective_allowed_upload_content_types)
-                ),
+                reason=("Unsupported file content type. Allowed types: " + ", ".join(effective_allowed_upload_content_types)),
             )
+        output_name = f"{uuid4()}_{original_filename}"
+        output_path = invoice_dir / output_name
         output_path.write_bytes(content)
         artifact = ledger.record_evidence_artifact(
             invoice_id=invoice_id,

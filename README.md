@@ -58,6 +58,8 @@ $env:FCD_RATE_LIMIT_ALERT_THRESHOLD="10"
 $env:FCD_SERVER_ERROR_ALERT_THRESHOLD="5"
 $env:FCD_MAX_UPLOAD_BYTES="5242880"
 $env:FCD_ALLOWED_UPLOAD_CONTENT_TYPES="application/pdf,text/plain,image/png,image/jpeg"
+$env:FCD_ALLOWED_UPLOAD_EXTENSIONS=".pdf,.txt,.png,.jpg,.jpeg"
+$env:FCD_QUARANTINE_DIR="data/quarantine"
 ```
 
 Notes:
@@ -67,6 +69,8 @@ Notes:
 - `FCD_MANIFEST_VERIFY_KEYS` enables key-rotation verification windows.
 - `FCD_MAX_UPLOAD_BYTES` enforces maximum uploaded artifact size.
 - `FCD_ALLOWED_UPLOAD_CONTENT_TYPES` restricts evidence uploads by MIME type.
+- `FCD_ALLOWED_UPLOAD_EXTENSIONS` restricts evidence uploads by filename extension.
+- `FCD_QUARANTINE_DIR` stores rejected upload payloads and metadata for audit review.
 
 ### Web Interface
 - Open `http://127.0.0.1:8000/` for the in-app operations UI.
@@ -155,6 +159,14 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
   - check list (pass/fail + severity + detail)
   - aggregated `errors` and `warnings`
 - `GET /deployment/runbook` returns deployment action steps with completion flags based on current checks.
+
+## Upload Rejection & Quarantine
+- Rejected uploads (size/type/extension/filename policy) are quarantined with a reference ID.
+- Quarantine actions are written to the tamper-evident event ledger.
+- `GET /metrics` includes:
+  - `upload_rejected_total`
+  - `upload_quarantined_total`
+  - `upload_rejections_by_reason`
 
 ## Deployment Runbook (Minimal)
 1. Set production environment variables (above).

@@ -46,6 +46,9 @@ class ApiSecurityController:
         self._auth_fail_count = 0
         self._forbidden_count = 0
         self._server_error_count = 0
+        self._upload_rejected_count = 0
+        self._upload_quarantined_count = 0
+        self._upload_rejections_by_reason: dict[str, int] = {}
         self._audit_events: deque[dict[str, object]] = deque(maxlen=max(1, audit_log_limit))
         self._last_alert: str | None = None
         self._active_alerts: set[str] = set()
@@ -167,6 +170,20 @@ class ApiSecurityController:
                 detail="Server error threshold reached.",
             )
 
+    def record_upload_rejection(self, *, reason: str, quarantined: bool) -> None:
+        self._upload_rejected_count += 1
+        if quarantined:
+            self._upload_quarantined_count += 1
+        self._upload_rejections_by_reason[reason] = self._upload_rejections_by_reason.get(reason, 0) + 1
+        self._record_audit_event(
+            event_type="UPLOAD_REJECTED",
+            severity="WARN",
+            method=None,
+            path=None,
+            identity="system",
+            detail=f"reason={reason} quarantined={quarantined}",
+        )
+
     def _record_audit_event(
         self,
         *,
@@ -214,6 +231,9 @@ class ApiSecurityController:
             "forbidden_total": self._forbidden_count,
             "rate_limited_total": self._rate_limited_count,
             "server_errors_total": self._server_error_count,
+            "upload_rejected_total": self._upload_rejected_count,
+            "upload_quarantined_total": self._upload_quarantined_count,
+            "upload_rejections_by_reason": dict(self._upload_rejections_by_reason),
             "alert_policy": {
                 "auth_failure_alert_threshold": self.auth_failure_alert_threshold,
                 "rate_limit_alert_threshold": self.rate_limit_alert_threshold,
