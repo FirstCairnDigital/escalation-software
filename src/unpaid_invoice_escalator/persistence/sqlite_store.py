@@ -14,6 +14,9 @@ from unpaid_invoice_escalator.models import (
     ArtifactType,
     ClientFeeAction,
     ClientFeeEntry,
+    CommunicationDeliveryEvent,
+    CommunicationDeliveryState,
+    CommunicationRecord,
     ComplianceLedgerEntry,
     DebtorLedgerEntry,
     DebtorLedgerEntryType,
@@ -198,6 +201,34 @@ class SQLiteStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS communications (
+                    communication_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body_summary TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS communication_delivery_events (
+                    event_id TEXT PRIMARY KEY,
+                    communication_id TEXT NOT NULL,
+                    invoice_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(communication_id) REFERENCES communications(communication_id),
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS payment_plan_agreements (
                     plan_id TEXT PRIMARY KEY,
                     invoice_id TEXT NOT NULL,
@@ -344,6 +375,18 @@ class SQLiteStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_verification_cases_invoice
                 ON debtor_verification_cases(invoice_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_communications_invoice_time
+                ON communications(invoice_id, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_comm_delivery_events_comm_time
+                ON communication_delivery_events(communication_id, timestamp)
                 """
             )
             conn.execute(
@@ -523,6 +566,42 @@ class SQLiteStore:
                 BEFORE DELETE ON debtor_verification_cases
                 BEGIN
                     SELECT RAISE(ABORT, 'debtor_verification_cases is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_communications_no_update
+                BEFORE UPDATE ON communications
+                BEGIN
+                    SELECT RAISE(ABORT, 'communications is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_communications_no_delete
+                BEFORE DELETE ON communications
+                BEGIN
+                    SELECT RAISE(ABORT, 'communications is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_communication_delivery_events_no_update
+                BEFORE UPDATE ON communication_delivery_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'communication_delivery_events is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_communication_delivery_events_no_delete
+                BEFORE DELETE ON communication_delivery_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'communication_delivery_events is append-only');
                 END;
                 """
             )
@@ -1034,6 +1113,139 @@ class SQLiteStore:
             invoice_reference=row["invoice_reference"],
             verification_code_hash=row["verification_code_hash"],
             created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    def append_communication(self, record: CommunicationRecord) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO communications (
+                    communication_id, invoice_id, channel, recipient, subject, body_summary, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.communication_id,
+                    record.invoice_id,
+                    record.channel,
+                    record.recipient,
+                    record.subject,
+                    record.body_summary,
+                    record.created_at.isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def communication_for_id(self, communication_id: str) -> CommunicationRecord | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT communication_id, invoice_id, channel, recipient, subject, body_summary, created_at
+                FROM communications
+                WHERE communication_id = ?
+                """,
+                (communication_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return CommunicationRecord(
+            communication_id=row["communication_id"],
+            invoice_id=row["invoice_id"],
+            channel=row["channel"],
+            recipient=row["recipient"],
+            subject=row["subject"],
+            body_summary=row["body_summary"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    def communications_for_invoice(self, invoice_id: str) -> tuple[CommunicationRecord, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT communication_id, invoice_id, channel, recipient, subject, body_summary, created_at
+                FROM communications
+                WHERE invoice_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            CommunicationRecord(
+                communication_id=row["communication_id"],
+                invoice_id=row["invoice_id"],
+                channel=row["channel"],
+                recipient=row["recipient"],
+                subject=row["subject"],
+                body_summary=row["body_summary"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+            )
+            for row in rows
+        )
+
+    def append_communication_delivery_event(self, event: CommunicationDeliveryEvent) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO communication_delivery_events (
+                    event_id, communication_id, invoice_id, state, timestamp, note
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.event_id,
+                    event.communication_id,
+                    event.invoice_id,
+                    event.state.value,
+                    event.timestamp.isoformat(),
+                    event.note,
+                ),
+            )
+            conn.commit()
+
+    def communication_delivery_events_for_communication(
+        self, communication_id: str
+    ) -> tuple[CommunicationDeliveryEvent, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT event_id, communication_id, invoice_id, state, timestamp, note
+                FROM communication_delivery_events
+                WHERE communication_id = ?
+                ORDER BY timestamp ASC, rowid ASC
+                """,
+                (communication_id,),
+            ).fetchall()
+        return tuple(
+            CommunicationDeliveryEvent(
+                event_id=row["event_id"],
+                communication_id=row["communication_id"],
+                invoice_id=row["invoice_id"],
+                state=CommunicationDeliveryState(row["state"]),
+                timestamp=datetime.fromisoformat(row["timestamp"]),
+                note=row["note"],
+            )
+            for row in rows
+        )
+
+    def communication_delivery_events_for_invoice(self, invoice_id: str) -> tuple[CommunicationDeliveryEvent, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT event_id, communication_id, invoice_id, state, timestamp, note
+                FROM communication_delivery_events
+                WHERE invoice_id = ?
+                ORDER BY timestamp ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            CommunicationDeliveryEvent(
+                event_id=row["event_id"],
+                communication_id=row["communication_id"],
+                invoice_id=row["invoice_id"],
+                state=CommunicationDeliveryState(row["state"]),
+                timestamp=datetime.fromisoformat(row["timestamp"]),
+                note=row["note"],
+            )
+            for row in rows
         )
 
     def append_payment_plan_agreement(self, agreement: PaymentPlanAgreement) -> None:

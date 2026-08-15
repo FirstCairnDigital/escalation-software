@@ -9,6 +9,9 @@ import unittest
 from unpaid_invoice_escalator.models import (
     Actor,
     ClientFeeAction,
+    CommunicationDeliveryEvent,
+    CommunicationDeliveryState,
+    CommunicationRecord,
     ComplianceLedgerEntry,
     DebtorVerificationCase,
     DebtorType,
@@ -160,6 +163,57 @@ class TestSQLiteStore(unittest.TestCase):
                 conn.rollback()
                 with self.assertRaises(sqlite3.DatabaseError):
                     conn.execute("DELETE FROM payment_plan_agreements")
+                conn.rollback()
+            finally:
+                conn.close()
+
+    def test_communication_delivery_tables_are_append_only(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "escalator.db")
+            store = SQLiteStore(db_path)
+            invoice = Invoice(
+                invoice_id="inv-db-8",
+                currency="GBP",
+                principal_amount=Decimal("300"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            record = CommunicationRecord(
+                communication_id="comm-1",
+                invoice_id=invoice.invoice_id,
+                channel="EMAIL",
+                recipient="debtor@example.com",
+                subject="Reminder",
+                body_summary="Summary",
+                created_at=datetime.now(timezone.utc),
+            )
+            store.append_communication(record)
+            store.append_communication_delivery_event(
+                CommunicationDeliveryEvent(
+                    event_id="comm-evt-1",
+                    communication_id=record.communication_id,
+                    invoice_id=invoice.invoice_id,
+                    state=CommunicationDeliveryState.CREATED,
+                    timestamp=datetime.now(timezone.utc),
+                    note="created",
+                )
+            )
+            conn = sqlite3.connect(db_path)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("UPDATE communications SET recipient = 'new@example.com'")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM communications")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("UPDATE communication_delivery_events SET state = 'SENT'")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM communication_delivery_events")
                 conn.rollback()
             finally:
                 conn.close()

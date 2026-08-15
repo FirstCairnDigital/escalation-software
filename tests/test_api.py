@@ -75,6 +75,28 @@ class TestApi(unittest.TestCase):
             self.assertIn("resolution_options", portal_resp.json())
             self.assertIn("Data Processor", portal_resp.json()["source_of_data_notice"])
 
+            comm_create_resp = client.post(
+                "/invoices/inv-api-1/communications",
+                json={
+                    "channel": "EMAIL",
+                    "recipient": "accounts@example.com",
+                    "subject": "Invoice reminder",
+                    "body_summary": "Friendly reminder for outstanding invoice.",
+                },
+            )
+            self.assertEqual(comm_create_resp.status_code, 200)
+            communication_id = comm_create_resp.json()["communication_id"]
+            self.assertEqual(comm_create_resp.json()["delivery_state"], "CREATED")
+            for state in ("QUEUED", "SENT", "DELIVERED", "OPENED"):
+                comm_state_resp = client.post(
+                    f"/invoices/inv-api-1/communications/{communication_id}/delivery-events",
+                    json={"state": state, "note": f"{state} update"},
+                )
+                self.assertEqual(comm_state_resp.status_code, 200)
+            comm_list_resp = client.get("/invoices/inv-api-1/communications")
+            self.assertEqual(comm_list_resp.status_code, 200)
+            self.assertEqual(comm_list_resp.json()["communications"][0]["latest_state"], "OPENED")
+
             legal_gate_resp = client.post(
                 "/invoices/inv-api-1/legal-safety-gate/confirm",
                 json={
@@ -595,6 +617,100 @@ class TestApi(unittest.TestCase):
                 },
             )
             self.assertEqual(blocked_resp.status_code, 409)
+
+    def test_escalation_blocked_on_delivery_failure_until_requeued(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-delivery-block.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-delivery",
+                    "currency": "GBP",
+                    "principal_amount": "700",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+            health_resp = client.post(
+                "/invoices/inv-api-delivery/case-health-check",
+                json={
+                    "user_id": "USER-1",
+                    "correct_customer_legal_entity": True,
+                    "description_of_goods_or_services": True,
+                    "invoice_number_and_date_verified": True,
+                    "amount_matches_contract_or_quote": True,
+                    "correct_billing_address": True,
+                    "vat_numbers_checked": True,
+                    "purchase_order_supplied_if_required": True,
+                    "payment_terms_and_due_date_established": True,
+                    "delivery_or_acceptance_proof_attached": True,
+                    "no_unresolved_credit_notes": True,
+                    "direct_payments_checked": True,
+                    "no_known_dispute": True,
+                    "creditor_authority_verified": True,
+                    "limitation_period_checked": True,
+                    "debtor_contact_details_verified": True,
+                    "court_handoff_boundary_acknowledged": True,
+                },
+            )
+            self.assertEqual(health_resp.status_code, 200)
+            discrepancy_resp = client.post(
+                "/invoices/inv-api-delivery/discrepancy-check",
+                json={
+                    "claim_amount": "700",
+                    "evidence_document_amount": "700",
+                    "principal": "700",
+                    "payments_recorded": "0",
+                    "outstanding_entered": "700",
+                },
+            )
+            self.assertEqual(discrepancy_resp.status_code, 200)
+            comm_resp = client.post(
+                "/invoices/inv-api-delivery/communications",
+                json={
+                    "channel": "EMAIL",
+                    "recipient": "debtor@example.com",
+                    "subject": "Notice",
+                    "body_summary": "Notice summary",
+                },
+            )
+            self.assertEqual(comm_resp.status_code, 200)
+            communication_id = comm_resp.json()["communication_id"]
+            client.post(
+                f"/invoices/inv-api-delivery/communications/{communication_id}/delivery-events",
+                json={"state": "QUEUED", "note": "queued"},
+            )
+            client.post(
+                f"/invoices/inv-api-delivery/communications/{communication_id}/delivery-events",
+                json={"state": "SENT", "note": "sent"},
+            )
+            fail_resp = client.post(
+                f"/invoices/inv-api-delivery/communications/{communication_id}/delivery-events",
+                json={"state": "BOUNCED", "note": "bounced"},
+            )
+            self.assertEqual(fail_resp.status_code, 200)
+            blocked_escalate = client.post(
+                "/invoices/inv-api-delivery/escalate",
+                json={"today": "2026-02-01", "current_state": "OVERDUE_CHASER"},
+            )
+            self.assertEqual(blocked_escalate.status_code, 409)
+            requeue_resp = client.post(
+                f"/invoices/inv-api-delivery/communications/{communication_id}/delivery-events",
+                json={"state": "QUEUED", "note": "contact corrected and requeued"},
+            )
+            self.assertEqual(requeue_resp.status_code, 200)
+            resumed_escalate = client.post(
+                "/invoices/inv-api-delivery/escalate",
+                json={"today": "2026-02-01", "current_state": "OVERDUE_CHASER"},
+            )
+            self.assertEqual(resumed_escalate.status_code, 200)
 
     def test_upload_rejection_quarantine_and_metrics(self) -> None:
         with TemporaryDirectory() as tmp_dir:

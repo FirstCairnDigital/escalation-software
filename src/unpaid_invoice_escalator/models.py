@@ -77,6 +77,17 @@ class InvoiceState(str, Enum):
     RESOLVED_PAID = "RESOLVED_PAID"
 
 
+class CommunicationDeliveryState(str, Enum):
+    CREATED = "CREATED"
+    QUEUED = "QUEUED"
+    SENT = "SENT"
+    DELIVERED = "DELIVERED"
+    OPENED = "OPENED"
+    BOUNCED = "BOUNCED"
+    REJECTED = "REJECTED"
+    RETURNED = "RETURNED"
+
+
 @dataclass(frozen=True)
 class Invoice:
     invoice_id: str
@@ -258,3 +269,24 @@ class DisputeCarveOut:
     undisputed_amount_gbp: Decimal
     reason: str
     created_by: str
+
+
+@dataclass(frozen=True)
+class CommunicationRecord:
+    communication_id: str
+    invoice_id: str
+    channel: str
+    recipient: str
+    subject: str
+    body_summary: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class CommunicationDeliveryEvent:
+    event_id: str
+    communication_id: str
+    invoice_id: str
+    state: CommunicationDeliveryState
+    timestamp: datetime
+    note: str = ""

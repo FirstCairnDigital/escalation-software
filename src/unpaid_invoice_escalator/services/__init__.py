@@ -1,6 +1,7 @@
 from .dual_ledger_engine import DualLedgerEngine, LedgerBalances
 from .case_health_check import CaseHealthCheck, CaseHealthCheckResult
 from .communication_severity_engine import CommunicationPreview, CommunicationSeverityEngine
+from .communication_delivery_tracker import CommunicationDeliverySnapshot, CommunicationDeliveryTracker
 from .data_discrepancy_validator import DataDiscrepancyValidator, DiscrepancyValidationResult
 from .debtor_verification_portal import (
     DebtorVerificationPortal,
@@ -28,6 +29,8 @@ __all__ = [
     "CaseHealthCheckResult",
     "CommunicationPreview",
     "CommunicationSeverityEngine",
+    "CommunicationDeliverySnapshot",
+    "CommunicationDeliveryTracker",
     "DataDiscrepancyValidator",
     "DiscrepancyValidationResult",
     "DebtorVerificationPortal",

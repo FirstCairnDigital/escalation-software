@@ -98,6 +98,9 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `POST /invoices`
 - `GET /invoices/{invoice_id}`
 - `GET /invoices/{invoice_id}/communication-preview?state=&on_date=YYYY-MM-DD`
+- `POST /invoices/{invoice_id}/communications`
+- `POST /invoices/{invoice_id}/communications/{communication_id}/delivery-events`
+- `GET /invoices/{invoice_id}/communications`
 - `POST /invoices/{invoice_id}/case-health-check`
 - `POST /invoices/{invoice_id}/devils-advocate-check`
 - `GET /invoices/{invoice_id}/five-ledger-summary`
@@ -213,6 +216,12 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
   - `message`
   - `guardrail_flags`
 - Guardrails automatically rewrite banned urgency/legal-pressure phrases into neutral procedural language.
+
+## Communication Delivery Lifecycle
+- Delivery states are tracked as append-only events:
+  - `CREATED -> QUEUED -> SENT -> DELIVERED -> OPENED`
+  - failure branches: `BOUNCED`, `REJECTED`, `RETURNED`
+- If a communication is in a failure state, escalation is blocked until contact details are corrected and delivery is re-queued.
 
 ## Deployment Runbook (Minimal)
 1. Set production environment variables (above).

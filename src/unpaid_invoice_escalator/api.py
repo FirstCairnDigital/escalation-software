@@ -18,6 +18,7 @@ from unpaid_invoice_escalator.models import (
     Actor,
     ArtifactType,
     ClientFeeAction,
+    CommunicationDeliveryState,
     ComplianceLedgerEntry,
     DebtorLedgerEntryType,
     DebtorType,
@@ -30,6 +31,7 @@ from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
 from unpaid_invoice_escalator.rulepacks import RulePackLoader, RulePackValidationError
 from unpaid_invoice_escalator.services.dual_ledger_engine import DualLedgerEngine
 from unpaid_invoice_escalator.services.case_health_check import CaseHealthCheck
+from unpaid_invoice_escalator.services.communication_delivery_tracker import CommunicationDeliveryTracker
 from unpaid_invoice_escalator.services.communication_severity_engine import CommunicationSeverityEngine
 from unpaid_invoice_escalator.services.data_discrepancy_validator import DataDiscrepancyValidator
 from unpaid_invoice_escalator.services.debtor_verification_portal import DebtorVerificationPortal
@@ -256,6 +258,18 @@ class ViabilityAssessmentRequest(BaseModel):
     company_status: str = "UNKNOWN"
 
 
+class CommunicationCreateRequest(BaseModel):
+    channel: str
+    recipient: str
+    subject: str
+    body_summary: str
+
+
+class CommunicationDeliveryUpdateRequest(BaseModel):
+    state: CommunicationDeliveryState
+    note: str = ""
+
+
 def _parse_api_keys(raw: str) -> dict[str, str]:
     keys: dict[str, str] = {}
     for item in raw.split(","):
@@ -395,6 +409,7 @@ def create_app(
     debtor_verification_portal = DebtorVerificationPortal(store=store)
     resolution_engine = ResolutionAndSettlementEngine(store=store, event_ledger=ledger)
     communication_severity_engine = CommunicationSeverityEngine(rule_pack_loader=rule_pack_loader)
+    communication_delivery_tracker = CommunicationDeliveryTracker(store=store, event_ledger=ledger)
     viability_calculator = ViabilityProportionalityCalculator(store=store)
     artifacts_root = Path(artifacts_dir)
     bundles_root = Path(bundles_dir)
@@ -567,6 +582,10 @@ def create_app(
             "trg_settlement_acceptances_no_delete",
             "trg_dispute_carve_outs_no_update",
             "trg_dispute_carve_outs_no_delete",
+            "trg_communications_no_update",
+            "trg_communications_no_delete",
+            "trg_communication_delivery_events_no_update",
+            "trg_communication_delivery_events_no_delete",
         )
         try:
             conn = sqlite3.connect(db_path)
@@ -698,6 +717,15 @@ def create_app(
             if status.status in {"ACTIVE", "DEFAULTED"}:
                 return plan.plan_id, status.status
         return None, None
+
+    def _has_unresolved_delivery_failure(invoice_id: str) -> bool:
+        failed_states = {
+            CommunicationDeliveryState.BOUNCED,
+            CommunicationDeliveryState.REJECTED,
+            CommunicationDeliveryState.RETURNED,
+        }
+        snapshots = communication_delivery_tracker.snapshots_for_invoice(invoice_id)
+        return any(snapshot.latest_state in failed_states for snapshot in snapshots)
 
     @app.middleware("http")
     async def security_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
@@ -902,6 +930,107 @@ def create_app(
             "template_version": preview.template_version,
             "message": preview.message,
             "guardrail_flags": list(preview.guardrail_flags),
+        }
+
+    @app.post("/invoices/{invoice_id}/communications")
+    def create_communication(invoice_id: str, payload: CommunicationCreateRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        snapshot = communication_delivery_tracker.create_communication(
+            invoice_id=invoice_id,
+            channel=payload.channel,
+            recipient=payload.recipient,
+            subject=payload.subject,
+            body_summary=payload.body_summary,
+        )
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=snapshot.communication.created_at,
+                event_type="COMMUNICATION_CREATED",
+                details={
+                    "communication_id": snapshot.communication.communication_id,
+                    "channel": snapshot.communication.channel,
+                    "recipient": snapshot.communication.recipient,
+                    "delivery_state": snapshot.latest_state.value,
+                },
+            )
+        )
+        return {
+            "invoice_id": invoice_id,
+            "communication_id": snapshot.communication.communication_id,
+            "delivery_state": snapshot.latest_state.value,
+            "created_at": snapshot.communication.created_at.isoformat(),
+        }
+
+    @app.post("/invoices/{invoice_id}/communications/{communication_id}/delivery-events")
+    def update_communication_delivery(
+        invoice_id: str, communication_id: str, payload: CommunicationDeliveryUpdateRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        try:
+            snapshot = communication_delivery_tracker.record_delivery_event(
+                invoice_id=invoice_id,
+                communication_id=communication_id,
+                next_state=payload.state,
+                note=payload.note,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        latest_event = snapshot.events[-1]
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=latest_event.timestamp,
+                event_type="COMMUNICATION_DELIVERY_STATE_UPDATED",
+                details={
+                    "communication_id": communication_id,
+                    "state": latest_event.state.value,
+                    "note": latest_event.note,
+                },
+            )
+        )
+        return {
+            "invoice_id": invoice_id,
+            "communication_id": communication_id,
+            "delivery_state": latest_event.state.value,
+            "recorded_at": latest_event.timestamp.isoformat(),
+        }
+
+    @app.get("/invoices/{invoice_id}/communications")
+    def list_communications(invoice_id: str) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        snapshots = communication_delivery_tracker.snapshots_for_invoice(invoice_id)
+        return {
+            "invoice_id": invoice_id,
+            "communications": [
+                {
+                    "communication_id": item.communication.communication_id,
+                    "channel": item.communication.channel,
+                    "recipient": item.communication.recipient,
+                    "subject": item.communication.subject,
+                    "body_summary": item.communication.body_summary,
+                    "created_at": item.communication.created_at.isoformat(),
+                    "latest_state": item.latest_state.value,
+                    "events": [
+                        {
+                            "event_id": evt.event_id,
+                            "state": evt.state.value,
+                            "timestamp": evt.timestamp.isoformat(),
+                            "note": evt.note,
+                        }
+                        for evt in item.events
+                    ],
+                }
+                for item in snapshots
+            ],
         }
 
     @app.post("/invoices/{invoice_id}/case-health-check")
@@ -1892,6 +2021,11 @@ def create_app(
             raise HTTPException(
                 status_code=409,
                 detail="Escalation blocked while debtor data-accuracy challenge is open.",
+            )
+        if _has_unresolved_delivery_failure(invoice_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Escalation blocked due to communication delivery failure. Verify debtor contact details first.",
             )
         viability = viability_calculator.assess(
             invoice=invoice,
