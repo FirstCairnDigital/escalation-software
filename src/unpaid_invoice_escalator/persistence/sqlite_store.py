@@ -15,17 +15,23 @@ from unpaid_invoice_escalator.models import (
     ClientFeeAction,
     ClientFeeEntry,
     ComplianceLedgerEntry,
-    DebtorVerificationCase,
     DebtorLedgerEntry,
     DebtorLedgerEntryType,
+    DebtorVerificationCase,
+    DisputeCarveOut,
     DebtorType,
     EvidenceArtifact,
     Invoice,
     InvoiceState,
     Jurisdiction,
     LedgerEvent,
+    PaymentPlanAgreement,
+    PaymentPlanInstallment,
+    PaymentPlanPayment,
     PreOverdueHygieneRecord,
     RecoveryCostCategory,
+    SettlementAcceptance,
+    SettlementOffer,
 )
 
 
@@ -190,6 +196,94 @@ class SQLiteStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payment_plan_agreements (
+                    plan_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    proposed_by TEXT NOT NULL,
+                    installment_amount_gbp TEXT NOT NULL,
+                    installment_count INTEGER NOT NULL,
+                    first_due_date TEXT NOT NULL,
+                    frequency_days INTEGER NOT NULL,
+                    notes TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payment_plan_installments (
+                    installment_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL,
+                    invoice_id TEXT NOT NULL,
+                    due_date TEXT NOT NULL,
+                    amount_gbp TEXT NOT NULL,
+                    sequence_number INTEGER NOT NULL,
+                    FOREIGN KEY(plan_id) REFERENCES payment_plan_agreements(plan_id),
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payment_plan_payments (
+                    payment_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL,
+                    installment_id TEXT NOT NULL,
+                    invoice_id TEXT NOT NULL,
+                    paid_at TEXT NOT NULL,
+                    amount_gbp TEXT NOT NULL,
+                    recorded_by TEXT NOT NULL,
+                    FOREIGN KEY(plan_id) REFERENCES payment_plan_agreements(plan_id),
+                    FOREIGN KEY(installment_id) REFERENCES payment_plan_installments(installment_id),
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS settlement_offers (
+                    offer_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    offered_at TEXT NOT NULL,
+                    offered_by TEXT NOT NULL,
+                    offered_amount_gbp TEXT NOT NULL,
+                    expiry_date TEXT NOT NULL,
+                    notes TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS settlement_acceptances (
+                    acceptance_id TEXT PRIMARY KEY,
+                    offer_id TEXT NOT NULL,
+                    invoice_id TEXT NOT NULL,
+                    accepted_at TEXT NOT NULL,
+                    accepted_by TEXT NOT NULL,
+                    accepter_role TEXT NOT NULL,
+                    FOREIGN KEY(offer_id) REFERENCES settlement_offers(offer_id),
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dispute_carve_outs (
+                    carve_out_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    disputed_amount_gbp TEXT NOT NULL,
+                    undisputed_amount_gbp TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
             hygiene_columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(pre_overdue_hygiene_records)").fetchall()
@@ -250,6 +344,42 @@ class SQLiteStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_verification_cases_invoice
                 ON debtor_verification_cases(invoice_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_payment_plans_invoice
+                ON payment_plan_agreements(invoice_id, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_payment_installments_plan
+                ON payment_plan_installments(plan_id, sequence_number)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_payment_plan_payments_installment
+                ON payment_plan_payments(installment_id, paid_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_settlement_offers_invoice
+                ON settlement_offers(invoice_id, offered_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_settlement_acceptances_offer
+                ON settlement_acceptances(offer_id, accepted_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dispute_carve_outs_invoice
+                ON dispute_carve_outs(invoice_id, created_at)
                 """
             )
             conn.execute(
@@ -396,6 +526,32 @@ class SQLiteStore:
                 END;
                 """
             )
+            for table_name in (
+                "payment_plan_agreements",
+                "payment_plan_installments",
+                "payment_plan_payments",
+                "settlement_offers",
+                "settlement_acceptances",
+                "dispute_carve_outs",
+            ):
+                conn.execute(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS trg_{table_name}_no_update
+                    BEFORE UPDATE ON {table_name}
+                    BEGIN
+                        SELECT RAISE(ABORT, '{table_name} is append-only');
+                    END;
+                    """
+                )
+                conn.execute(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS trg_{table_name}_no_delete
+                    BEFORE DELETE ON {table_name}
+                    BEGIN
+                        SELECT RAISE(ABORT, '{table_name} is append-only');
+                    END;
+                    """
+                )
             conn.commit()
 
     def create_invoice(self, invoice: Invoice) -> None:
@@ -878,4 +1034,297 @@ class SQLiteStore:
             invoice_reference=row["invoice_reference"],
             verification_code_hash=row["verification_code_hash"],
             created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    def append_payment_plan_agreement(self, agreement: PaymentPlanAgreement) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO payment_plan_agreements (
+                    plan_id, invoice_id, created_at, proposed_by, installment_amount_gbp,
+                    installment_count, first_due_date, frequency_days, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    agreement.plan_id,
+                    agreement.invoice_id,
+                    agreement.created_at.isoformat(),
+                    agreement.proposed_by,
+                    str(agreement.installment_amount_gbp),
+                    agreement.installment_count,
+                    agreement.first_due_date.isoformat(),
+                    agreement.frequency_days,
+                    agreement.notes,
+                ),
+            )
+            conn.commit()
+
+    def append_payment_plan_installments(self, installments: tuple[PaymentPlanInstallment, ...]) -> None:
+        if not installments:
+            return
+        with self._connection() as conn:
+            conn.executemany(
+                """
+                INSERT INTO payment_plan_installments (
+                    installment_id, plan_id, invoice_id, due_date, amount_gbp, sequence_number
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        item.installment_id,
+                        item.plan_id,
+                        item.invoice_id,
+                        item.due_date.isoformat(),
+                        str(item.amount_gbp),
+                        item.sequence_number,
+                    )
+                    for item in installments
+                ],
+            )
+            conn.commit()
+
+    def payment_plan_agreements_for_invoice(self, invoice_id: str) -> tuple[PaymentPlanAgreement, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT plan_id, invoice_id, created_at, proposed_by, installment_amount_gbp,
+                       installment_count, first_due_date, frequency_days, notes
+                FROM payment_plan_agreements
+                WHERE invoice_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            PaymentPlanAgreement(
+                plan_id=row["plan_id"],
+                invoice_id=row["invoice_id"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                proposed_by=row["proposed_by"],
+                installment_amount_gbp=Decimal(row["installment_amount_gbp"]),
+                installment_count=int(row["installment_count"]),
+                first_due_date=date.fromisoformat(row["first_due_date"]),
+                frequency_days=int(row["frequency_days"]),
+                notes=row["notes"],
+            )
+            for row in rows
+        )
+
+    def payment_plan_installments_for_plan(self, plan_id: str) -> tuple[PaymentPlanInstallment, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT installment_id, plan_id, invoice_id, due_date, amount_gbp, sequence_number
+                FROM payment_plan_installments
+                WHERE plan_id = ?
+                ORDER BY sequence_number ASC, rowid ASC
+                """,
+                (plan_id,),
+            ).fetchall()
+        return tuple(
+            PaymentPlanInstallment(
+                installment_id=row["installment_id"],
+                plan_id=row["plan_id"],
+                invoice_id=row["invoice_id"],
+                due_date=date.fromisoformat(row["due_date"]),
+                amount_gbp=Decimal(row["amount_gbp"]),
+                sequence_number=int(row["sequence_number"]),
+            )
+            for row in rows
+        )
+
+    def append_payment_plan_payment(self, payment: PaymentPlanPayment) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO payment_plan_payments (
+                    payment_id, plan_id, installment_id, invoice_id, paid_at, amount_gbp, recorded_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payment.payment_id,
+                    payment.plan_id,
+                    payment.installment_id,
+                    payment.invoice_id,
+                    payment.paid_at.isoformat(),
+                    str(payment.amount_gbp),
+                    payment.recorded_by,
+                ),
+            )
+            conn.commit()
+
+    def payment_plan_payments_for_plan(self, plan_id: str) -> tuple[PaymentPlanPayment, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT payment_id, plan_id, installment_id, invoice_id, paid_at, amount_gbp, recorded_by
+                FROM payment_plan_payments
+                WHERE plan_id = ?
+                ORDER BY paid_at ASC, rowid ASC
+                """,
+                (plan_id,),
+            ).fetchall()
+        return tuple(
+            PaymentPlanPayment(
+                payment_id=row["payment_id"],
+                plan_id=row["plan_id"],
+                installment_id=row["installment_id"],
+                invoice_id=row["invoice_id"],
+                paid_at=datetime.fromisoformat(row["paid_at"]),
+                amount_gbp=Decimal(row["amount_gbp"]),
+                recorded_by=row["recorded_by"],
+            )
+            for row in rows
+        )
+
+    def append_settlement_offer(self, offer: SettlementOffer) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO settlement_offers (
+                    offer_id, invoice_id, offered_at, offered_by, offered_amount_gbp, expiry_date, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    offer.offer_id,
+                    offer.invoice_id,
+                    offer.offered_at.isoformat(),
+                    offer.offered_by,
+                    str(offer.offered_amount_gbp),
+                    offer.expiry_date.isoformat(),
+                    offer.notes,
+                ),
+            )
+            conn.commit()
+
+    def settlement_offers_for_invoice(self, invoice_id: str) -> tuple[SettlementOffer, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT offer_id, invoice_id, offered_at, offered_by, offered_amount_gbp, expiry_date, notes
+                FROM settlement_offers
+                WHERE invoice_id = ?
+                ORDER BY offered_at ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            SettlementOffer(
+                offer_id=row["offer_id"],
+                invoice_id=row["invoice_id"],
+                offered_at=datetime.fromisoformat(row["offered_at"]),
+                offered_by=row["offered_by"],
+                offered_amount_gbp=Decimal(row["offered_amount_gbp"]),
+                expiry_date=date.fromisoformat(row["expiry_date"]),
+                notes=row["notes"],
+            )
+            for row in rows
+        )
+
+    def settlement_offer_by_id(self, offer_id: str) -> SettlementOffer | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT offer_id, invoice_id, offered_at, offered_by, offered_amount_gbp, expiry_date, notes
+                FROM settlement_offers
+                WHERE offer_id = ?
+                """,
+                (offer_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SettlementOffer(
+            offer_id=row["offer_id"],
+            invoice_id=row["invoice_id"],
+            offered_at=datetime.fromisoformat(row["offered_at"]),
+            offered_by=row["offered_by"],
+            offered_amount_gbp=Decimal(row["offered_amount_gbp"]),
+            expiry_date=date.fromisoformat(row["expiry_date"]),
+            notes=row["notes"],
+        )
+
+    def append_settlement_acceptance(self, acceptance: SettlementAcceptance) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO settlement_acceptances (
+                    acceptance_id, offer_id, invoice_id, accepted_at, accepted_by, accepter_role
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    acceptance.acceptance_id,
+                    acceptance.offer_id,
+                    acceptance.invoice_id,
+                    acceptance.accepted_at.isoformat(),
+                    acceptance.accepted_by,
+                    acceptance.accepter_role,
+                ),
+            )
+            conn.commit()
+
+    def settlement_acceptances_for_offer(self, offer_id: str) -> tuple[SettlementAcceptance, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT acceptance_id, offer_id, invoice_id, accepted_at, accepted_by, accepter_role
+                FROM settlement_acceptances
+                WHERE offer_id = ?
+                ORDER BY accepted_at ASC, rowid ASC
+                """,
+                (offer_id,),
+            ).fetchall()
+        return tuple(
+            SettlementAcceptance(
+                acceptance_id=row["acceptance_id"],
+                offer_id=row["offer_id"],
+                invoice_id=row["invoice_id"],
+                accepted_at=datetime.fromisoformat(row["accepted_at"]),
+                accepted_by=row["accepted_by"],
+                accepter_role=row["accepter_role"],
+            )
+            for row in rows
+        )
+
+    def append_dispute_carve_out(self, carve_out: DisputeCarveOut) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO dispute_carve_outs (
+                    carve_out_id, invoice_id, created_at, disputed_amount_gbp, undisputed_amount_gbp, reason, created_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    carve_out.carve_out_id,
+                    carve_out.invoice_id,
+                    carve_out.created_at.isoformat(),
+                    str(carve_out.disputed_amount_gbp),
+                    str(carve_out.undisputed_amount_gbp),
+                    carve_out.reason,
+                    carve_out.created_by,
+                ),
+            )
+            conn.commit()
+
+    def dispute_carve_outs_for_invoice(self, invoice_id: str) -> tuple[DisputeCarveOut, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT carve_out_id, invoice_id, created_at, disputed_amount_gbp, undisputed_amount_gbp, reason, created_by
+                FROM dispute_carve_outs
+                WHERE invoice_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            DisputeCarveOut(
+                carve_out_id=row["carve_out_id"],
+                invoice_id=row["invoice_id"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                disputed_amount_gbp=Decimal(row["disputed_amount_gbp"]),
+                undisputed_amount_gbp=Decimal(row["undisputed_amount_gbp"]),
+                reason=row["reason"],
+                created_by=row["created_by"],
+            )
+            for row in rows
         )

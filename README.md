@@ -105,6 +105,14 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `POST /invoices/{invoice_id}/debtor-verification/register`
 - `POST /invoices/{invoice_id}/debtor-actions/data-accuracy-challenge`
 - `POST /invoices/{invoice_id}/debtor-actions/data-accuracy-challenge/resolve`
+- `POST /invoices/{invoice_id}/resolution/payment-plans`
+- `GET /invoices/{invoice_id}/resolution/payment-plans?as_of_date=YYYY-MM-DD`
+- `POST /invoices/{invoice_id}/resolution/payment-plans/{plan_id}/payments`
+- `POST /invoices/{invoice_id}/resolution/settlement-offers`
+- `GET /invoices/{invoice_id}/resolution/settlement-offers`
+- `POST /invoices/{invoice_id}/resolution/settlement-offers/{offer_id}/accept`
+- `POST /invoices/{invoice_id}/resolution/dispute-carve-outs`
+- `GET /invoices/{invoice_id}/resolution/dispute-carve-outs`
 - `GET /invoices/{invoice_id}/evidence-artifacts?artifact_type=&limit=100&offset=0`
 - `GET /invoices/{invoice_id}/ledger-events?event_type=&limit=100&offset=0`
 - `GET /invoices/{invoice_id}/debtor-ledger`
@@ -179,6 +187,13 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
   - `upload_rejected_total`
   - `upload_quarantined_total`
   - `upload_rejections_by_reason`
+
+## Resolution & Settlement Controls
+- Payment plans are append-only records with generated installment schedules and immutable payment records.
+- While a payment plan is `ACTIVE`, escalation is blocked and chasers remain paused.
+- If a plan defaults, escalation resumes from `OVERDUE_CHASER` (Level 2 equivalent flow).
+- Settlement offers are finalized only after both debtor and creditor accept.
+- Dispute carve-outs isolate disputed amounts from the immediately pursued undisputed balance.
 
 ## Deployment Runbook (Minimal)
 1. Set production environment variables (above).

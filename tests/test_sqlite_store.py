@@ -14,6 +14,7 @@ from unpaid_invoice_escalator.models import (
     DebtorType,
     Invoice,
     Jurisdiction,
+    PaymentPlanAgreement,
     PreOverdueHygieneRecord,
 )
 from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
@@ -122,6 +123,43 @@ class TestSQLiteStore(unittest.TestCase):
                 conn.rollback()
                 with self.assertRaises(sqlite3.DatabaseError):
                     conn.execute("DELETE FROM debtor_verification_cases")
+                conn.rollback()
+            finally:
+                conn.close()
+
+    def test_payment_plan_tables_are_append_only(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "escalator.db")
+            store = SQLiteStore(db_path)
+            invoice = Invoice(
+                invoice_id="inv-db-7",
+                currency="GBP",
+                principal_amount=Decimal("900"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            store.append_payment_plan_agreement(
+                PaymentPlanAgreement(
+                    plan_id="plan-1",
+                    invoice_id=invoice.invoice_id,
+                    created_at=datetime.now(timezone.utc),
+                    proposed_by="USER-1",
+                    installment_amount_gbp=Decimal("100"),
+                    installment_count=3,
+                    first_due_date=date(2026, 2, 10),
+                    frequency_days=30,
+                )
+            )
+            conn = sqlite3.connect(db_path)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("UPDATE payment_plan_agreements SET proposed_by = 'USER-X'")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM payment_plan_agreements")
                 conn.rollback()
             finally:
                 conn.close()

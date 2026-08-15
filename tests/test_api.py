@@ -560,6 +560,157 @@ class TestApi(unittest.TestCase):
             quarantine_files = list((Path(quarantine_dir) / "inv-api-quarantine").glob("*"))
             self.assertGreaterEqual(len(quarantine_files), 2)
 
+    def test_resolution_and_settlement_endpoints(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-resolution.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-resolution",
+                    "currency": "GBP",
+                    "principal_amount": "1000",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            health_resp = client.post(
+                "/invoices/inv-api-resolution/case-health-check",
+                json={
+                    "user_id": "USER-1",
+                    "correct_customer_legal_entity": True,
+                    "description_of_goods_or_services": True,
+                    "invoice_number_and_date_verified": True,
+                    "amount_matches_contract_or_quote": True,
+                    "correct_billing_address": True,
+                    "vat_numbers_checked": True,
+                    "purchase_order_supplied_if_required": True,
+                    "payment_terms_and_due_date_established": True,
+                    "delivery_or_acceptance_proof_attached": True,
+                    "no_unresolved_credit_notes": True,
+                    "direct_payments_checked": True,
+                    "no_known_dispute": True,
+                    "creditor_authority_verified": True,
+                    "limitation_period_checked": True,
+                    "debtor_contact_details_verified": True,
+                    "court_handoff_boundary_acknowledged": True,
+                },
+            )
+            self.assertEqual(health_resp.status_code, 200)
+
+            discrepancy_resp = client.post(
+                "/invoices/inv-api-resolution/discrepancy-check",
+                json={
+                    "claim_amount": "1000",
+                    "evidence_document_amount": "1000",
+                    "principal": "1000",
+                    "payments_recorded": "0",
+                    "outstanding_entered": "1000",
+                },
+            )
+            self.assertEqual(discrepancy_resp.status_code, 200)
+
+            debtor_resp = client.post(
+                "/invoices/inv-api-resolution/debtor-ledger/entries",
+                json={"entry_type": "ORIGINAL_PRINCIPAL", "amount_gbp": "1000", "description": "Initial principal"},
+            )
+            self.assertEqual(debtor_resp.status_code, 200)
+
+            plan_resp = client.post(
+                "/invoices/inv-api-resolution/resolution/payment-plans",
+                json={
+                    "proposed_by": "USER-1",
+                    "installment_amount_gbp": "200",
+                    "installment_count": 3,
+                    "first_due_date": "2026-03-01",
+                    "frequency_days": 30,
+                    "notes": "Plan terms",
+                },
+            )
+            self.assertEqual(plan_resp.status_code, 200)
+            plan_body = plan_resp.json()
+            plan_id = plan_body["plan_id"]
+
+            blocked_escalate_resp = client.post(
+                "/invoices/inv-api-resolution/escalate",
+                json={"today": "2026-02-15", "current_state": "OVERDUE_CHASER"},
+            )
+            self.assertEqual(blocked_escalate_resp.status_code, 409)
+
+            pay_resp = client.post(
+                f"/invoices/inv-api-resolution/resolution/payment-plans/{plan_id}/payments",
+                json={
+                    "installment_id": plan_body["installments"][0]["installment_id"],
+                    "amount_gbp": "200",
+                    "recorded_by": "USER-1",
+                },
+            )
+            self.assertEqual(pay_resp.status_code, 200)
+
+            plans_list_resp = client.get("/invoices/inv-api-resolution/resolution/payment-plans?as_of_date=2026-08-01")
+            self.assertEqual(plans_list_resp.status_code, 200)
+            self.assertEqual(plans_list_resp.json()["plans"][0]["status"], "DEFAULTED")
+
+            resumed_escalate_resp = client.post(
+                "/invoices/inv-api-resolution/escalate",
+                json={"today": "2026-08-01", "current_state": "FRIENDLY_REMINDER"},
+            )
+            self.assertEqual(resumed_escalate_resp.status_code, 200)
+            self.assertEqual(resumed_escalate_resp.json()["next_state"], "FORMAL_NOTICE")
+
+            offer_resp = client.post(
+                "/invoices/inv-api-resolution/resolution/settlement-offers",
+                json={
+                    "offered_by": "USER-1",
+                    "offered_amount_gbp": "750",
+                    "expiry_date": "2026-09-15",
+                    "notes": "Full and final",
+                },
+            )
+            self.assertEqual(offer_resp.status_code, 200)
+            offer_id = offer_resp.json()["offer_id"]
+
+            accept_debtor_resp = client.post(
+                f"/invoices/inv-api-resolution/resolution/settlement-offers/{offer_id}/accept",
+                json={"accepted_by": "Debtor Contact", "accepter_role": "DEBTOR"},
+            )
+            self.assertEqual(accept_debtor_resp.status_code, 200)
+            self.assertFalse(accept_debtor_resp.json()["finalized"])
+
+            accept_creditor_resp = client.post(
+                f"/invoices/inv-api-resolution/resolution/settlement-offers/{offer_id}/accept",
+                json={"accepted_by": "Creditor User", "accepter_role": "CREDITOR"},
+            )
+            self.assertEqual(accept_creditor_resp.status_code, 200)
+            self.assertTrue(accept_creditor_resp.json()["finalized"])
+
+            offers_resp = client.get("/invoices/inv-api-resolution/resolution/settlement-offers")
+            self.assertEqual(offers_resp.status_code, 200)
+            self.assertEqual(offers_resp.json()["offers"][0]["status"], "FINALIZED")
+
+            carve_out_resp = client.post(
+                "/invoices/inv-api-resolution/resolution/dispute-carve-outs",
+                json={
+                    "disputed_amount_gbp": "100",
+                    "reason": "Partial quality dispute",
+                    "created_by": "USER-1",
+                },
+            )
+            self.assertEqual(carve_out_resp.status_code, 200)
+            self.assertEqual(carve_out_resp.json()["suggested_state"], "DISPUTE_REVIEW")
+
+            carve_outs_resp = client.get("/invoices/inv-api-resolution/resolution/dispute-carve-outs")
+            self.assertEqual(carve_outs_resp.status_code, 200)
+            self.assertEqual(len(carve_outs_resp.json()["carve_outs"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

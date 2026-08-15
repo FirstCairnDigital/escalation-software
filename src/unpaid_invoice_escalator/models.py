@@ -42,10 +42,14 @@ class RecoveryCostCategory(str, Enum):
 
 class DebtorLedgerEntryType(str, Enum):
     ORIGINAL_PRINCIPAL = "ORIGINAL_PRINCIPAL"
+    CREDIT_NOTE = "CREDIT_NOTE"
     STATUTORY_INTEREST = "STATUTORY_INTEREST"
     FIXED_COMPENSATION = "FIXED_COMPENSATION"
     CONTRACTUAL_RECOVERY_COST = "CONTRACTUAL_RECOVERY_COST"
     OFFICIAL_COURT_FEE = "OFFICIAL_COURT_FEE"
+    SETTLEMENT_DISCOUNT = "SETTLEMENT_DISCOUNT"
+    RETENTION_HOLD = "RETENTION_HOLD"
+    DISPUTED_CARVE_OUT = "DISPUTED_CARVE_OUT"
     PAYMENT_RECEIVED = "PAYMENT_RECEIVED"
     ADJUSTMENT = "ADJUSTMENT"
 
@@ -67,6 +71,7 @@ class InvoiceState(str, Enum):
     PRE_ACTION_PROTOCOL = "PRE_ACTION_PROTOCOL"
     JURISDICTION_UNCERTAIN = "JURISDICTION_UNCERTAIN"
     DISPUTED = "DISPUTED"
+    DISPUTE_REVIEW = "DISPUTE_REVIEW"
     BREATHING_SPACE_PAUSE = "BREATHING_SPACE_PAUSE"
     CLIENT_HANDOFF = "CLIENT_HANDOFF"
     RESOLVED_PAID = "RESOLVED_PAID"
@@ -187,3 +192,69 @@ class DebtorVerificationCase:
     invoice_reference: str
     verification_code_hash: str
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class PaymentPlanAgreement:
+    plan_id: str
+    invoice_id: str
+    created_at: datetime
+    proposed_by: str
+    installment_amount_gbp: Decimal
+    installment_count: int
+    first_due_date: date
+    frequency_days: int
+    notes: str = ""
+
+
+@dataclass(frozen=True)
+class PaymentPlanInstallment:
+    installment_id: str
+    plan_id: str
+    invoice_id: str
+    due_date: date
+    amount_gbp: Decimal
+    sequence_number: int
+
+
+@dataclass(frozen=True)
+class PaymentPlanPayment:
+    payment_id: str
+    plan_id: str
+    installment_id: str
+    invoice_id: str
+    paid_at: datetime
+    amount_gbp: Decimal
+    recorded_by: str
+
+
+@dataclass(frozen=True)
+class SettlementOffer:
+    offer_id: str
+    invoice_id: str
+    offered_at: datetime
+    offered_by: str
+    offered_amount_gbp: Decimal
+    expiry_date: date
+    notes: str = ""
+
+
+@dataclass(frozen=True)
+class SettlementAcceptance:
+    acceptance_id: str
+    offer_id: str
+    invoice_id: str
+    accepted_at: datetime
+    accepted_by: str
+    accepter_role: str
+
+
+@dataclass(frozen=True)
+class DisputeCarveOut:
+    carve_out_id: str
+    invoice_id: str
+    created_at: datetime
+    disputed_amount_gbp: Decimal
+    undisputed_amount_gbp: Decimal
+    reason: str
+    created_by: str

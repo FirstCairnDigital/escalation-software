@@ -40,6 +40,7 @@ from unpaid_invoice_escalator.services.ledger_manifest_exporter import LedgerMan
 from unpaid_invoice_escalator.services.late_payment_engine import LatePaymentEngine
 from unpaid_invoice_escalator.services.legal_safety_gate_manager import LegalSafetyGateManager
 from unpaid_invoice_escalator.services.pre_overdue_hygiene_engine import PreOverdueHygieneEngine
+from unpaid_invoice_escalator.services.resolution_settlement_engine import ResolutionAndSettlementEngine
 from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
 from unpaid_invoice_escalator.security import ApiSecurityController, ROLE_RANK
 from unpaid_invoice_escalator.ui import render_home_html, render_invoice_workspace_html
@@ -210,6 +211,39 @@ class ResolveDataAccuracyChallengeRequest(BaseModel):
     resolution_notes: str
 
 
+class PaymentPlanProposalRequest(BaseModel):
+    proposed_by: str
+    installment_amount_gbp: Decimal
+    installment_count: int
+    first_due_date: date
+    frequency_days: int = 30
+    notes: str = ""
+
+
+class PaymentPlanPaymentRequest(BaseModel):
+    installment_id: str
+    amount_gbp: Decimal
+    recorded_by: str
+
+
+class SettlementOfferRequest(BaseModel):
+    offered_by: str
+    offered_amount_gbp: Decimal
+    expiry_date: date
+    notes: str = ""
+
+
+class SettlementAcceptanceRequest(BaseModel):
+    accepted_by: str
+    accepter_role: Literal["DEBTOR", "CREDITOR"]
+
+
+class DisputeCarveOutRequest(BaseModel):
+    disputed_amount_gbp: Decimal
+    reason: str
+    created_by: str
+
+
 def _parse_api_keys(raw: str) -> dict[str, str]:
     keys: dict[str, str] = {}
     for item in raw.split(","):
@@ -347,6 +381,7 @@ def create_app(
     case_health_check = CaseHealthCheck()
     devils_advocate_engine = DevilsAdvocateEngine()
     debtor_verification_portal = DebtorVerificationPortal(store=store)
+    resolution_engine = ResolutionAndSettlementEngine(store=store, event_ledger=ledger)
     artifacts_root = Path(artifacts_dir)
     bundles_root = Path(bundles_dir)
     quarantine_root = Path(effective_quarantine_dir)
@@ -506,6 +541,18 @@ def create_app(
             "trg_compliance_ledger_no_delete",
             "trg_debtor_verification_no_update",
             "trg_debtor_verification_no_delete",
+            "trg_payment_plan_agreements_no_update",
+            "trg_payment_plan_agreements_no_delete",
+            "trg_payment_plan_installments_no_update",
+            "trg_payment_plan_installments_no_delete",
+            "trg_payment_plan_payments_no_update",
+            "trg_payment_plan_payments_no_delete",
+            "trg_settlement_offers_no_update",
+            "trg_settlement_offers_no_delete",
+            "trg_settlement_acceptances_no_update",
+            "trg_settlement_acceptances_no_delete",
+            "trg_dispute_carve_outs_no_update",
+            "trg_dispute_carve_outs_no_delete",
         )
         try:
             conn = sqlite3.connect(db_path)
@@ -629,6 +676,14 @@ def create_app(
             if entry.event_type == "DISCREPANCY_VALIDATION":
                 return not bool(entry.details.get("valid", False))
         return False
+
+    def _active_or_defaulted_payment_plan(invoice_id: str, as_of_date: date) -> tuple[str | None, str | None]:
+        plans = store.payment_plan_agreements_for_invoice(invoice_id)
+        for plan in reversed(plans):
+            status = resolution_engine.payment_plan_status(plan_id=plan.plan_id, as_of_date=as_of_date)
+            if status.status in {"ACTIVE", "DEFAULTED"}:
+                return plan.plan_id, status.status
+        return None, None
 
     @app.middleware("http")
     async def security_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
@@ -1208,6 +1263,293 @@ def create_app(
             ],
         }
 
+    @app.post("/invoices/{invoice_id}/resolution/payment-plans")
+    def propose_payment_plan(invoice_id: str, payload: PaymentPlanProposalRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        try:
+            plan, installments = resolution_engine.propose_payment_plan(
+                invoice_id=invoice_id,
+                proposed_by=payload.proposed_by,
+                installment_amount_gbp=payload.installment_amount_gbp,
+                installment_count=payload.installment_count,
+                first_due_date=payload.first_due_date,
+                frequency_days=payload.frequency_days,
+                notes=payload.notes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=plan.created_at,
+                event_type="PAYMENT_PLAN_PROPOSED",
+                details={
+                    "plan_id": plan.plan_id,
+                    "proposed_by": plan.proposed_by,
+                    "installment_amount_gbp": str(plan.installment_amount_gbp),
+                    "installment_count": plan.installment_count,
+                    "first_due_date": plan.first_due_date.isoformat(),
+                },
+            )
+        )
+        return {
+            "invoice_id": invoice_id,
+            "plan_id": plan.plan_id,
+            "installment_count": len(installments),
+            "installments": [
+                {
+                    "installment_id": item.installment_id,
+                    "sequence_number": item.sequence_number,
+                    "due_date": item.due_date.isoformat(),
+                    "amount_gbp": str(item.amount_gbp),
+                }
+                for item in installments
+            ],
+            "status": "ACTIVE",
+            "chasers_paused": True,
+        }
+
+    @app.get("/invoices/{invoice_id}/resolution/payment-plans")
+    def list_payment_plans(invoice_id: str, as_of_date: date | None = None) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        target_date = as_of_date or date.today()
+        plans = store.payment_plan_agreements_for_invoice(invoice_id)
+        result: list[dict[str, object]] = []
+        for plan in plans:
+            status = resolution_engine.payment_plan_status(plan_id=plan.plan_id, as_of_date=target_date)
+            installments = store.payment_plan_installments_for_plan(plan.plan_id)
+            result.append(
+                {
+                    "plan_id": plan.plan_id,
+                    "created_at": plan.created_at.isoformat(),
+                    "proposed_by": plan.proposed_by,
+                    "installment_amount_gbp": str(plan.installment_amount_gbp),
+                    "installment_count": plan.installment_count,
+                    "first_due_date": plan.first_due_date.isoformat(),
+                    "frequency_days": plan.frequency_days,
+                    "notes": plan.notes,
+                    "status": status.status,
+                    "remaining_amount_gbp": str(status.remaining_amount_gbp),
+                    "missed_installment_count": status.missed_installment_count,
+                    "installments": [
+                        {
+                            "installment_id": inst.installment_id,
+                            "sequence_number": inst.sequence_number,
+                            "due_date": inst.due_date.isoformat(),
+                            "amount_gbp": str(inst.amount_gbp),
+                        }
+                        for inst in installments
+                    ],
+                }
+            )
+        return {"invoice_id": invoice_id, "as_of_date": target_date.isoformat(), "plans": result}
+
+    @app.post("/invoices/{invoice_id}/resolution/payment-plans/{plan_id}/payments")
+    def record_payment_plan_payment(
+        invoice_id: str, plan_id: str, payload: PaymentPlanPaymentRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        installments = store.payment_plan_installments_for_plan(plan_id)
+        if not any(item.installment_id == payload.installment_id and item.invoice_id == invoice_id for item in installments):
+            raise HTTPException(status_code=404, detail="Installment not found for invoice payment plan.")
+        try:
+            payment = resolution_engine.record_installment_payment(
+                invoice_id=invoice_id,
+                plan_id=plan_id,
+                installment_id=payload.installment_id,
+                amount_gbp=payload.amount_gbp,
+                recorded_by=payload.recorded_by,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=payment.paid_at,
+                event_type="PAYMENT_PLAN_PAYMENT_RECORDED",
+                details={
+                    "plan_id": payment.plan_id,
+                    "installment_id": payment.installment_id,
+                    "amount_gbp": str(payment.amount_gbp),
+                    "recorded_by": payment.recorded_by,
+                },
+            )
+        )
+        return {
+            "invoice_id": invoice_id,
+            "plan_id": plan_id,
+            "payment_id": payment.payment_id,
+            "amount_gbp": str(payment.amount_gbp),
+            "recorded_at": payment.paid_at.isoformat(),
+            "chasers_paused": True,
+        }
+
+    @app.post("/invoices/{invoice_id}/resolution/settlement-offers")
+    def propose_settlement_offer(invoice_id: str, payload: SettlementOfferRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        try:
+            offer = resolution_engine.propose_settlement_offer(
+                invoice_id=invoice_id,
+                offered_by=payload.offered_by,
+                offered_amount_gbp=payload.offered_amount_gbp,
+                expiry_date=payload.expiry_date,
+                notes=payload.notes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=offer.offered_at,
+                event_type="SETTLEMENT_OFFER_PROPOSED",
+                details={
+                    "offer_id": offer.offer_id,
+                    "offered_by": offer.offered_by,
+                    "offered_amount_gbp": str(offer.offered_amount_gbp),
+                    "expiry_date": offer.expiry_date.isoformat(),
+                },
+            )
+        )
+        return {
+            "invoice_id": invoice_id,
+            "offer_id": offer.offer_id,
+            "offered_amount_gbp": str(offer.offered_amount_gbp),
+            "expiry_date": offer.expiry_date.isoformat(),
+            "status": "OPEN",
+        }
+
+    @app.post("/invoices/{invoice_id}/resolution/settlement-offers/{offer_id}/accept")
+    def accept_settlement_offer(
+        invoice_id: str, offer_id: str, payload: SettlementAcceptanceRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        offer = store.settlement_offer_by_id(offer_id)
+        if offer is None or offer.invoice_id != invoice_id:
+            raise HTTPException(status_code=404, detail="Settlement offer not found.")
+        try:
+            acceptance, finalized = resolution_engine.accept_settlement_offer(
+                offer_id=offer_id,
+                accepted_by=payload.accepted_by,
+                accepter_role=payload.accepter_role,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=acceptance.accepted_at,
+                event_type="SETTLEMENT_OFFER_ACCEPTED",
+                details={
+                    "offer_id": offer_id,
+                    "accepted_by": acceptance.accepted_by,
+                    "accepter_role": acceptance.accepter_role,
+                    "finalized": finalized,
+                },
+            )
+        )
+        return {
+            "invoice_id": invoice_id,
+            "offer_id": offer_id,
+            "acceptance_id": acceptance.acceptance_id,
+            "accepter_role": acceptance.accepter_role,
+            "finalized": finalized,
+        }
+
+    @app.get("/invoices/{invoice_id}/resolution/settlement-offers")
+    def list_settlement_offers(invoice_id: str) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        offers = store.settlement_offers_for_invoice(invoice_id)
+        rows: list[dict[str, object]] = []
+        for offer in offers:
+            acceptances = store.settlement_acceptances_for_offer(offer.offer_id)
+            roles = {item.accepter_role for item in acceptances}
+            rows.append(
+                {
+                    "offer_id": offer.offer_id,
+                    "offered_at": offer.offered_at.isoformat(),
+                    "offered_by": offer.offered_by,
+                    "offered_amount_gbp": str(offer.offered_amount_gbp),
+                    "expiry_date": offer.expiry_date.isoformat(),
+                    "notes": offer.notes,
+                    "accepted_roles": sorted(roles),
+                    "status": "FINALIZED" if roles == {"DEBTOR", "CREDITOR"} else "OPEN",
+                }
+            )
+        return {"invoice_id": invoice_id, "offers": rows}
+
+    @app.post("/invoices/{invoice_id}/resolution/dispute-carve-outs")
+    def create_dispute_carve_out(invoice_id: str, payload: DisputeCarveOutRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        try:
+            carve_out = resolution_engine.create_dispute_carve_out(
+                invoice_id=invoice_id,
+                disputed_amount_gbp=payload.disputed_amount_gbp,
+                reason=payload.reason,
+                created_by=payload.created_by,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=carve_out.created_at,
+                event_type="DISPUTE_CARVE_OUT_CREATED",
+                details={
+                    "carve_out_id": carve_out.carve_out_id,
+                    "disputed_amount_gbp": str(carve_out.disputed_amount_gbp),
+                    "undisputed_amount_gbp": str(carve_out.undisputed_amount_gbp),
+                    "reason": carve_out.reason,
+                },
+            )
+        )
+        return {
+            "invoice_id": invoice_id,
+            "carve_out_id": carve_out.carve_out_id,
+            "disputed_amount_gbp": str(carve_out.disputed_amount_gbp),
+            "undisputed_amount_gbp": str(carve_out.undisputed_amount_gbp),
+            "suggested_state": "DISPUTE_REVIEW",
+        }
+
+    @app.get("/invoices/{invoice_id}/resolution/dispute-carve-outs")
+    def list_dispute_carve_outs(invoice_id: str) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        carve_outs = store.dispute_carve_outs_for_invoice(invoice_id)
+        return {
+            "invoice_id": invoice_id,
+            "carve_outs": [
+                {
+                    "carve_out_id": item.carve_out_id,
+                    "created_at": item.created_at.isoformat(),
+                    "disputed_amount_gbp": str(item.disputed_amount_gbp),
+                    "undisputed_amount_gbp": str(item.undisputed_amount_gbp),
+                    "reason": item.reason,
+                    "created_by": item.created_by,
+                }
+                for item in carve_outs
+            ],
+        }
+
     @app.get("/invoices/{invoice_id}/debtor-ledger")
     def get_debtor_ledger(invoice_id: str) -> dict[str, object]:
         invoice = store.get_invoice(invoice_id)
@@ -1459,6 +1801,32 @@ def create_app(
                 status_code=409,
                 detail="Escalation blocked while debtor data-accuracy challenge is open.",
             )
+        forced_current_state: InvoiceState | None = None
+        active_plan_id, active_plan_status = _active_or_defaulted_payment_plan(invoice_id, payload.today)
+        if active_plan_status == "ACTIVE":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Escalation blocked: payment plan {active_plan_id} is active and chasers remain paused.",
+            )
+        if active_plan_status == "DEFAULTED":
+            forced_current_state = InvoiceState.OVERDUE_CHASER
+            now = datetime.now(timezone.utc)
+            store.append_compliance_entry(
+                ComplianceLedgerEntry(
+                    entry_id=str(uuid4()),
+                    invoice_id=invoice_id,
+                    timestamp=now,
+                    event_type="PAYMENT_PLAN_DEFAULTED_RESUME",
+                    details={"plan_id": active_plan_id, "resume_state": InvoiceState.OVERDUE_CHASER.value},
+                )
+            )
+            ledger.append_event(
+                invoice_id=invoice_id,
+                actor=Actor.SYSTEM,
+                event_type="PAYMENT_PLAN_DEFAULTED_RESUME",
+                timestamp=now,
+                data_payload={"plan_id": active_plan_id, "resume_state": InvoiceState.OVERDUE_CHASER.value},
+            )
 
         devils_advocate_result = devils_advocate_engine.evaluate(
             active_dispute=payload.debtor_feedback == "DISPUTE",
@@ -1496,7 +1864,7 @@ def create_app(
                 detail="Escalation blocked by devil's advocate verification checks.",
             )
 
-        current_state = payload.current_state or store.infer_state(invoice_id)
+        current_state = forced_current_state or payload.current_state or store.infer_state(invoice_id)
         state_entered_on = payload.state_entered_on or store.infer_state_entered_on(invoice_id, current_state)
         result = runner.run_step(
             invoice=invoice,
