@@ -44,6 +44,8 @@ class TestEvidencePackCompiler(unittest.TestCase):
             self.assertTrue(any("Filing Portal: Make a Money Claim Online (MMCO)" in line for line in lines))
             self.assertTrue(any("Enforcement Route:" in line for line in lines))
             self.assertTrue(any("Contract Artifacts:" in line for line in lines))
+            self.assertTrue(any("Communication Delivery Timeline:" in line for line in lines))
+            self.assertTrue(any("Correction and Withdrawal Notices:" in line for line in lines))
 
 
 if __name__ == "__main__":

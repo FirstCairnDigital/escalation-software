@@ -20,6 +20,8 @@ class EvidenceBundleInput:
     debtor_ledger_breakdown: tuple[str, ...] = ()
     client_fee_ledger_breakdown: tuple[str, ...] = ()
     resolution_artifact_paths: tuple[str, ...] = ()
+    communication_delivery_timeline: tuple[str, ...] = ()
+    correction_withdrawal_notices: tuple[str, ...] = ()
 
 
 class EvidencePackCompiler:
@@ -102,6 +104,12 @@ class EvidencePackCompiler:
                 lines.append(f"- {path.name} | Exists={exists} | SHA256={checksum}")
         else:
             lines.append("- None provided")
+        lines.append("")
+        lines.append("Communication Delivery Timeline:")
+        lines.extend([f"- {line}" for line in bundle.communication_delivery_timeline] or ["- None provided"])
+        lines.append("")
+        lines.append("Correction and Withdrawal Notices:")
+        lines.extend([f"- {line}" for line in bundle.correction_withdrawal_notices] or ["- None provided"])
         return lines
 
     @staticmethod

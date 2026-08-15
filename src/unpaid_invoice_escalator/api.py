@@ -2478,6 +2478,24 @@ def create_app(
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
         artifacts = store.artifacts_for_invoice(invoice_id)
+        delivery_timeline = [
+            (
+                f"{event.timestamp.isoformat()} | Comm={event.communication_id} | "
+                f"State={event.state.value} | Note={event.note or '-'}"
+            )
+            for event in store.communication_delivery_events_for_invoice(invoice_id)
+        ]
+        correction_notice_events = {
+            "ERROR_CORRECTED",
+            "COMMUNICATION_WITHDRAWN",
+            "DATA_ACCURACY_CHALLENGE_OPEN",
+            "DATA_ACCURACY_CHALLENGE_RESOLVED",
+        }
+        correction_notices = [
+            f"{entry.timestamp.isoformat()} | {entry.event_type} | {entry.details}"
+            for entry in store.compliance_entries_for_invoice(invoice_id)
+            if entry.event_type in correction_notice_events
+        ]
         resolution_artifact_paths: list[str] = []
         if payload.include_resolution_artifacts:
             for plan in store.payment_plan_agreements_for_invoice(invoice_id):
@@ -2524,6 +2542,8 @@ def create_app(
                 for entry in store.client_fee_entries_for_invoice(invoice_id)
             ],
             resolution_artifact_paths=resolution_artifact_paths,
+            communication_delivery_timeline=delivery_timeline,
+            correction_withdrawal_notices=correction_notices,
         )
         return {"invoice_id": invoice_id, "bundle_path": generated_path}
 

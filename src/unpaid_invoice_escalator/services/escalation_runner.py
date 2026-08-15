@@ -99,6 +99,8 @@ class EscalationRunner:
         debtor_ledger_breakdown: Iterable[str] = (),
         client_fee_ledger_breakdown: Iterable[str] = (),
         resolution_artifact_paths: Iterable[str] = (),
+        communication_delivery_timeline: Iterable[str] = (),
+        correction_withdrawal_notices: Iterable[str] = (),
     ) -> str:
         bundle = EvidenceBundleInput(
             invoice=invoice,
@@ -111,6 +113,8 @@ class EscalationRunner:
             debtor_ledger_breakdown=tuple(debtor_ledger_breakdown),
             client_fee_ledger_breakdown=tuple(client_fee_ledger_breakdown),
             resolution_artifact_paths=tuple(resolution_artifact_paths),
+            communication_delivery_timeline=tuple(communication_delivery_timeline),
+            correction_withdrawal_notices=tuple(correction_withdrawal_notices),
         )
         generated_path = self._evidence_pack_compiler.compile_bundle(bundle, output_path)
         self._ledger.append_event(

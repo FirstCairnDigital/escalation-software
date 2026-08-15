@@ -1056,6 +1056,39 @@ class TestApi(unittest.TestCase):
             self.assertEqual(carve_outs_resp.status_code, 200)
             self.assertEqual(len(carve_outs_resp.json()["carve_outs"]), 1)
 
+            communication_resp = client.post(
+                "/invoices/inv-api-resolution/communications",
+                json={
+                    "channel": "EMAIL",
+                    "recipient": "ap@example.com",
+                    "subject": "Resolution Update",
+                    "body_summary": "Installment plan progress",
+                    "automated": True,
+                },
+            )
+            self.assertEqual(communication_resp.status_code, 200)
+            communication_id = communication_resp.json()["communication_id"]
+            queue_resp = client.post(
+                f"/invoices/inv-api-resolution/communications/{communication_id}/delivery-events",
+                json={"state": "QUEUED", "note": "Queued for delivery"},
+            )
+            self.assertEqual(queue_resp.status_code, 200)
+
+            open_challenge_resp = client.post(
+                "/invoices/inv-api-resolution/debtor-actions/data-accuracy-challenge",
+                json={
+                    "debtor_identifier": "debtor-1",
+                    "challenge_reason": "Incorrect address",
+                    "challenge_details": "Registered office corrected",
+                },
+            )
+            self.assertEqual(open_challenge_resp.status_code, 200)
+            resolve_challenge_resp = client.post(
+                "/invoices/inv-api-resolution/debtor-actions/data-accuracy-challenge/resolve",
+                json={"creditor_user_id": "USER-1", "resolution_notes": "Address corrected and confirmed"},
+            )
+            self.assertEqual(resolve_challenge_resp.status_code, 200)
+
             bundle_resp = client.post(
                 "/invoices/inv-api-resolution/evidence-bundles",
                 json={
@@ -1066,7 +1099,12 @@ class TestApi(unittest.TestCase):
                 },
             )
             self.assertEqual(bundle_resp.status_code, 200)
-            self.assertTrue(Path(bundle_resp.json()["bundle_path"]).exists())
+            bundle_path = Path(bundle_resp.json()["bundle_path"])
+            self.assertTrue(bundle_path.exists())
+            bundle_bytes = bundle_path.read_bytes()
+            self.assertIn(b"Communication Delivery Timeline:", bundle_bytes)
+            self.assertIn(b"Correction and Withdrawal Notices:", bundle_bytes)
+            self.assertIn(b"DATA_ACCURACY_CHALLENGE_OPEN", bundle_bytes)
 
 
 if __name__ == "__main__":
