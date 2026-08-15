@@ -30,6 +30,7 @@ from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
 from unpaid_invoice_escalator.rulepacks import RulePackLoader, RulePackValidationError
 from unpaid_invoice_escalator.services.dual_ledger_engine import DualLedgerEngine
 from unpaid_invoice_escalator.services.case_health_check import CaseHealthCheck
+from unpaid_invoice_escalator.services.communication_severity_engine import CommunicationSeverityEngine
 from unpaid_invoice_escalator.services.data_discrepancy_validator import DataDiscrepancyValidator
 from unpaid_invoice_escalator.services.debtor_verification_portal import DebtorVerificationPortal
 from unpaid_invoice_escalator.services.devils_advocate_engine import DevilsAdvocateEngine
@@ -382,6 +383,7 @@ def create_app(
     devils_advocate_engine = DevilsAdvocateEngine()
     debtor_verification_portal = DebtorVerificationPortal(store=store)
     resolution_engine = ResolutionAndSettlementEngine(store=store, event_ledger=ledger)
+    communication_severity_engine = CommunicationSeverityEngine(rule_pack_loader=rule_pack_loader)
     artifacts_root = Path(artifacts_dir)
     bundles_root = Path(bundles_dir)
     quarantine_root = Path(effective_quarantine_dir)
@@ -865,6 +867,29 @@ def create_app(
             "debtor_type": invoice.debtor_type.value,
             "current_state": current_state.value,
             "chain_valid": store.verify_chain(invoice_id),
+        }
+
+    @app.get("/invoices/{invoice_id}/communication-preview")
+    def get_communication_preview(
+        invoice_id: str, state: InvoiceState | None = None, on_date: date | None = None
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        preview = communication_severity_engine.preview_for_state(
+            invoice=invoice,
+            state=state or store.infer_state(invoice_id),
+            on_date=on_date or date.today(),
+            instructions="Procedural communication preview.",
+            wait_until=None,
+        )
+        return {
+            "invoice_id": invoice_id,
+            "level": preview.level,
+            "stage_name": preview.stage_name,
+            "template_version": preview.template_version,
+            "message": preview.message,
+            "guardrail_flags": list(preview.guardrail_flags),
         }
 
     @app.post("/invoices/{invoice_id}/case-health-check")
@@ -1912,6 +1937,13 @@ def create_app(
                 place_of_supply_country_code=payload.place_of_supply_country_code,
             ),
         )
+        preview = communication_severity_engine.preview_for_state(
+            invoice=invoice,
+            state=result.decision.next_state,
+            on_date=payload.today,
+            instructions=result.decision.instructions,
+            wait_until=result.decision.wait_until,
+        )
         return {
             "invoice_id": invoice_id,
             "next_state": result.decision.next_state.value,
@@ -1921,6 +1953,13 @@ def create_app(
             "wait_until": result.decision.wait_until.isoformat() if result.decision.wait_until else None,
             "recorded_at": result.recorded_at.isoformat(),
             "chain_valid": store.verify_chain(invoice_id),
+            "communication_preview": {
+                "level": preview.level,
+                "stage_name": preview.stage_name,
+                "template_version": preview.template_version,
+                "message": preview.message,
+                "guardrail_flags": list(preview.guardrail_flags),
+            },
         }
 
     @app.post("/invoices/{invoice_id}/evidence-artifacts")

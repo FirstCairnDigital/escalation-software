@@ -15,6 +15,16 @@
     "corporate_documents": ["14-day Letter Before Action"],
     "small_claims_pack": ["MMCO Evidence Pack"],
     "over_limit_pack": ["County Court / Solicitor Briefing Pack"],
-    "enforcement_note": "High Court Enforcement Officers (HCEOs) or County Court Bailiffs"
+    "enforcement_note": "High Court Enforcement Officers (HCEOs) or County Court Bailiffs",
+    "tone_framework_version": "fcd-tone-v1",
+    "communication_templates": {
+      "LEVEL_0": "Courtesy reminder: Invoice {invoice_id} is due on {due_date}.",
+      "LEVEL_1": "Friendly reminder: Invoice {invoice_id} remains open. If payment has already been made, please let us know.",
+      "LEVEL_2": "Overdue notice: Invoice {invoice_id} is overdue. Current outstanding balance is £{principal_amount}.",
+      "LEVEL_3": "Request for resolution: please confirm payment timing or provide a formal dispute update for Invoice {invoice_id}.",
+      "LEVEL_4": "Formal notice: Invoice {invoice_id} remains unpaid. {instructions}",
+      "LEVEL_5": "Pre-action procedural notice: Invoice {invoice_id}. {instructions}",
+      "LEVEL_6": "Client handoff: automated processing has ended for Invoice {invoice_id}. {instructions}"
+    }
   }
 }

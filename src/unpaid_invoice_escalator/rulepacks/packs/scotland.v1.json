@@ -11,6 +11,16 @@
   "workflow": {
     "small_claims_pack": ["Scottish Civil Online Form 3A Evidence Pack"],
     "over_limit_pack": ["Formal Notice", "Ordinary Cause / Sheriff Court Briefing Pack"],
-    "enforcement_note": "Sheriff Officers"
+    "enforcement_note": "Sheriff Officers",
+    "tone_framework_version": "fcd-tone-v1",
+    "communication_templates": {
+      "LEVEL_0": "Courtesy reminder: Invoice {invoice_id} is due on {due_date}.",
+      "LEVEL_1": "Friendly reminder: Invoice {invoice_id} remains open. Please confirm payment timing if needed.",
+      "LEVEL_2": "Overdue notice: Invoice {invoice_id} is overdue. Current outstanding balance is £{principal_amount}.",
+      "LEVEL_3": "Request for resolution: please confirm payment arrangements or raise a formal dispute for Invoice {invoice_id}.",
+      "LEVEL_4": "Formal notice: Invoice {invoice_id} remains unpaid. {instructions}",
+      "LEVEL_5": "Pre-action procedural notice: Invoice {invoice_id}. {instructions}",
+      "LEVEL_6": "Client handoff: automated processing has ended for Invoice {invoice_id}. {instructions}"
+    }
   }
 }

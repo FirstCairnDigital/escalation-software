@@ -239,6 +239,14 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(escalate_resp.status_code, 200)
             self.assertEqual(escalate_resp.json()["next_state"], "PRE_ACTION_PROTOCOL")
+            self.assertEqual(escalate_resp.json()["communication_preview"]["level"], 5)
+            self.assertIn("message", escalate_resp.json()["communication_preview"])
+
+            preview_resp = client.get(
+                "/invoices/inv-api-1/communication-preview?state=OVERDUE_CHASER&on_date=2026-02-01"
+            )
+            self.assertEqual(preview_resp.status_code, 200)
+            self.assertEqual(preview_resp.json()["level"], 2)
 
             upload_resp = client.post(
                 "/invoices/inv-api-1/evidence-artifacts",

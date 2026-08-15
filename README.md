@@ -97,6 +97,7 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `GET /rule-packs/{jurisdiction}/active?on_date=YYYY-MM-DD`
 - `POST /invoices`
 - `GET /invoices/{invoice_id}`
+- `GET /invoices/{invoice_id}/communication-preview?state=&on_date=YYYY-MM-DD`
 - `POST /invoices/{invoice_id}/case-health-check`
 - `POST /invoices/{invoice_id}/devils-advocate-check`
 - `GET /invoices/{invoice_id}/five-ledger-summary`
@@ -196,6 +197,15 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 - Settlement offers are finalized only after both debtor and creditor accept.
 - Dispute carve-outs isolate disputed amounts from the immediately pursued undisputed balance.
 - Debtor portal verification view returns neutral resolution options and independent advice links messaging.
+
+## Communication Severity Framework
+- Escalation responses include `communication_preview` with:
+  - `level` (0-6)
+  - `stage_name`
+  - `template_version`
+  - `message`
+  - `guardrail_flags`
+- Guardrails automatically rewrite banned urgency/legal-pressure phrases into neutral procedural language.
 
 ## Deployment Runbook (Minimal)
 1. Set production environment variables (above).
