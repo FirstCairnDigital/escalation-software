@@ -16,6 +16,7 @@ from .legal_safety_gate_manager import LegalSafetyGateManager, LegalSafetyGateRe
 from .late_payment_engine import LatePaymentCalculationResult, LatePaymentEngine
 from .pre_overdue_hygiene_engine import PreOverdueHygieneAssessment, PreOverdueHygieneEngine
 from .resolution_settlement_engine import PaymentPlanStatus, ResolutionAndSettlementEngine
+from .viability_proportionality_calculator import ViabilityAssessment, ViabilityProportionalityCalculator
 from .invoice_ledger import InvoiceLedger
 from .jurisdiction_engine import JurisdictionEngine
 from .sqlite_invoice_ledger import SQLiteInvoiceLedger
@@ -49,6 +50,8 @@ __all__ = [
     "PreOverdueHygieneEngine",
     "PaymentPlanStatus",
     "ResolutionAndSettlementEngine",
+    "ViabilityAssessment",
+    "ViabilityProportionalityCalculator",
     "InvoiceLedger",
     "JurisdictionEngine",
     "SQLiteInvoiceLedger",

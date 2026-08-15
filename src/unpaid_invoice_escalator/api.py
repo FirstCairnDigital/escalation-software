@@ -43,6 +43,7 @@ from unpaid_invoice_escalator.services.legal_safety_gate_manager import LegalSaf
 from unpaid_invoice_escalator.services.pre_overdue_hygiene_engine import PreOverdueHygieneEngine
 from unpaid_invoice_escalator.services.resolution_settlement_engine import ResolutionAndSettlementEngine
 from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
+from unpaid_invoice_escalator.services.viability_proportionality_calculator import ViabilityProportionalityCalculator
 from unpaid_invoice_escalator.security import ApiSecurityController, ROLE_RANK
 from unpaid_invoice_escalator.ui import render_home_html, render_invoice_workspace_html
 
@@ -73,6 +74,9 @@ class EscalateRequest(BaseModel):
     regulated_debt_suspected: bool = False
     settlement_pending_and_not_due: bool = False
     delivery_evidence_unverified: bool = False
+    company_status: str = "UNKNOWN"
+    estimated_time_cost_gbp: Decimal = Decimal("0")
+    projected_action: ClientFeeAction = ClientFeeAction.PRE_ACTION_PACK
     contract_jurisdiction: Jurisdiction | None = None
     creditor_country_code: str | None = None
     debtor_country_code: str | None = None
@@ -245,6 +249,13 @@ class DisputeCarveOutRequest(BaseModel):
     created_by: str
 
 
+class ViabilityAssessmentRequest(BaseModel):
+    on_date: date
+    projected_action: ClientFeeAction = ClientFeeAction.PRE_ACTION_PACK
+    estimated_time_cost_gbp: Decimal = Decimal("0")
+    company_status: str = "UNKNOWN"
+
+
 def _parse_api_keys(raw: str) -> dict[str, str]:
     keys: dict[str, str] = {}
     for item in raw.split(","):
@@ -384,6 +395,7 @@ def create_app(
     debtor_verification_portal = DebtorVerificationPortal(store=store)
     resolution_engine = ResolutionAndSettlementEngine(store=store, event_ledger=ledger)
     communication_severity_engine = CommunicationSeverityEngine(rule_pack_loader=rule_pack_loader)
+    viability_calculator = ViabilityProportionalityCalculator(store=store)
     artifacts_root = Path(artifacts_dir)
     bundles_root = Path(bundles_dir)
     quarantine_root = Path(effective_quarantine_dir)
@@ -1736,6 +1748,33 @@ def create_app(
             "external_fee_notice": "Official court fee payable to court authority, not FCD revenue.",
         }
 
+    @app.post("/invoices/{invoice_id}/viability-proportionality-assessments")
+    def assess_viability_proportionality(invoice_id: str, payload: ViabilityAssessmentRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        assessment = viability_calculator.assess(
+            invoice=invoice,
+            on_date=payload.on_date,
+            projected_action=payload.projected_action,
+            estimated_time_cost_gbp=payload.estimated_time_cost_gbp,
+            company_status=payload.company_status,
+        )
+        return {
+            "invoice_id": invoice_id,
+            "company_status": assessment.company_status,
+            "outstanding_amount_gbp": str(assessment.outstanding_amount_gbp),
+            "projected_fcd_action_fee_gbp": str(assessment.projected_fcd_action_fee_gbp),
+            "projected_court_fee_gbp": str(assessment.projected_court_fee_gbp),
+            "estimated_time_cost_gbp": str(assessment.estimated_time_cost_gbp),
+            "projected_total_cost_gbp": str(assessment.projected_total_cost_gbp),
+            "cost_ratio": str(assessment.cost_ratio),
+            "disproportionate": assessment.disproportionate,
+            "blocked": assessment.blocked,
+            "notice": assessment.notice,
+            "recommendation": assessment.recommendation,
+        }
+
     @app.post("/invoices/{invoice_id}/pre-overdue-hygiene")
     def record_pre_overdue_hygiene(invoice_id: str, payload: PreOverdueHygieneRequest) -> dict[str, object]:
         invoice = store.get_invoice(invoice_id)
@@ -1854,6 +1893,38 @@ def create_app(
                 status_code=409,
                 detail="Escalation blocked while debtor data-accuracy challenge is open.",
             )
+        viability = viability_calculator.assess(
+            invoice=invoice,
+            on_date=payload.today,
+            projected_action=payload.projected_action,
+            estimated_time_cost_gbp=payload.estimated_time_cost_gbp,
+            company_status=payload.company_status,
+        )
+        if viability.blocked:
+            now = datetime.now(timezone.utc)
+            store.append_compliance_entry(
+                ComplianceLedgerEntry(
+                    entry_id=str(uuid4()),
+                    invoice_id=invoice_id,
+                    timestamp=now,
+                    event_type="VIABILITY_BLOCK",
+                    details={
+                        "company_status": viability.company_status,
+                        "recommendation": viability.recommendation,
+                    },
+                )
+            )
+            ledger.append_event(
+                invoice_id=invoice_id,
+                actor=Actor.SYSTEM,
+                event_type="VIABILITY_BLOCK",
+                timestamp=now,
+                data_payload={"company_status": viability.company_status, "recommendation": viability.recommendation},
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="Escalation blocked by viability review: financial distress indicator present.",
+            )
         forced_current_state: InvoiceState | None = None
         active_plan_id, active_plan_status = _active_or_defaulted_payment_plan(invoice_id, payload.today)
         if active_plan_status == "ACTIVE":
@@ -1953,6 +2024,15 @@ def create_app(
             "wait_until": result.decision.wait_until.isoformat() if result.decision.wait_until else None,
             "recorded_at": result.recorded_at.isoformat(),
             "chain_valid": store.verify_chain(invoice_id),
+            "viability_assessment": {
+                "company_status": viability.company_status,
+                "outstanding_amount_gbp": str(viability.outstanding_amount_gbp),
+                "projected_total_cost_gbp": str(viability.projected_total_cost_gbp),
+                "cost_ratio": str(viability.cost_ratio),
+                "disproportionate": viability.disproportionate,
+                "notice": viability.notice,
+                "recommendation": viability.recommendation,
+            },
             "communication_preview": {
                 "level": preview.level,
                 "stage_name": preview.stage_name,

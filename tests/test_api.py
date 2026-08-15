@@ -132,6 +132,17 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(court_quote_resp.status_code, 200)
             self.assertEqual(court_quote_resp.json()["official_court_fee_gbp"], "163")
+            viability_resp = client.post(
+                "/invoices/inv-api-1/viability-proportionality-assessments",
+                json={
+                    "on_date": "2026-02-01",
+                    "projected_action": "PRE_ACTION_PACK",
+                    "estimated_time_cost_gbp": "30",
+                    "company_status": "ACTIVE",
+                },
+            )
+            self.assertEqual(viability_resp.status_code, 200)
+            self.assertIn("projected_total_cost_gbp", viability_resp.json())
 
             cost_assess_resp = client.post(
                 "/invoices/inv-api-1/recovery-cost-assessments",
@@ -239,6 +250,7 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(escalate_resp.status_code, 200)
             self.assertEqual(escalate_resp.json()["next_state"], "PRE_ACTION_PROTOCOL")
+            self.assertIn("viability_assessment", escalate_resp.json())
             self.assertEqual(escalate_resp.json()["communication_preview"]["level"], 5)
             self.assertIn("message", escalate_resp.json()["communication_preview"])
 
@@ -519,6 +531,70 @@ class TestApi(unittest.TestCase):
                 json={"today": "2026-02-01", "current_state": "OVERDUE_CHASER"},
             )
             self.assertEqual(allowed_resp.status_code, 200)
+
+    def test_escalation_blocked_by_viability_financial_distress(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-viability-block.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-viability",
+                    "currency": "GBP",
+                    "principal_amount": "800",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+            health_resp = client.post(
+                "/invoices/inv-api-viability/case-health-check",
+                json={
+                    "user_id": "USER-1",
+                    "correct_customer_legal_entity": True,
+                    "description_of_goods_or_services": True,
+                    "invoice_number_and_date_verified": True,
+                    "amount_matches_contract_or_quote": True,
+                    "correct_billing_address": True,
+                    "vat_numbers_checked": True,
+                    "purchase_order_supplied_if_required": True,
+                    "payment_terms_and_due_date_established": True,
+                    "delivery_or_acceptance_proof_attached": True,
+                    "no_unresolved_credit_notes": True,
+                    "direct_payments_checked": True,
+                    "no_known_dispute": True,
+                    "creditor_authority_verified": True,
+                    "limitation_period_checked": True,
+                    "debtor_contact_details_verified": True,
+                    "court_handoff_boundary_acknowledged": True,
+                },
+            )
+            self.assertEqual(health_resp.status_code, 200)
+            discrepancy_resp = client.post(
+                "/invoices/inv-api-viability/discrepancy-check",
+                json={
+                    "claim_amount": "800",
+                    "evidence_document_amount": "800",
+                    "principal": "800",
+                    "payments_recorded": "0",
+                    "outstanding_entered": "800",
+                },
+            )
+            self.assertEqual(discrepancy_resp.status_code, 200)
+            blocked_resp = client.post(
+                "/invoices/inv-api-viability/escalate",
+                json={
+                    "today": "2026-02-01",
+                    "current_state": "OVERDUE_CHASER",
+                    "company_status": "INSOLVENT",
+                },
+            )
+            self.assertEqual(blocked_resp.status_code, 409)
 
     def test_upload_rejection_quarantine_and_metrics(self) -> None:
         with TemporaryDirectory() as tmp_dir:

@@ -124,6 +124,7 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `POST /invoices/{invoice_id}/debtor-ledger/entries`
 - `POST /invoices/{invoice_id}/recovery-cost-assessments`
 - `POST /invoices/{invoice_id}/court-fee-quotes`
+- `POST /invoices/{invoice_id}/viability-proportionality-assessments`
 - `POST /invoices/{invoice_id}/pre-overdue-hygiene`
 - `GET /invoices/{invoice_id}/pre-overdue-hygiene`
 - `POST /invoices/{invoice_id}/evidence-artifacts` (multipart; supports `artifact_type`)
@@ -197,6 +198,12 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 - Settlement offers are finalized only after both debtor and creditor accept.
 - Dispute carve-outs isolate disputed amounts from the immediately pursued undisputed balance.
 - Debtor portal verification view returns neutral resolution options and independent advice links messaging.
+
+## Viability & Proportionality
+- Viability assessments combine projected FCD action fee, projected court fee, and estimated time-cost against current outstanding amount.
+- Escalation calls include `viability_assessment` and block when the supplied company status indicates financial distress (`INSOLVENT`, `DISSOLVED`, `IN_ADMINISTRATION`, `CEASED`).
+- When costs look disproportionate, responses include the mandatory notice:
+  - `Recovery costs and effort may be disproportionate to the amount outstanding (£X).`
 
 ## Communication Severity Framework
 - Escalation responses include `communication_preview` with:
