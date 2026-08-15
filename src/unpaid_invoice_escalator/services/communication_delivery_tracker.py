@@ -23,12 +23,13 @@ class CommunicationDeliverySnapshot:
 
 class CommunicationDeliveryTracker:
     _ALLOWED_TRANSITIONS = {
-        CommunicationDeliveryState.CREATED: {CommunicationDeliveryState.QUEUED},
+        CommunicationDeliveryState.CREATED: {CommunicationDeliveryState.QUEUED, CommunicationDeliveryState.CANCELLED},
         CommunicationDeliveryState.QUEUED: {
             CommunicationDeliveryState.SENT,
             CommunicationDeliveryState.BOUNCED,
             CommunicationDeliveryState.REJECTED,
             CommunicationDeliveryState.RETURNED,
+            CommunicationDeliveryState.CANCELLED,
         },
         CommunicationDeliveryState.SENT: {
             CommunicationDeliveryState.DELIVERED,
@@ -46,6 +47,7 @@ class CommunicationDeliveryTracker:
         CommunicationDeliveryState.BOUNCED: {CommunicationDeliveryState.QUEUED},
         CommunicationDeliveryState.REJECTED: {CommunicationDeliveryState.QUEUED},
         CommunicationDeliveryState.RETURNED: {CommunicationDeliveryState.QUEUED},
+        CommunicationDeliveryState.CANCELLED: set(),
     }
 
     def __init__(self, *, store: SQLiteStore, event_ledger: InvoiceLedger) -> None:
@@ -60,6 +62,7 @@ class CommunicationDeliveryTracker:
         recipient: str,
         subject: str,
         body_summary: str,
+        automated: bool = True,
     ) -> CommunicationDeliverySnapshot:
         now = datetime.now(timezone.utc)
         communication = CommunicationRecord(
@@ -69,6 +72,7 @@ class CommunicationDeliveryTracker:
             recipient=recipient,
             subject=subject,
             body_summary=body_summary,
+            automated=automated,
             created_at=now,
         )
         self._store.append_communication(communication)

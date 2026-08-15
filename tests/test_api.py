@@ -712,6 +712,131 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(resumed_escalate.status_code, 200)
 
+    def test_payment_or_credit_cancels_pending_automated_communications(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-cancel-pending.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-cancel",
+                    "currency": "GBP",
+                    "principal_amount": "500",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+            comm_one = client.post(
+                "/invoices/inv-api-cancel/communications",
+                json={
+                    "channel": "EMAIL",
+                    "recipient": "debtor@example.com",
+                    "subject": "Reminder 1",
+                    "body_summary": "Pending reminder one",
+                    "automated": True,
+                },
+            ).json()["communication_id"]
+            comm_two = client.post(
+                "/invoices/inv-api-cancel/communications",
+                json={
+                    "channel": "EMAIL",
+                    "recipient": "debtor@example.com",
+                    "subject": "Reminder 2",
+                    "body_summary": "Pending reminder two",
+                    "automated": True,
+                },
+            ).json()["communication_id"]
+            client.post(
+                f"/invoices/inv-api-cancel/communications/{comm_one}/delivery-events",
+                json={"state": "QUEUED", "note": "queued one"},
+            )
+            client.post(
+                f"/invoices/inv-api-cancel/communications/{comm_two}/delivery-events",
+                json={"state": "QUEUED", "note": "queued two"},
+            )
+            payment_resp = client.post(
+                "/invoices/inv-api-cancel/debtor-ledger/entries",
+                json={"entry_type": "PAYMENT_RECEIVED", "amount_gbp": "-100", "description": "Partial payment"},
+            )
+            self.assertEqual(payment_resp.status_code, 200)
+            cancelled = payment_resp.json()["cancelled_pending_communication_ids"]
+            self.assertEqual(len(cancelled), 2)
+            comms_resp = client.get("/invoices/inv-api-cancel/communications")
+            self.assertEqual(comms_resp.status_code, 200)
+            self.assertEqual(
+                {item["latest_state"] for item in comms_resp.json()["communications"]},
+                {"CANCELLED"},
+            )
+
+    def test_pre_send_balance_lock_blocks_send_when_no_outstanding(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-balance-lock.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-lock",
+                    "currency": "GBP",
+                    "principal_amount": "250",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+            client.post(
+                "/invoices/inv-api-lock/debtor-ledger/entries",
+                json={"entry_type": "ORIGINAL_PRINCIPAL", "amount_gbp": "250", "description": "Principal"},
+            )
+            client.post(
+                "/invoices/inv-api-lock/debtor-ledger/entries",
+                json={"entry_type": "PAYMENT_RECEIVED", "amount_gbp": "-250", "description": "Paid in full"},
+            )
+            comm_resp = client.post(
+                "/invoices/inv-api-lock/communications",
+                json={
+                    "channel": "EMAIL",
+                    "recipient": "debtor@example.com",
+                    "subject": "Manual note",
+                    "body_summary": "Non-automated note",
+                    "automated": False,
+                },
+            )
+            self.assertEqual(comm_resp.status_code, 200)
+            communication_id = comm_resp.json()["communication_id"]
+            queued_resp = client.post(
+                f"/invoices/inv-api-lock/communications/{communication_id}/delivery-events",
+                json={"state": "QUEUED", "note": "queued"},
+            )
+            self.assertEqual(queued_resp.status_code, 200)
+            blocked_send = client.post(
+                f"/invoices/inv-api-lock/communications/{communication_id}/delivery-events",
+                json={"state": "SENT", "note": "attempt send"},
+            )
+            self.assertEqual(blocked_send.status_code, 200)
+
+            automated_comm = client.post(
+                "/invoices/inv-api-lock/communications",
+                json={
+                    "channel": "EMAIL",
+                    "recipient": "debtor@example.com",
+                    "subject": "Automated note",
+                    "body_summary": "Automated comm",
+                    "automated": True,
+                },
+            )
+            self.assertEqual(automated_comm.status_code, 409)
+
     def test_upload_rejection_quarantine_and_metrics(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "api-quarantine.db")

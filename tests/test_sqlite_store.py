@@ -188,6 +188,7 @@ class TestSQLiteStore(unittest.TestCase):
                 recipient="debtor@example.com",
                 subject="Reminder",
                 body_summary="Summary",
+                automated=True,
                 created_at=datetime.now(timezone.utc),
             )
             store.append_communication(record)

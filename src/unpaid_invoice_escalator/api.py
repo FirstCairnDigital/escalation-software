@@ -263,6 +263,7 @@ class CommunicationCreateRequest(BaseModel):
     recipient: str
     subject: str
     body_summary: str
+    automated: bool = True
 
 
 class CommunicationDeliveryUpdateRequest(BaseModel):
@@ -727,6 +728,21 @@ def create_app(
         snapshots = communication_delivery_tracker.snapshots_for_invoice(invoice_id)
         return any(snapshot.latest_state in failed_states for snapshot in snapshots)
 
+    def _effective_outstanding_amount(invoice: Invoice) -> Decimal:
+        entries = store.debtor_ledger_entries_for_invoice(invoice.invoice_id)
+        if not entries:
+            return invoice.principal_amount
+        return store.debtor_ledger_balance_for_invoice(invoice.invoice_id)
+
+    def _assert_pre_send_balance_lock(invoice: Invoice) -> Decimal:
+        outstanding = _effective_outstanding_amount(invoice)
+        if outstanding <= Decimal("0.00"):
+            raise HTTPException(
+                status_code=409,
+                detail="Pre-send balance lock failed: no positive outstanding balance available for communication.",
+            )
+        return outstanding
+
     @app.middleware("http")
     async def security_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
         request_id = request.headers.get("x-request-id") or str(uuid4())
@@ -937,12 +953,14 @@ def create_app(
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
+        locked_outstanding = _assert_pre_send_balance_lock(invoice) if payload.automated else _effective_outstanding_amount(invoice)
         snapshot = communication_delivery_tracker.create_communication(
             invoice_id=invoice_id,
             channel=payload.channel,
             recipient=payload.recipient,
             subject=payload.subject,
             body_summary=payload.body_summary,
+            automated=payload.automated,
         )
         store.append_compliance_entry(
             ComplianceLedgerEntry(
@@ -954,7 +972,9 @@ def create_app(
                     "communication_id": snapshot.communication.communication_id,
                     "channel": snapshot.communication.channel,
                     "recipient": snapshot.communication.recipient,
+                    "automated": snapshot.communication.automated,
                     "delivery_state": snapshot.latest_state.value,
+                    "locked_outstanding_balance_gbp": str(locked_outstanding),
                 },
             )
         )
@@ -962,6 +982,8 @@ def create_app(
             "invoice_id": invoice_id,
             "communication_id": snapshot.communication.communication_id,
             "delivery_state": snapshot.latest_state.value,
+            "automated": snapshot.communication.automated,
+            "locked_outstanding_balance_gbp": str(locked_outstanding),
             "created_at": snapshot.communication.created_at.isoformat(),
         }
 
@@ -972,6 +994,12 @@ def create_app(
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
+        communication = store.communication_for_id(communication_id)
+        if communication is None or communication.invoice_id != invoice_id:
+            raise HTTPException(status_code=404, detail="Communication not found for invoice.")
+        locked_outstanding: Decimal | None = None
+        if payload.state == CommunicationDeliveryState.SENT and communication.automated:
+            locked_outstanding = _assert_pre_send_balance_lock(invoice)
         try:
             snapshot = communication_delivery_tracker.record_delivery_event(
                 invoice_id=invoice_id,
@@ -992,6 +1020,9 @@ def create_app(
                     "communication_id": communication_id,
                     "state": latest_event.state.value,
                     "note": latest_event.note,
+                    "locked_outstanding_balance_gbp": (
+                        None if locked_outstanding is None else str(locked_outstanding)
+                    ),
                 },
             )
         )
@@ -999,6 +1030,7 @@ def create_app(
             "invoice_id": invoice_id,
             "communication_id": communication_id,
             "delivery_state": latest_event.state.value,
+            "locked_outstanding_balance_gbp": None if locked_outstanding is None else str(locked_outstanding),
             "recorded_at": latest_event.timestamp.isoformat(),
         }
 
@@ -1017,6 +1049,7 @@ def create_app(
                     "recipient": item.communication.recipient,
                     "subject": item.communication.subject,
                     "body_summary": item.communication.body_summary,
+                    "automated": item.communication.automated,
                     "created_at": item.communication.created_at.isoformat(),
                     "latest_state": item.latest_state.value,
                     "events": [
@@ -1831,12 +1864,54 @@ def create_app(
             recovery_cost_category=payload.recovery_cost_category,
             linked_client_fee_entry_id=payload.linked_client_fee_entry_id,
         )
+        cancelled_communications: list[str] = []
+        if payload.entry_type in {DebtorLedgerEntryType.PAYMENT_RECEIVED, DebtorLedgerEntryType.CREDIT_NOTE}:
+            for snapshot in communication_delivery_tracker.snapshots_for_invoice(invoice_id):
+                if not snapshot.communication.automated:
+                    continue
+                if snapshot.latest_state not in {CommunicationDeliveryState.CREATED, CommunicationDeliveryState.QUEUED}:
+                    continue
+                try:
+                    communication_delivery_tracker.record_delivery_event(
+                        invoice_id=invoice_id,
+                        communication_id=snapshot.communication.communication_id,
+                        next_state=CommunicationDeliveryState.CANCELLED,
+                        note="Cancelled automatically due to payment/credit ledger entry.",
+                    )
+                    cancelled_communications.append(snapshot.communication.communication_id)
+                except ValueError:
+                    continue
+            if cancelled_communications:
+                now = datetime.now(timezone.utc)
+                store.append_compliance_entry(
+                    ComplianceLedgerEntry(
+                        entry_id=str(uuid4()),
+                        invoice_id=invoice_id,
+                        timestamp=now,
+                        event_type="PENDING_COMMUNICATIONS_CANCELLED_ON_PAYMENT_OR_CREDIT",
+                        details={
+                            "entry_type": payload.entry_type.value,
+                            "cancelled_communication_ids": cancelled_communications,
+                        },
+                    )
+                )
+                ledger.append_event(
+                    invoice_id=invoice_id,
+                    actor=Actor.SYSTEM,
+                    event_type="PENDING_COMMUNICATIONS_CANCELLED_ON_PAYMENT_OR_CREDIT",
+                    timestamp=now,
+                    data_payload={
+                        "entry_type": payload.entry_type.value,
+                        "cancelled_communication_ids": cancelled_communications,
+                    },
+                )
         balances = dual_ledger_engine.balances_for_invoice(invoice_id)
         return {
             "invoice_id": invoice_id,
             "entry_id": entry.entry_id,
             "amount_gbp": str(entry.amount_gbp),
             "debtor_ledger_balance_gbp": str(balances.debtor_ledger_balance),
+            "cancelled_pending_communication_ids": cancelled_communications,
         }
 
     @app.post("/invoices/{invoice_id}/recovery-cost-assessments")

@@ -221,7 +221,10 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 - Delivery states are tracked as append-only events:
   - `CREATED -> QUEUED -> SENT -> DELIVERED -> OPENED`
   - failure branches: `BOUNCED`, `REJECTED`, `RETURNED`
+  - operational cancellation state: `CANCELLED`
 - If a communication is in a failure state, escalation is blocked until contact details are corrected and delivery is re-queued.
+- Automated communications enforce a pre-send balance lock and require a positive outstanding balance at send time.
+- Recording payment or credit entries automatically cancels pending automated communications (`CREATED`/`QUEUED`).
 
 ## Deployment Runbook (Minimal)
 1. Set production environment variables (above).

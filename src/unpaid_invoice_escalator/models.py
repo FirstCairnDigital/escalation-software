@@ -86,6 +86,7 @@ class CommunicationDeliveryState(str, Enum):
     BOUNCED = "BOUNCED"
     REJECTED = "REJECTED"
     RETURNED = "RETURNED"
+    CANCELLED = "CANCELLED"
 
 
 @dataclass(frozen=True)
@@ -279,6 +280,7 @@ class CommunicationRecord:
     recipient: str
     subject: str
     body_summary: str
+    automated: bool
     created_at: datetime
 
 

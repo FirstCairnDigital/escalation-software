@@ -208,6 +208,7 @@ class SQLiteStore:
                     recipient TEXT NOT NULL,
                     subject TEXT NOT NULL,
                     body_summary TEXT NOT NULL,
+                    automated INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
                 )
@@ -227,6 +228,12 @@ class SQLiteStore:
                 )
                 """
             )
+            communication_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(communications)").fetchall()
+            }
+            if "automated" not in communication_columns:
+                conn.execute("ALTER TABLE communications ADD COLUMN automated INTEGER NOT NULL DEFAULT 1")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS payment_plan_agreements (
@@ -1120,8 +1127,8 @@ class SQLiteStore:
             conn.execute(
                 """
                 INSERT INTO communications (
-                    communication_id, invoice_id, channel, recipient, subject, body_summary, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    communication_id, invoice_id, channel, recipient, subject, body_summary, automated, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.communication_id,
@@ -1130,6 +1137,7 @@ class SQLiteStore:
                     record.recipient,
                     record.subject,
                     record.body_summary,
+                    1 if record.automated else 0,
                     record.created_at.isoformat(),
                 ),
             )
@@ -1139,7 +1147,7 @@ class SQLiteStore:
         with self._connection() as conn:
             row = conn.execute(
                 """
-                SELECT communication_id, invoice_id, channel, recipient, subject, body_summary, created_at
+                SELECT communication_id, invoice_id, channel, recipient, subject, body_summary, automated, created_at
                 FROM communications
                 WHERE communication_id = ?
                 """,
@@ -1154,6 +1162,7 @@ class SQLiteStore:
             recipient=row["recipient"],
             subject=row["subject"],
             body_summary=row["body_summary"],
+            automated=bool(row["automated"]),
             created_at=datetime.fromisoformat(row["created_at"]),
         )
 
@@ -1161,7 +1170,7 @@ class SQLiteStore:
         with self._connection() as conn:
             rows = conn.execute(
                 """
-                SELECT communication_id, invoice_id, channel, recipient, subject, body_summary, created_at
+                SELECT communication_id, invoice_id, channel, recipient, subject, body_summary, automated, created_at
                 FROM communications
                 WHERE invoice_id = ?
                 ORDER BY created_at ASC, rowid ASC
@@ -1176,6 +1185,7 @@ class SQLiteStore:
                 recipient=row["recipient"],
                 subject=row["subject"],
                 body_summary=row["body_summary"],
+                automated=bool(row["automated"]),
                 created_at=datetime.fromisoformat(row["created_at"]),
             )
             for row in rows
