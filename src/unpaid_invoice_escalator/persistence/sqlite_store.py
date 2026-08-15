@@ -15,6 +15,7 @@ from unpaid_invoice_escalator.models import (
     ClientFeeAction,
     ClientFeeEntry,
     ComplianceLedgerEntry,
+    DebtorVerificationCase,
     DebtorLedgerEntry,
     DebtorLedgerEntryType,
     DebtorType,
@@ -176,6 +177,19 @@ class SQLiteStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS debtor_verification_cases (
+                    case_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL UNIQUE,
+                    creditor_name TEXT NOT NULL,
+                    invoice_reference TEXT NOT NULL,
+                    verification_code_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
             hygiene_columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(pre_overdue_hygiene_records)").fetchall()
@@ -230,6 +244,12 @@ class SQLiteStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_artifacts_invoice
                 ON evidence_artifacts(invoice_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_verification_cases_invoice
+                ON debtor_verification_cases(invoice_id)
                 """
             )
             conn.execute(
@@ -355,6 +375,24 @@ class SQLiteStore:
                 BEFORE DELETE ON compliance_ledger_entries
                 BEGIN
                     SELECT RAISE(ABORT, 'compliance_ledger_entries is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_debtor_verification_no_update
+                BEFORE UPDATE ON debtor_verification_cases
+                BEGIN
+                    SELECT RAISE(ABORT, 'debtor_verification_cases is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_debtor_verification_no_delete
+                BEFORE DELETE ON debtor_verification_cases
+                BEGIN
+                    SELECT RAISE(ABORT, 'debtor_verification_cases is append-only');
                 END;
                 """
             )
@@ -779,4 +817,65 @@ class SQLiteStore:
                 details=json.loads(row["details_json"]),
             )
             for row in rows
+        )
+
+    def append_debtor_verification_case(self, record: DebtorVerificationCase) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO debtor_verification_cases (
+                    case_id, invoice_id, creditor_name, invoice_reference, verification_code_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.case_id,
+                    record.invoice_id,
+                    record.creditor_name,
+                    record.invoice_reference,
+                    record.verification_code_hash,
+                    record.created_at.isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def debtor_verification_case_for_invoice(self, invoice_id: str) -> DebtorVerificationCase | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT case_id, invoice_id, creditor_name, invoice_reference, verification_code_hash, created_at
+                FROM debtor_verification_cases
+                WHERE invoice_id = ?
+                """,
+                (invoice_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return DebtorVerificationCase(
+            case_id=row["case_id"],
+            invoice_id=row["invoice_id"],
+            creditor_name=row["creditor_name"],
+            invoice_reference=row["invoice_reference"],
+            verification_code_hash=row["verification_code_hash"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    def debtor_verification_case_by_case_id(self, case_id: str) -> DebtorVerificationCase | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT case_id, invoice_id, creditor_name, invoice_reference, verification_code_hash, created_at
+                FROM debtor_verification_cases
+                WHERE case_id = ?
+                """,
+                (case_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return DebtorVerificationCase(
+            case_id=row["case_id"],
+            invoice_id=row["invoice_id"],
+            creditor_name=row["creditor_name"],
+            invoice_reference=row["invoice_reference"],
+            verification_code_hash=row["verification_code_hash"],
+            created_at=datetime.fromisoformat(row["created_at"]),
         )

@@ -10,6 +10,7 @@ from unpaid_invoice_escalator.models import (
     Actor,
     ClientFeeAction,
     ComplianceLedgerEntry,
+    DebtorVerificationCase,
     DebtorType,
     Invoice,
     Jurisdiction,
@@ -83,6 +84,44 @@ class TestSQLiteStore(unittest.TestCase):
                         "DELETE FROM ledger_events WHERE invoice_id = ?",
                         (invoice.invoice_id,),
                     )
+                conn.rollback()
+            finally:
+                conn.close()
+
+    def test_debtor_verification_table_is_append_only(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "escalator.db")
+            store = SQLiteStore(db_path)
+            invoice = Invoice(
+                invoice_id="inv-db-6",
+                currency="GBP",
+                principal_amount=Decimal("650"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            store.append_debtor_verification_case(
+                DebtorVerificationCase(
+                    case_id="FCD-R-2026-000001",
+                    invoice_id=invoice.invoice_id,
+                    creditor_name="Creditor Ltd",
+                    invoice_reference="INV-6",
+                    verification_code_hash="abc123",
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+            self.assertIsNotNone(store.debtor_verification_case_for_invoice(invoice.invoice_id))
+            self.assertIsNotNone(store.debtor_verification_case_by_case_id("FCD-R-2026-000001"))
+
+            conn = sqlite3.connect(db_path)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("UPDATE debtor_verification_cases SET creditor_name = 'X'")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM debtor_verification_cases")
                 conn.rollback()
             finally:
                 conn.close()

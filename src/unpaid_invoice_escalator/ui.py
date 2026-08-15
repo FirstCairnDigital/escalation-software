@@ -123,6 +123,19 @@ def render_home_html() -> str:
     </section>
 
     <section class="card">
+      <h2>Pre-Escalation Controls</h2>
+      <label>Invoice ID<input id="gate_invoice_id" value="inv-ui-1" /></label>
+      <label>User ID<input id="gate_user_id" value="USER-102" /></label>
+      <label>Creditor Name<input id="verify_creditor_name" value="First Cairn Digital Client Ltd" /></label>
+      <label>Invoice Reference<input id="verify_invoice_ref" value="INV-001" /></label>
+      <button onclick="runCaseHealthCheck()">Run Case Health Check (All Criteria True)</button>
+      <button onclick="runDevilsAdvocateCheck()">Run Devil's Advocate Check</button>
+      <button onclick="registerVerificationCase()">Register Debtor Verification Case</button>
+      <button onclick="openDataAccuracyChallenge()">Open Data Accuracy Challenge</button>
+      <button onclick="resolveDataAccuracyChallenge()">Resolve Data Accuracy Challenge</button>
+    </section>
+
+    <section class="card">
       <h2>Review Audit & Artifacts</h2>
       <label>Invoice ID<input id="view_invoice_id" value="inv-ui-1" /></label>
       <label>Artifact Type Filter
@@ -247,6 +260,56 @@ def render_home_html() -> str:
       });
     }
     async function listHygiene() { await request(`/invoices/${hy_invoice_id.value}/pre-overdue-hygiene`, "GET"); }
+    async function runCaseHealthCheck() {
+      await request(`/invoices/${gate_invoice_id.value}/case-health-check`, "POST", {
+        user_id: gate_user_id.value,
+        correct_customer_legal_entity: true,
+        description_of_goods_or_services: true,
+        invoice_number_and_date_verified: true,
+        amount_matches_contract_or_quote: true,
+        correct_billing_address: true,
+        vat_numbers_checked: true,
+        purchase_order_supplied_if_required: true,
+        payment_terms_and_due_date_established: true,
+        delivery_or_acceptance_proof_attached: true,
+        no_unresolved_credit_notes: true,
+        direct_payments_checked: true,
+        no_known_dispute: true,
+        creditor_authority_verified: true,
+        limitation_period_checked: true,
+        debtor_contact_details_verified: true,
+        court_handoff_boundary_acknowledged: true
+      });
+    }
+    async function runDevilsAdvocateCheck() {
+      await request(`/invoices/${gate_invoice_id.value}/devils-advocate-check`, "POST", {
+        active_dispute: false,
+        payment_or_credit_discrepancy: false,
+        delivery_evidence_unverified: false,
+        settlement_pending_and_not_due: false,
+        data_accuracy_challenge_pending: false,
+        insolvency_or_breathing_space_flag: false
+      });
+    }
+    async function registerVerificationCase() {
+      await request(`/invoices/${gate_invoice_id.value}/debtor-verification/register`, "POST", {
+        creditor_name: verify_creditor_name.value,
+        invoice_reference: verify_invoice_ref.value
+      });
+    }
+    async function openDataAccuracyChallenge() {
+      await request(`/invoices/${gate_invoice_id.value}/debtor-actions/data-accuracy-challenge`, "POST", {
+        debtor_identifier: "debtor-contact",
+        challenge_reason: "DATA_INACCURATE",
+        challenge_details: "Debtor indicates address detail is outdated."
+      });
+    }
+    async function resolveDataAccuracyChallenge() {
+      await request(`/invoices/${gate_invoice_id.value}/debtor-actions/data-accuracy-challenge/resolve`, "POST", {
+        creditor_user_id: gate_user_id.value,
+        resolution_notes: "Creditor uploaded corrected records and confirmed data update."
+      });
+    }
     async function viewInvoice() { await request(`/invoices/${view_invoice_id.value}`, "GET"); }
     async function viewArtifacts() {
       const params = new URLSearchParams();

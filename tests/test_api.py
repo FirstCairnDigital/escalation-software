@@ -32,6 +32,43 @@ class TestApi(unittest.TestCase):
                 },
             )
             self.assertEqual(create_resp.status_code, 200)
+            case_health_resp = client.post(
+                "/invoices/inv-api-1/case-health-check",
+                json={
+                    "user_id": "USER-102",
+                    "correct_customer_legal_entity": True,
+                    "description_of_goods_or_services": True,
+                    "invoice_number_and_date_verified": True,
+                    "amount_matches_contract_or_quote": True,
+                    "correct_billing_address": True,
+                    "vat_numbers_checked": True,
+                    "purchase_order_supplied_if_required": True,
+                    "payment_terms_and_due_date_established": True,
+                    "delivery_or_acceptance_proof_attached": True,
+                    "no_unresolved_credit_notes": True,
+                    "direct_payments_checked": True,
+                    "no_known_dispute": True,
+                    "creditor_authority_verified": True,
+                    "limitation_period_checked": True,
+                    "debtor_contact_details_verified": True,
+                    "court_handoff_boundary_acknowledged": True,
+                },
+            )
+            self.assertEqual(case_health_resp.status_code, 200)
+            self.assertEqual(case_health_resp.json()["case_confidence"], "READY")
+
+            verification_register_resp = client.post(
+                "/invoices/inv-api-1/debtor-verification/register",
+                json={"creditor_name": "First Cairn Digital Client Ltd", "invoice_reference": "INV-001"},
+            )
+            self.assertEqual(verification_register_resp.status_code, 200)
+            verification_body = verification_register_resp.json()
+            verify_resp = client.get(
+                f"/verify?case={verification_body['case_id']}&code={verification_body['verification_code']}"
+            )
+            self.assertEqual(verify_resp.status_code, 200)
+            self.assertTrue(verify_resp.json()["valid"])
+
             legal_gate_resp = client.post(
                 "/invoices/inv-api-1/legal-safety-gate/confirm",
                 json={
@@ -69,7 +106,7 @@ class TestApi(unittest.TestCase):
 
             five_ledger_resp = client.get("/invoices/inv-api-1/five-ledger-summary")
             self.assertEqual(five_ledger_resp.status_code, 200)
-            self.assertEqual(five_ledger_resp.json()["compliance_ledger_events_count"], 2)
+            self.assertGreaterEqual(five_ledger_resp.json()["compliance_ledger_events_count"], 4)
 
             fee_action_resp = client.post(
                 "/invoices/inv-api-1/client-fee-ledger/actions",
@@ -386,6 +423,88 @@ class TestApi(unittest.TestCase):
                 },
             )
             self.assertEqual(gate_resp.status_code, 400)
+
+    def test_escalation_blocked_until_health_and_accuracy_resolution(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-escalation-guard.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-guard",
+                    "currency": "GBP",
+                    "principal_amount": "500",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            blocked_resp = client.post(
+                "/invoices/inv-api-guard/escalate",
+                json={"today": "2026-02-01", "current_state": "OVERDUE_CHASER"},
+            )
+            self.assertEqual(blocked_resp.status_code, 409)
+
+            health_resp = client.post(
+                "/invoices/inv-api-guard/case-health-check",
+                json={
+                    "user_id": "USER-1",
+                    "correct_customer_legal_entity": True,
+                    "description_of_goods_or_services": True,
+                    "invoice_number_and_date_verified": True,
+                    "amount_matches_contract_or_quote": True,
+                    "correct_billing_address": True,
+                    "vat_numbers_checked": True,
+                    "purchase_order_supplied_if_required": True,
+                    "payment_terms_and_due_date_established": True,
+                    "delivery_or_acceptance_proof_attached": True,
+                    "no_unresolved_credit_notes": True,
+                    "direct_payments_checked": True,
+                    "no_known_dispute": True,
+                    "creditor_authority_verified": True,
+                    "limitation_period_checked": True,
+                    "debtor_contact_details_verified": True,
+                    "court_handoff_boundary_acknowledged": True,
+                },
+            )
+            self.assertEqual(health_resp.status_code, 200)
+
+            challenge_resp = client.post(
+                "/invoices/inv-api-guard/debtor-actions/data-accuracy-challenge",
+                json={
+                    "debtor_identifier": "debtor@example.com",
+                    "challenge_reason": "DATA_INACCURATE",
+                    "challenge_details": "Address record is outdated.",
+                },
+            )
+            self.assertEqual(challenge_resp.status_code, 200)
+
+            blocked_challenge_resp = client.post(
+                "/invoices/inv-api-guard/escalate",
+                json={"today": "2026-02-01", "current_state": "OVERDUE_CHASER"},
+            )
+            self.assertEqual(blocked_challenge_resp.status_code, 409)
+
+            resolve_resp = client.post(
+                "/invoices/inv-api-guard/debtor-actions/data-accuracy-challenge/resolve",
+                json={
+                    "creditor_user_id": "USER-1",
+                    "resolution_notes": "Corrected records uploaded.",
+                },
+            )
+            self.assertEqual(resolve_resp.status_code, 200)
+
+            allowed_resp = client.post(
+                "/invoices/inv-api-guard/escalate",
+                json={"today": "2026-02-01", "current_state": "OVERDUE_CHASER"},
+            )
+            self.assertEqual(allowed_resp.status_code, 200)
 
     def test_upload_rejection_quarantine_and_metrics(self) -> None:
         with TemporaryDirectory() as tmp_dir:

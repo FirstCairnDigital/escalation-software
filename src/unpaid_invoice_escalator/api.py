@@ -29,7 +29,10 @@ from unpaid_invoice_escalator.models import (
 from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
 from unpaid_invoice_escalator.rulepacks import RulePackLoader, RulePackValidationError
 from unpaid_invoice_escalator.services.dual_ledger_engine import DualLedgerEngine
+from unpaid_invoice_escalator.services.case_health_check import CaseHealthCheck
 from unpaid_invoice_escalator.services.data_discrepancy_validator import DataDiscrepancyValidator
+from unpaid_invoice_escalator.services.debtor_verification_portal import DebtorVerificationPortal
+from unpaid_invoice_escalator.services.devils_advocate_engine import DevilsAdvocateEngine
 from unpaid_invoice_escalator.services.escalation_runner import EscalationRunner
 from unpaid_invoice_escalator.services.five_ledger_engine import FiveLedgerEngine
 from unpaid_invoice_escalator.services.jurisdiction_engine import JurisdictionFacts
@@ -66,6 +69,8 @@ class EscalateRequest(BaseModel):
     payment_plan_proposed: bool = False
     partially_paid: bool = False
     regulated_debt_suspected: bool = False
+    settlement_pending_and_not_due: bool = False
+    delivery_evidence_unverified: bool = False
     contract_jurisdiction: Jurisdiction | None = None
     creditor_country_code: str | None = None
     debtor_country_code: str | None = None
@@ -158,6 +163,51 @@ class DiscrepancyCheckRequest(BaseModel):
     principal: Decimal
     payments_recorded: Decimal
     outstanding_entered: Decimal
+
+
+class CaseHealthCheckRequest(BaseModel):
+    user_id: str
+    correct_customer_legal_entity: bool
+    description_of_goods_or_services: bool
+    invoice_number_and_date_verified: bool
+    amount_matches_contract_or_quote: bool
+    correct_billing_address: bool
+    vat_numbers_checked: bool
+    purchase_order_supplied_if_required: bool
+    payment_terms_and_due_date_established: bool
+    delivery_or_acceptance_proof_attached: bool
+    no_unresolved_credit_notes: bool
+    direct_payments_checked: bool
+    no_known_dispute: bool
+    creditor_authority_verified: bool
+    limitation_period_checked: bool
+    debtor_contact_details_verified: bool
+    court_handoff_boundary_acknowledged: bool
+
+
+class DevilsAdvocateCheckRequest(BaseModel):
+    active_dispute: bool = False
+    payment_or_credit_discrepancy: bool = False
+    delivery_evidence_unverified: bool = False
+    settlement_pending_and_not_due: bool = False
+    data_accuracy_challenge_pending: bool = False
+    insolvency_or_breathing_space_flag: bool = False
+
+
+class DebtorVerificationRegisterRequest(BaseModel):
+    creditor_name: str
+    invoice_reference: str | None = None
+
+
+class DataAccuracyChallengeRequest(BaseModel):
+    debtor_identifier: str
+    challenge_reason: str
+    challenge_details: str
+
+
+class ResolveDataAccuracyChallengeRequest(BaseModel):
+    creditor_user_id: str
+    resolution_notes: str
 
 
 def _parse_api_keys(raw: str) -> dict[str, str]:
@@ -294,6 +344,9 @@ def create_app(
     discrepancy_validator = DataDiscrepancyValidator()
     legal_safety_gate_manager = LegalSafetyGateManager(store=store, event_ledger=ledger)
     five_ledger_engine = FiveLedgerEngine(store=store)
+    case_health_check = CaseHealthCheck()
+    devils_advocate_engine = DevilsAdvocateEngine()
+    debtor_verification_portal = DebtorVerificationPortal(store=store)
     artifacts_root = Path(artifacts_dir)
     bundles_root = Path(bundles_dir)
     quarantine_root = Path(effective_quarantine_dir)
@@ -451,6 +504,8 @@ def create_app(
             "trg_hygiene_records_no_delete",
             "trg_compliance_ledger_no_update",
             "trg_compliance_ledger_no_delete",
+            "trg_debtor_verification_no_update",
+            "trg_debtor_verification_no_delete",
         )
         try:
             conn = sqlite3.connect(db_path)
@@ -551,6 +606,30 @@ def create_app(
             "steps": steps,
         }
 
+    def _latest_case_health_confidence(invoice_id: str) -> str | None:
+        entries = store.compliance_entries_for_invoice(invoice_id)
+        for entry in reversed(entries):
+            if entry.event_type == "CASE_HEALTH_CHECK":
+                confidence = str(entry.details.get("case_confidence", "")).strip().upper()
+                return confidence or None
+        return None
+
+    def _data_accuracy_challenge_is_open(invoice_id: str) -> bool:
+        entries = store.compliance_entries_for_invoice(invoice_id)
+        for entry in reversed(entries):
+            if entry.event_type == "DATA_ACCURACY_CHALLENGE_RESOLVED":
+                return False
+            if entry.event_type == "DATA_ACCURACY_CHALLENGE_OPEN":
+                return True
+        return False
+
+    def _latest_discrepancy_invalid(invoice_id: str) -> bool:
+        entries = store.compliance_entries_for_invoice(invoice_id)
+        for entry in reversed(entries):
+            if entry.event_type == "DISCREPANCY_VALIDATION":
+                return not bool(entry.details.get("valid", False))
+        return False
+
     @app.middleware("http")
     async def security_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
         request_id = request.headers.get("x-request-id") or str(uuid4())
@@ -605,6 +684,13 @@ def create_app(
     @app.get("/metrics")
     def metrics() -> dict[str, object]:
         return security.metrics_snapshot()
+
+    @app.get("/verify")
+    def verify_case(case: str, code: str) -> dict[str, object]:
+        result = debtor_verification_portal.verify(case_id=case, verification_code=code)
+        if not result.valid:
+            raise HTTPException(status_code=404, detail=result.message)
+        return {"valid": True, "message": result.message}
 
     @app.get("/deployment/startup-config-validation")
     def startup_config_validation() -> dict[str, object]:
@@ -695,6 +781,113 @@ def create_app(
             "jurisdiction": invoice.jurisdiction.value,
             "debtor_type": invoice.debtor_type.value,
             "current_state": current_state.value,
+            "chain_valid": store.verify_chain(invoice_id),
+        }
+
+    @app.post("/invoices/{invoice_id}/case-health-check")
+    def run_case_health_check(invoice_id: str, payload: CaseHealthCheckRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        criteria = {
+            "correct_customer_legal_entity": payload.correct_customer_legal_entity,
+            "description_of_goods_or_services": payload.description_of_goods_or_services,
+            "invoice_number_and_date_verified": payload.invoice_number_and_date_verified,
+            "amount_matches_contract_or_quote": payload.amount_matches_contract_or_quote,
+            "correct_billing_address": payload.correct_billing_address,
+            "vat_numbers_checked": payload.vat_numbers_checked,
+            "purchase_order_supplied_if_required": payload.purchase_order_supplied_if_required,
+            "payment_terms_and_due_date_established": payload.payment_terms_and_due_date_established,
+            "delivery_or_acceptance_proof_attached": payload.delivery_or_acceptance_proof_attached,
+            "no_unresolved_credit_notes": payload.no_unresolved_credit_notes,
+            "direct_payments_checked": payload.direct_payments_checked,
+            "no_known_dispute": payload.no_known_dispute,
+            "creditor_authority_verified": payload.creditor_authority_verified,
+            "limitation_period_checked": payload.limitation_period_checked,
+            "debtor_contact_details_verified": payload.debtor_contact_details_verified,
+            "court_handoff_boundary_acknowledged": payload.court_handoff_boundary_acknowledged,
+        }
+        result = case_health_check.evaluate(criteria=criteria)
+        now = datetime.now(timezone.utc)
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="CASE_HEALTH_CHECK",
+                details={
+                    "case_confidence": result.confidence,
+                    "user_id": payload.user_id,
+                    "passed_count": result.passed_count,
+                    "total_count": result.total_count,
+                    "failed_criteria": list(result.failed_criteria),
+                    "criteria": result.criteria,
+                },
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.SYSTEM,
+            event_type="CASE_HEALTH_CHECK",
+            timestamp=now,
+            data_payload={
+                "case_confidence": result.confidence,
+                "passed_count": result.passed_count,
+                "total_count": result.total_count,
+                "failed_criteria": list(result.failed_criteria),
+            },
+        )
+        return {
+            "invoice_id": invoice_id,
+            "case_confidence": result.confidence,
+            "passed_count": result.passed_count,
+            "total_count": result.total_count,
+            "failed_criteria": list(result.failed_criteria),
+            "chain_valid": store.verify_chain(invoice_id),
+        }
+
+    @app.post("/invoices/{invoice_id}/devils-advocate-check")
+    def run_devils_advocate_check(invoice_id: str, payload: DevilsAdvocateCheckRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        result = devils_advocate_engine.evaluate(
+            active_dispute=payload.active_dispute,
+            payment_or_credit_discrepancy=payload.payment_or_credit_discrepancy,
+            delivery_evidence_unverified=payload.delivery_evidence_unverified,
+            settlement_pending_and_not_due=payload.settlement_pending_and_not_due,
+            data_accuracy_challenge_pending=payload.data_accuracy_challenge_pending,
+            insolvency_or_breathing_space_flag=payload.insolvency_or_breathing_space_flag,
+        )
+        now = datetime.now(timezone.utc)
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="DEVILS_ADVOCATE_REVIEW",
+                details={
+                    "blocked": result.blocked,
+                    "reasons": list(result.reasons),
+                    "recommended_actions": list(result.recommended_actions),
+                },
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.SYSTEM,
+            event_type="DEVILS_ADVOCATE_REVIEW",
+            timestamp=now,
+            data_payload={
+                "blocked": result.blocked,
+                "reasons": list(result.reasons),
+            },
+        )
+        return {
+            "invoice_id": invoice_id,
+            "blocked": result.blocked,
+            "reasons": list(result.reasons),
+            "recommended_actions": list(result.recommended_actions),
             "chain_valid": store.verify_chain(invoice_id),
         }
 
@@ -797,6 +990,122 @@ def create_app(
             "circuit_breaker_triggered": result.circuit_breaker_triggered,
             "suggested_state": result.suggested_state,
             "chain_valid": store.verify_chain(invoice_id),
+        }
+
+    @app.post("/invoices/{invoice_id}/debtor-verification/register")
+    def register_debtor_verification(
+        invoice_id: str, payload: DebtorVerificationRegisterRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        invoice_reference = payload.invoice_reference or invoice.invoice_id
+        try:
+            registration = debtor_verification_portal.register_case(
+                invoice_id=invoice_id,
+                creditor_name=payload.creditor_name,
+                invoice_reference=invoice_reference,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.SYSTEM,
+            event_type="DEBTOR_VERIFICATION_REGISTERED",
+            data_payload={
+                "case_id": registration.case_id,
+                "creditor_name": registration.creditor_name,
+                "invoice_reference": registration.invoice_reference,
+            },
+        )
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=registration.created_at,
+                event_type="DEBTOR_VERIFICATION_REGISTERED",
+                details={
+                    "case_id": registration.case_id,
+                    "creditor_name": registration.creditor_name,
+                    "invoice_reference": registration.invoice_reference,
+                },
+            )
+        )
+        return {
+            "invoice_id": invoice_id,
+            "case_id": registration.case_id,
+            "verification_code": registration.verification_code,
+            "verify_url": f"/verify?case={registration.case_id}",
+        }
+
+    @app.post("/invoices/{invoice_id}/debtor-actions/data-accuracy-challenge")
+    def submit_data_accuracy_challenge(invoice_id: str, payload: DataAccuracyChallengeRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        now = datetime.now(timezone.utc)
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="DATA_ACCURACY_CHALLENGE_OPEN",
+                details={
+                    "recovery_restricted": True,
+                    "debtor_identifier": payload.debtor_identifier,
+                    "challenge_reason": payload.challenge_reason,
+                    "challenge_details": payload.challenge_details,
+                },
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.DEBTOR,
+            event_type="DATA_ACCURACY_CHALLENGE_OPEN",
+            timestamp=now,
+            data_payload={"recovery_restricted": True, "challenge_reason": payload.challenge_reason},
+        )
+        return {
+            "invoice_id": invoice_id,
+            "recovery_restricted": True,
+            "status": "RECOVERY_RESTRICTED",
+            "message": "Automation frozen pending creditor data verification or correction.",
+        }
+
+    @app.post("/invoices/{invoice_id}/debtor-actions/data-accuracy-challenge/resolve")
+    def resolve_data_accuracy_challenge(
+        invoice_id: str, payload: ResolveDataAccuracyChallengeRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        if not _data_accuracy_challenge_is_open(invoice_id):
+            raise HTTPException(status_code=409, detail="No open data-accuracy challenge to resolve.")
+        now = datetime.now(timezone.utc)
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="DATA_ACCURACY_CHALLENGE_RESOLVED",
+                details={
+                    "recovery_restricted": False,
+                    "creditor_user_id": payload.creditor_user_id,
+                    "resolution_notes": payload.resolution_notes,
+                },
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.CLIENT,
+            event_type="DATA_ACCURACY_CHALLENGE_RESOLVED",
+            timestamp=now,
+            data_payload={"recovery_restricted": False, "creditor_user_id": payload.creditor_user_id},
+        )
+        return {
+            "invoice_id": invoice_id,
+            "recovery_restricted": False,
+            "status": "RECOVERY_RESTORED",
         }
 
     @app.get("/invoices/{invoice_id}/evidence-artifacts")
@@ -1128,6 +1437,64 @@ def create_app(
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
+
+        case_health_confidence = _latest_case_health_confidence(invoice_id)
+        if case_health_confidence is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Pre-escalation case health check is required before escalation can proceed.",
+            )
+        if case_health_confidence != "READY":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Escalation blocked by case health confidence: {case_health_confidence}.",
+            )
+        if _latest_discrepancy_invalid(invoice_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Escalation blocked by unresolved discrepancy validation failure.",
+            )
+        if _data_accuracy_challenge_is_open(invoice_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Escalation blocked while debtor data-accuracy challenge is open.",
+            )
+
+        devils_advocate_result = devils_advocate_engine.evaluate(
+            active_dispute=payload.debtor_feedback == "DISPUTE",
+            payment_or_credit_discrepancy=_latest_discrepancy_invalid(invoice_id),
+            delivery_evidence_unverified=payload.delivery_evidence_unverified,
+            settlement_pending_and_not_due=payload.settlement_pending_and_not_due,
+            data_accuracy_challenge_pending=_data_accuracy_challenge_is_open(invoice_id),
+            insolvency_or_breathing_space_flag=(
+                payload.system_flag in {"BREATHING_SPACE", "INSOLVENCY"} or payload.insolvency_flag
+            ),
+        )
+        if devils_advocate_result.blocked:
+            now = datetime.now(timezone.utc)
+            store.append_compliance_entry(
+                ComplianceLedgerEntry(
+                    entry_id=str(uuid4()),
+                    invoice_id=invoice_id,
+                    timestamp=now,
+                    event_type="DEVILS_ADVOCATE_BLOCK",
+                    details={
+                        "reasons": list(devils_advocate_result.reasons),
+                        "recommended_actions": list(devils_advocate_result.recommended_actions),
+                    },
+                )
+            )
+            ledger.append_event(
+                invoice_id=invoice_id,
+                actor=Actor.SYSTEM,
+                event_type="DEVILS_ADVOCATE_BLOCK",
+                timestamp=now,
+                data_payload={"reasons": list(devils_advocate_result.reasons)},
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="Escalation blocked by devil's advocate verification checks.",
+            )
 
         current_state = payload.current_state or store.infer_state(invoice_id)
         state_entered_on = payload.state_entered_on or store.infer_state_entered_on(invoice_id, current_state)

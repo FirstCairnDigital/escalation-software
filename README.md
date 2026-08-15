@@ -86,14 +86,25 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 ## API Endpoints
 - `GET /health`
 - `GET /ready` (readiness check; public)
+- `GET /verify?case=&code=` (public anti-phishing verification)
 - `GET /metrics` (admin role when auth enabled)
 - `GET /deployment/startup-config-validation` (admin role when auth enabled)
+- `GET /deployment/startup-config-validation/report` (admin role when auth enabled)
 - `GET /deployment/runbook` (admin role when auth enabled)
 - `GET /` (Web UI)
 - `GET /ui/invoices/{invoice_id}` (Tabbed invoice workspace)
 - `GET /rule-packs/{jurisdiction}/active?on_date=YYYY-MM-DD`
 - `POST /invoices`
 - `GET /invoices/{invoice_id}`
+- `POST /invoices/{invoice_id}/case-health-check`
+- `POST /invoices/{invoice_id}/devils-advocate-check`
+- `GET /invoices/{invoice_id}/five-ledger-summary`
+- `POST /invoices/{invoice_id}/legal-safety-gate/confirm`
+- `POST /invoices/{invoice_id}/discrepancy-check`
+- `GET /invoices/{invoice_id}/compliance-ledger`
+- `POST /invoices/{invoice_id}/debtor-verification/register`
+- `POST /invoices/{invoice_id}/debtor-actions/data-accuracy-challenge`
+- `POST /invoices/{invoice_id}/debtor-actions/data-accuracy-challenge/resolve`
 - `GET /invoices/{invoice_id}/evidence-artifacts?artifact_type=&limit=100&offset=0`
 - `GET /invoices/{invoice_id}/ledger-events?event_type=&limit=100&offset=0`
 - `GET /invoices/{invoice_id}/debtor-ledger`
@@ -158,6 +169,7 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
   - environment and effective security settings
   - check list (pass/fail + severity + detail)
   - aggregated `errors` and `warnings`
+- `GET /deployment/startup-config-validation/report` returns startup validation plus runbook summary in one payload.
 - `GET /deployment/runbook` returns deployment action steps with completion flags based on current checks.
 
 ## Upload Rejection & Quarantine

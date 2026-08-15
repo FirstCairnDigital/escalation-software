@@ -177,3 +177,13 @@ class ComplianceLedgerEntry:
     timestamp: datetime
     event_type: str
     details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class DebtorVerificationCase:
+    case_id: str
+    invoice_id: str
+    creditor_name: str
+    invoice_reference: str
+    verification_code_hash: str
+    created_at: datetime

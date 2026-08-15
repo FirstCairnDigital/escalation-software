@@ -210,6 +210,22 @@ class TestApiSecurity(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_verify_endpoint_is_public(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-verify-public.db")
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                bundles_dir=str(Path(tmp_dir) / "bundles"),
+                auth_enabled=True,
+                api_keys={"viewer-key": "viewer", "admin-key": "admin"},
+                manifest_signing_key="non-default-key",
+                manifest_key_id="fcd-kms-key-ready",
+            )
+            with TestClient(app) as client:
+                verify_resp = client.get("/verify?case=FCD-R-2026-000001&code=ABCDEFGH")
+                self.assertEqual(verify_resp.status_code, 404)
+
     def test_readiness_fails_with_invalid_upload_limit(self) -> None:
         tmp_dir = mkdtemp()
         try:

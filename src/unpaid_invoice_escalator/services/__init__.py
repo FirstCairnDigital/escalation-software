@@ -1,5 +1,12 @@
 from .dual_ledger_engine import DualLedgerEngine, LedgerBalances
+from .case_health_check import CaseHealthCheck, CaseHealthCheckResult
 from .data_discrepancy_validator import DataDiscrepancyValidator, DiscrepancyValidationResult
+from .debtor_verification_portal import (
+    DebtorVerificationPortal,
+    DebtorVerificationRegistration,
+    DebtorVerificationResult,
+)
+from .devils_advocate_engine import DevilsAdvocateEngine, DevilsAdvocateResult
 from .evidence_pack_compiler import EvidenceBundleInput, EvidencePackCompiler
 from .escalation_runner import EscalationRunner, EscalationStepResult
 from .five_ledger_engine import FiveLedgerEngine, FiveLedgerSummary
@@ -14,8 +21,15 @@ from .sqlite_invoice_ledger import SQLiteInvoiceLedger
 __all__ = [
     "EvidenceBundleInput",
     "EvidencePackCompiler",
+    "CaseHealthCheck",
+    "CaseHealthCheckResult",
     "DataDiscrepancyValidator",
     "DiscrepancyValidationResult",
+    "DebtorVerificationPortal",
+    "DebtorVerificationRegistration",
+    "DebtorVerificationResult",
+    "DevilsAdvocateEngine",
+    "DevilsAdvocateResult",
     "DualLedgerEngine",
     "EscalationRunner",
     "EscalationStepResult",
