@@ -2478,6 +2478,8 @@ def create_app(
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
         artifacts = store.artifacts_for_invoice(invoice_id)
+        compliance_entries = store.compliance_entries_for_invoice(invoice_id)
+        ledger_events = store.events_for_invoice(invoice_id)
         delivery_timeline = [
             (
                 f"{event.timestamp.isoformat()} | Comm={event.communication_id} | "
@@ -2493,9 +2495,37 @@ def create_app(
         }
         correction_notices = [
             f"{entry.timestamp.isoformat()} | {entry.event_type} | {entry.details}"
-            for entry in store.compliance_entries_for_invoice(invoice_id)
+            for entry in compliance_entries
             if entry.event_type in correction_notice_events
         ]
+        artifact_inventory = [
+            (
+                f"{artifact.upload_timestamp.isoformat()} | {artifact.artifact_type.value} | "
+                f"Doc={artifact.document_id} | Hash={artifact.file_hash} | Path={artifact.file_path}"
+            )
+            for artifact in artifacts
+        ]
+
+        def _latest_compliance_entry(event_type: str) -> str:
+            for entry in reversed(compliance_entries):
+                if entry.event_type == event_type:
+                    return f"{entry.timestamp.isoformat()} | {event_type} | {entry.details}"
+            return f"{event_type} | NOT_RECORDED"
+
+        compliance_snapshot = [
+            _latest_compliance_entry("LEGAL_SAFETY_GATE_ACCEPTED"),
+            _latest_compliance_entry("CASE_HEALTH_CHECK"),
+            _latest_compliance_entry("DISCREPANCY_VALIDATION"),
+            _latest_compliance_entry("DATA_ACCURACY_CHALLENGE_OPEN"),
+            _latest_compliance_entry("DATA_ACCURACY_CHALLENGE_RESOLVED"),
+        ]
+        latest_hash = ledger_events[-1].hash if ledger_events else "GENESIS"
+        event_chain_attestation = [
+            f"Chain Valid: {store.verify_chain(invoice_id)}",
+            f"Events Count: {len(ledger_events)}",
+            f"Latest Event Hash: {latest_hash}",
+        ]
+
         resolution_artifact_paths: list[str] = []
         if payload.include_resolution_artifacts:
             for plan in store.payment_plan_agreements_for_invoice(invoice_id):
@@ -2517,6 +2547,9 @@ def create_app(
                         output_filename=f"full_final_settlement_{offer.offer_id}.pdf",
                     )
                 )
+        pre_action_notice_paths = [
+            artifact.file_path for artifact in artifacts if artifact.artifact_type == ArtifactType.PRE_ACTION_NOTICE
+        ]
         output_path = bundles_root / invoice_id / payload.output_filename
         output_path.parent.mkdir(parents=True, exist_ok=True)
         generated_path = runner.compile_evidence_bundle(
@@ -2529,7 +2562,7 @@ def create_app(
                 for artifact in artifacts
                 if artifact.artifact_type in (ArtifactType.PROOF_OF_DELIVERY, ArtifactType.OTHER)
             ],
-            formal_notices=payload.formal_notices,
+            formal_notices=[*payload.formal_notices, *pre_action_notice_paths],
             debtor_ledger_breakdown=[
                 f"{entry.timestamp.date().isoformat()} | {entry.entry_type.value} | GBP {entry.amount_gbp} | {entry.description}"
                 for entry in store.debtor_ledger_entries_for_invoice(invoice_id)
@@ -2544,6 +2577,9 @@ def create_app(
             resolution_artifact_paths=resolution_artifact_paths,
             communication_delivery_timeline=delivery_timeline,
             correction_withdrawal_notices=correction_notices,
+            evidence_artifact_inventory=artifact_inventory,
+            compliance_snapshot=compliance_snapshot,
+            event_chain_attestation=event_chain_attestation,
         )
         return {"invoice_id": invoice_id, "bundle_path": generated_path}
 

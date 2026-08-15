@@ -1105,6 +1105,9 @@ class TestApi(unittest.TestCase):
             self.assertIn(b"Communication Delivery Timeline:", bundle_bytes)
             self.assertIn(b"Correction and Withdrawal Notices:", bundle_bytes)
             self.assertIn(b"DATA_ACCURACY_CHALLENGE_OPEN", bundle_bytes)
+            self.assertIn(b"Evidence Artifact Inventory:", bundle_bytes)
+            self.assertIn(b"Compliance Snapshot:", bundle_bytes)
+            self.assertIn(b"Event Chain Attestation:", bundle_bytes)
 
 
 if __name__ == "__main__":

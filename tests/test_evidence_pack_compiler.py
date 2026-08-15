@@ -46,6 +46,9 @@ class TestEvidencePackCompiler(unittest.TestCase):
             self.assertTrue(any("Contract Artifacts:" in line for line in lines))
             self.assertTrue(any("Communication Delivery Timeline:" in line for line in lines))
             self.assertTrue(any("Correction and Withdrawal Notices:" in line for line in lines))
+            self.assertTrue(any("Evidence Artifact Inventory:" in line for line in lines))
+            self.assertTrue(any("Compliance Snapshot:" in line for line in lines))
+            self.assertTrue(any("Event Chain Attestation:" in line for line in lines))
 
 
 if __name__ == "__main__":

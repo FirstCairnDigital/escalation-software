@@ -22,6 +22,9 @@ class EvidenceBundleInput:
     resolution_artifact_paths: tuple[str, ...] = ()
     communication_delivery_timeline: tuple[str, ...] = ()
     correction_withdrawal_notices: tuple[str, ...] = ()
+    evidence_artifact_inventory: tuple[str, ...] = ()
+    compliance_snapshot: tuple[str, ...] = ()
+    event_chain_attestation: tuple[str, ...] = ()
 
 
 class EvidencePackCompiler:
@@ -110,6 +113,15 @@ class EvidencePackCompiler:
         lines.append("")
         lines.append("Correction and Withdrawal Notices:")
         lines.extend([f"- {line}" for line in bundle.correction_withdrawal_notices] or ["- None provided"])
+        lines.append("")
+        lines.append("Evidence Artifact Inventory:")
+        lines.extend([f"- {line}" for line in bundle.evidence_artifact_inventory] or ["- None provided"])
+        lines.append("")
+        lines.append("Compliance Snapshot:")
+        lines.extend([f"- {line}" for line in bundle.compliance_snapshot] or ["- None provided"])
+        lines.append("")
+        lines.append("Event Chain Attestation:")
+        lines.extend([f"- {line}" for line in bundle.event_chain_attestation] or ["- None provided"])
         return lines
 
     @staticmethod

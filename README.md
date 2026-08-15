@@ -230,6 +230,7 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 - Automated communications enforce a pre-send balance lock and require a positive outstanding balance at send time.
 - Recording payment or credit entries automatically cancels pending automated communications (`CREATED`/`QUEUED`).
 - Evidence bundles now include a communication delivery timeline and correction/withdrawal notice section sourced from compliance events.
+- Evidence bundles also include an artifact inventory, compliance snapshot, and event-chain attestation (validity, event count, latest hash).
 
 ## Deployment Runbook (Minimal)
 1. Set production environment variables (above).

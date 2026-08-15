@@ -101,6 +101,9 @@ class EscalationRunner:
         resolution_artifact_paths: Iterable[str] = (),
         communication_delivery_timeline: Iterable[str] = (),
         correction_withdrawal_notices: Iterable[str] = (),
+        evidence_artifact_inventory: Iterable[str] = (),
+        compliance_snapshot: Iterable[str] = (),
+        event_chain_attestation: Iterable[str] = (),
     ) -> str:
         bundle = EvidenceBundleInput(
             invoice=invoice,
@@ -115,6 +118,9 @@ class EscalationRunner:
             resolution_artifact_paths=tuple(resolution_artifact_paths),
             communication_delivery_timeline=tuple(communication_delivery_timeline),
             correction_withdrawal_notices=tuple(correction_withdrawal_notices),
+            evidence_artifact_inventory=tuple(evidence_artifact_inventory),
+            compliance_snapshot=tuple(compliance_snapshot),
+            event_chain_attestation=tuple(event_chain_attestation),
         )
         generated_path = self._evidence_pack_compiler.compile_bundle(bundle, output_path)
         self._ledger.append_event(
