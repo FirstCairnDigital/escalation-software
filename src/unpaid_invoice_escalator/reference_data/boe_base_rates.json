@@ -1,0 +1,21 @@
+{
+  "entries": [
+    {
+      "effective_from": "2020-01-01",
+      "rate": 0.005
+    },
+    {
+      "effective_from": "2022-12-01",
+      "rate": 0.035
+    },
+    {
+      "effective_from": "2024-01-01",
+      "rate": 0.0525
+    },
+    {
+      "effective_from": "2025-01-01",
+      "rate": 0.05
+    }
+  ]
+}
+

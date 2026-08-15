@@ -1,0 +1,20 @@
+{
+  "rule_id": "ni-commercial-invoice-recovery",
+  "jurisdiction": "NORTHERN_IRELAND",
+  "rule_version": "2026.08.15",
+  "effective_from": "2020-01-01",
+  "effective_to": null,
+  "source_authority": "NI Direct Small Claims / County Court Commercial Protocol",
+  "source_reference": "Operational guidance rule pack",
+  "fcd_automation_limit": 5000,
+  "human_approval_required": true,
+  "workflow": {
+    "sole_trader_wait_days": 30,
+    "corporate_wait_days": 14,
+    "sole_trader_documents": ["Letter of Claim", "Reply Form", "Information Sheet"],
+    "corporate_documents": ["14-day Letter Before Action"],
+    "small_claims_pack": ["NI Direct Small Claims Evidence Pack"],
+    "over_limit_pack": ["County Court Civil Bill / NI Solicitor Briefing Pack"],
+    "enforcement_note": "Enforcement of Judgments Office (EJO)"
+  }
+}

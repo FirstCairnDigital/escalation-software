@@ -1,0 +1,20 @@
+{
+  "rule_id": "ew-commercial-invoice-recovery",
+  "jurisdiction": "ENGLAND_WALES",
+  "rule_version": "2026.08.15",
+  "effective_from": "2020-01-01",
+  "effective_to": null,
+  "source_authority": "Pre-Action Protocol for Debt Claims / Civil Procedure Rules",
+  "source_reference": "Operational guidance rule pack",
+  "fcd_automation_limit": 10000,
+  "human_approval_required": true,
+  "workflow": {
+    "sole_trader_wait_days": 30,
+    "corporate_wait_days": 14,
+    "sole_trader_documents": ["Letter of Claim", "Reply Form", "Information Sheet"],
+    "corporate_documents": ["14-day Letter Before Action"],
+    "small_claims_pack": ["MMCO Evidence Pack"],
+    "over_limit_pack": ["County Court / Solicitor Briefing Pack"],
+    "enforcement_note": "High Court Enforcement Officers (HCEOs) or County Court Bailiffs"
+  }
+}

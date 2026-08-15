@@ -1,0 +1,16 @@
+{
+  "rule_id": "scotland-commercial-invoice-recovery",
+  "jurisdiction": "SCOTLAND",
+  "rule_version": "2026.08.15",
+  "effective_from": "2020-01-01",
+  "effective_to": null,
+  "source_authority": "Simple Procedure / Sheriff Court",
+  "source_reference": "Operational guidance rule pack",
+  "fcd_automation_limit": 5000,
+  "human_approval_required": true,
+  "workflow": {
+    "small_claims_pack": ["Scottish Civil Online Form 3A Evidence Pack"],
+    "over_limit_pack": ["Formal Notice", "Ordinary Cause / Sheriff Court Briefing Pack"],
+    "enforcement_note": "Sheriff Officers"
+  }
+}

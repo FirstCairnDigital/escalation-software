@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unpaid-invoice-escalator"
+version = "0.1.0"
+description = "Autonomous B2B unpaid invoice escalation engine with immutable evidence ledger."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+invoice-escalator = "unpaid_invoice_escalator.cli:main"
+invoice-escalator-api = "unpaid_invoice_escalator.api:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
