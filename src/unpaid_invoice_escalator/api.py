@@ -291,6 +291,42 @@ class BalanceCorrectionRequest(BaseModel):
     corrected_statement_subject: str = "Corrected Statement"
 
 
+class PortalDataAccuracyChallengeActionRequest(BaseModel):
+    case: str
+    code: str
+    debtor_identifier: str
+    challenge_reason: str
+    challenge_details: str
+
+
+class PortalPaymentPlanActionRequest(BaseModel):
+    case: str
+    code: str
+    debtor_identifier: str
+    installment_amount_gbp: Decimal
+    installment_count: int
+    first_due_date: date
+    frequency_days: int
+    notes: str = ""
+
+
+class PortalSettlementOfferActionRequest(BaseModel):
+    case: str
+    code: str
+    debtor_identifier: str
+    offered_amount_gbp: Decimal
+    expiry_date: date
+    notes: str = ""
+
+
+class PortalPaymentReportedActionRequest(BaseModel):
+    case: str
+    code: str
+    debtor_identifier: str
+    amount_gbp: Decimal
+    payment_reference: str = ""
+
+
 def _parse_api_keys(raw: str) -> dict[str, str]:
     keys: dict[str, str] = {}
     for item in raw.split(","):
@@ -764,6 +800,92 @@ def create_app(
             )
         return outstanding
 
+    def _resolve_verified_portal_case(*, case: str, code: str):
+        result = debtor_verification_portal.verify(case_id=case, verification_code=code)
+        if not result.valid:
+            raise HTTPException(status_code=404, detail=result.message)
+        verification_case = store.debtor_verification_case_by_case_id(case.strip())
+        if verification_case is None:
+            raise HTTPException(status_code=404, detail="Verification case record not found.")
+        return verification_case, result
+
+    def _open_data_accuracy_challenge(
+        *,
+        invoice_id: str,
+        debtor_identifier: str,
+        challenge_reason: str,
+        challenge_details: str,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="DATA_ACCURACY_CHALLENGE_OPEN",
+                details={
+                    "recovery_restricted": True,
+                    "debtor_identifier": debtor_identifier,
+                    "challenge_reason": challenge_reason,
+                    "challenge_details": challenge_details,
+                },
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.DEBTOR,
+            event_type="DATA_ACCURACY_CHALLENGE_OPEN",
+            timestamp=now,
+            data_payload={"recovery_restricted": True, "challenge_reason": challenge_reason},
+        )
+
+    def _cancel_pending_automated_communications(
+        *,
+        invoice_id: str,
+        trigger_entry_type: DebtorLedgerEntryType,
+    ) -> list[str]:
+        cancelled_communications: list[str] = []
+        for snapshot in communication_delivery_tracker.snapshots_for_invoice(invoice_id):
+            if not snapshot.communication.automated:
+                continue
+            if snapshot.latest_state not in {CommunicationDeliveryState.CREATED, CommunicationDeliveryState.QUEUED}:
+                continue
+            try:
+                communication_delivery_tracker.record_delivery_event(
+                    invoice_id=invoice_id,
+                    communication_id=snapshot.communication.communication_id,
+                    next_state=CommunicationDeliveryState.CANCELLED,
+                    note="Cancelled automatically due to payment/credit ledger entry.",
+                )
+                cancelled_communications.append(snapshot.communication.communication_id)
+            except ValueError:
+                continue
+        if cancelled_communications:
+            now = datetime.now(timezone.utc)
+            store.append_compliance_entry(
+                ComplianceLedgerEntry(
+                    entry_id=str(uuid4()),
+                    invoice_id=invoice_id,
+                    timestamp=now,
+                    event_type="PENDING_COMMUNICATIONS_CANCELLED_ON_PAYMENT_OR_CREDIT",
+                    details={
+                        "entry_type": trigger_entry_type.value,
+                        "cancelled_communication_ids": cancelled_communications,
+                    },
+                )
+            )
+            ledger.append_event(
+                invoice_id=invoice_id,
+                actor=Actor.SYSTEM,
+                event_type="PENDING_COMMUNICATIONS_CANCELLED_ON_PAYMENT_OR_CREDIT",
+                timestamp=now,
+                data_payload={
+                    "entry_type": trigger_entry_type.value,
+                    "cancelled_communication_ids": cancelled_communications,
+                },
+            )
+        return cancelled_communications
+
     def _generate_promise_to_pay_artifact(invoice_id: str, plan_id: str, output_filename: str) -> EvidenceArtifact:
         agreements = store.payment_plan_agreements_for_invoice(invoice_id)
         agreement = next((item for item in agreements if item.plan_id == plan_id), None)
@@ -898,6 +1020,159 @@ def create_app(
                 "Correct Inaccurate Information",
                 "View Independent Legal Advice Links",
             ],
+        }
+
+    @app.post("/portal/actions/data-accuracy-challenge")
+    def portal_data_accuracy_challenge(payload: PortalDataAccuracyChallengeActionRequest) -> dict[str, object]:
+        verification_case, _ = _resolve_verified_portal_case(case=payload.case, code=payload.code)
+        _open_data_accuracy_challenge(
+            invoice_id=verification_case.invoice_id,
+            debtor_identifier=payload.debtor_identifier,
+            challenge_reason=payload.challenge_reason,
+            challenge_details=payload.challenge_details,
+        )
+        return {
+            "invoice_id": verification_case.invoice_id,
+            "case_id": verification_case.case_id,
+            "recovery_restricted": True,
+            "status": "RECOVERY_RESTRICTED",
+        }
+
+    @app.post("/portal/actions/payment-plan-proposals")
+    def portal_propose_payment_plan(payload: PortalPaymentPlanActionRequest) -> dict[str, object]:
+        verification_case, _ = _resolve_verified_portal_case(case=payload.case, code=payload.code)
+        try:
+            plan, installments = resolution_engine.propose_payment_plan(
+                invoice_id=verification_case.invoice_id,
+                proposed_by=f"DEBTOR_PORTAL:{payload.debtor_identifier}",
+                installment_amount_gbp=payload.installment_amount_gbp,
+                installment_count=payload.installment_count,
+                first_due_date=payload.first_due_date,
+                frequency_days=payload.frequency_days,
+                notes=payload.notes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=verification_case.invoice_id,
+                timestamp=plan.created_at,
+                event_type="PAYMENT_PLAN_PROPOSED",
+                details={
+                    "source": "PORTAL",
+                    "plan_id": plan.plan_id,
+                    "debtor_identifier": payload.debtor_identifier,
+                    "installment_amount_gbp": str(plan.installment_amount_gbp),
+                    "installment_count": plan.installment_count,
+                    "first_due_date": plan.first_due_date.isoformat(),
+                },
+            )
+        )
+        return {
+            "invoice_id": verification_case.invoice_id,
+            "case_id": verification_case.case_id,
+            "plan_id": plan.plan_id,
+            "status": "ACTIVE",
+            "installments": [
+                {
+                    "installment_id": item.installment_id,
+                    "sequence_number": item.sequence_number,
+                    "due_date": item.due_date.isoformat(),
+                    "amount_gbp": str(item.amount_gbp),
+                }
+                for item in installments
+            ],
+        }
+
+    @app.post("/portal/actions/settlement-offers")
+    def portal_propose_settlement_offer(payload: PortalSettlementOfferActionRequest) -> dict[str, object]:
+        verification_case, _ = _resolve_verified_portal_case(case=payload.case, code=payload.code)
+        try:
+            offer = resolution_engine.propose_settlement_offer(
+                invoice_id=verification_case.invoice_id,
+                offered_by=f"DEBTOR_PORTAL:{payload.debtor_identifier}",
+                offered_amount_gbp=payload.offered_amount_gbp,
+                expiry_date=payload.expiry_date,
+                notes=payload.notes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=verification_case.invoice_id,
+                timestamp=offer.offered_at,
+                event_type="SETTLEMENT_OFFER_PROPOSED",
+                details={
+                    "source": "PORTAL",
+                    "offer_id": offer.offer_id,
+                    "debtor_identifier": payload.debtor_identifier,
+                    "offered_amount_gbp": str(offer.offered_amount_gbp),
+                    "expiry_date": offer.expiry_date.isoformat(),
+                },
+            )
+        )
+        return {
+            "invoice_id": verification_case.invoice_id,
+            "case_id": verification_case.case_id,
+            "offer_id": offer.offer_id,
+            "offered_amount_gbp": str(offer.offered_amount_gbp),
+            "expiry_date": offer.expiry_date.isoformat(),
+            "status": "OPEN",
+        }
+
+    @app.post("/portal/actions/confirm-paid")
+    def portal_confirm_paid(payload: PortalPaymentReportedActionRequest) -> dict[str, object]:
+        verification_case, _ = _resolve_verified_portal_case(case=payload.case, code=payload.code)
+        amount = abs(payload.amount_gbp)
+        entry = dual_ledger_engine.add_debtor_entry(
+            invoice_id=verification_case.invoice_id,
+            entry_type=DebtorLedgerEntryType.PAYMENT_RECEIVED,
+            amount_gbp=-amount,
+            description=(
+                "Debtor self-reported payment via portal."
+                + (f" Reference: {payload.payment_reference}" if payload.payment_reference else "")
+            ),
+        )
+        cancelled = _cancel_pending_automated_communications(
+            invoice_id=verification_case.invoice_id,
+            trigger_entry_type=DebtorLedgerEntryType.PAYMENT_RECEIVED,
+        )
+        now = datetime.now(timezone.utc)
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=verification_case.invoice_id,
+                timestamp=now,
+                event_type="PORTAL_PAYMENT_REPORTED",
+                details={
+                    "debtor_identifier": payload.debtor_identifier,
+                    "entry_id": entry.entry_id,
+                    "amount_gbp": str(amount),
+                    "payment_reference": payload.payment_reference,
+                    "cancelled_communication_ids": cancelled,
+                },
+            )
+        )
+        ledger.append_event(
+            invoice_id=verification_case.invoice_id,
+            actor=Actor.DEBTOR,
+            event_type="PORTAL_PAYMENT_REPORTED",
+            timestamp=now,
+            data_payload={
+                "entry_id": entry.entry_id,
+                "amount_gbp": str(amount),
+                "payment_reference": payload.payment_reference,
+                "cancelled_communication_ids": cancelled,
+            },
+        )
+        return {
+            "invoice_id": verification_case.invoice_id,
+            "case_id": verification_case.case_id,
+            "entry_id": entry.entry_id,
+            "amount_gbp": str(amount),
+            "cancelled_pending_communication_ids": cancelled,
         }
 
     @app.get("/deployment/startup-config-validation")
@@ -1499,27 +1774,11 @@ def create_app(
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
-        now = datetime.now(timezone.utc)
-        store.append_compliance_entry(
-            ComplianceLedgerEntry(
-                entry_id=str(uuid4()),
-                invoice_id=invoice_id,
-                timestamp=now,
-                event_type="DATA_ACCURACY_CHALLENGE_OPEN",
-                details={
-                    "recovery_restricted": True,
-                    "debtor_identifier": payload.debtor_identifier,
-                    "challenge_reason": payload.challenge_reason,
-                    "challenge_details": payload.challenge_details,
-                },
-            )
-        )
-        ledger.append_event(
+        _open_data_accuracy_challenge(
             invoice_id=invoice_id,
-            actor=Actor.DEBTOR,
-            event_type="DATA_ACCURACY_CHALLENGE_OPEN",
-            timestamp=now,
-            data_payload={"recovery_restricted": True, "challenge_reason": payload.challenge_reason},
+            debtor_identifier=payload.debtor_identifier,
+            challenge_reason=payload.challenge_reason,
+            challenge_details=payload.challenge_details,
         )
         return {
             "invoice_id": invoice_id,
@@ -2136,45 +2395,10 @@ def create_app(
         )
         cancelled_communications: list[str] = []
         if payload.entry_type in {DebtorLedgerEntryType.PAYMENT_RECEIVED, DebtorLedgerEntryType.CREDIT_NOTE}:
-            for snapshot in communication_delivery_tracker.snapshots_for_invoice(invoice_id):
-                if not snapshot.communication.automated:
-                    continue
-                if snapshot.latest_state not in {CommunicationDeliveryState.CREATED, CommunicationDeliveryState.QUEUED}:
-                    continue
-                try:
-                    communication_delivery_tracker.record_delivery_event(
-                        invoice_id=invoice_id,
-                        communication_id=snapshot.communication.communication_id,
-                        next_state=CommunicationDeliveryState.CANCELLED,
-                        note="Cancelled automatically due to payment/credit ledger entry.",
-                    )
-                    cancelled_communications.append(snapshot.communication.communication_id)
-                except ValueError:
-                    continue
-            if cancelled_communications:
-                now = datetime.now(timezone.utc)
-                store.append_compliance_entry(
-                    ComplianceLedgerEntry(
-                        entry_id=str(uuid4()),
-                        invoice_id=invoice_id,
-                        timestamp=now,
-                        event_type="PENDING_COMMUNICATIONS_CANCELLED_ON_PAYMENT_OR_CREDIT",
-                        details={
-                            "entry_type": payload.entry_type.value,
-                            "cancelled_communication_ids": cancelled_communications,
-                        },
-                    )
-                )
-                ledger.append_event(
-                    invoice_id=invoice_id,
-                    actor=Actor.SYSTEM,
-                    event_type="PENDING_COMMUNICATIONS_CANCELLED_ON_PAYMENT_OR_CREDIT",
-                    timestamp=now,
-                    data_payload={
-                        "entry_type": payload.entry_type.value,
-                        "cancelled_communication_ids": cancelled_communications,
-                    },
-                )
+            cancelled_communications = _cancel_pending_automated_communications(
+                invoice_id=invoice_id,
+                trigger_entry_type=payload.entry_type,
+            )
         balances = dual_ledger_engine.balances_for_invoice(invoice_id)
         return {
             "invoice_id": invoice_id,

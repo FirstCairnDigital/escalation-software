@@ -618,6 +618,115 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(blocked_resp.status_code, 409)
 
+    def test_portal_actions_execute_workflows(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-portal-actions.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-portal",
+                    "currency": "GBP",
+                    "principal_amount": "1200",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+            reg_resp = client.post(
+                "/invoices/inv-api-portal/debtor-verification/register",
+                json={"creditor_name": "Creditor Ltd", "invoice_reference": "INV-PORTAL-1"},
+            )
+            self.assertEqual(reg_resp.status_code, 200)
+            case_id = reg_resp.json()["case_id"]
+            code = reg_resp.json()["verification_code"]
+
+            accuracy_resp = client.post(
+                "/portal/actions/data-accuracy-challenge",
+                json={
+                    "case": case_id,
+                    "code": code,
+                    "debtor_identifier": "debtor-portal",
+                    "challenge_reason": "Incorrect amount",
+                    "challenge_details": "Please verify amount and credits.",
+                },
+            )
+            self.assertEqual(accuracy_resp.status_code, 200)
+            self.assertTrue(accuracy_resp.json()["recovery_restricted"])
+
+            plan_resp = client.post(
+                "/portal/actions/payment-plan-proposals",
+                json={
+                    "case": case_id,
+                    "code": code,
+                    "debtor_identifier": "debtor-portal",
+                    "installment_amount_gbp": "100",
+                    "installment_count": 3,
+                    "first_due_date": "2026-03-01",
+                    "frequency_days": 30,
+                    "notes": "Debtor-proposed schedule",
+                },
+            )
+            self.assertEqual(plan_resp.status_code, 200)
+            self.assertEqual(plan_resp.json()["status"], "ACTIVE")
+
+            offer_resp = client.post(
+                "/portal/actions/settlement-offers",
+                json={
+                    "case": case_id,
+                    "code": code,
+                    "debtor_identifier": "debtor-portal",
+                    "offered_amount_gbp": "900",
+                    "expiry_date": "2026-04-01",
+                    "notes": "Settlement proposal",
+                },
+            )
+            self.assertEqual(offer_resp.status_code, 200)
+            self.assertEqual(offer_resp.json()["status"], "OPEN")
+
+            comm_resp = client.post(
+                "/invoices/inv-api-portal/communications",
+                json={
+                    "channel": "EMAIL",
+                    "recipient": "debtor@example.com",
+                    "subject": "Reminder",
+                    "body_summary": "Pending send",
+                    "automated": True,
+                },
+            )
+            self.assertEqual(comm_resp.status_code, 200)
+            comm_id = comm_resp.json()["communication_id"]
+            client.post(
+                f"/invoices/inv-api-portal/communications/{comm_id}/delivery-events",
+                json={"state": "QUEUED", "note": "queued"},
+            )
+
+            paid_resp = client.post(
+                "/portal/actions/confirm-paid",
+                json={
+                    "case": case_id,
+                    "code": code,
+                    "debtor_identifier": "debtor-portal",
+                    "amount_gbp": "250",
+                    "payment_reference": "BANK-XYZ",
+                },
+            )
+            self.assertEqual(paid_resp.status_code, 200)
+            self.assertEqual(len(paid_resp.json()["cancelled_pending_communication_ids"]), 1)
+
+            compliance_resp = client.get("/invoices/inv-api-portal/compliance-ledger")
+            self.assertEqual(compliance_resp.status_code, 200)
+            events = {item["event_type"] for item in compliance_resp.json()["entries"]}
+            self.assertIn("DATA_ACCURACY_CHALLENGE_OPEN", events)
+            self.assertIn("PAYMENT_PLAN_PROPOSED", events)
+            self.assertIn("SETTLEMENT_OFFER_PROPOSED", events)
+            self.assertIn("PORTAL_PAYMENT_REPORTED", events)
+
     def test_escalation_blocked_on_delivery_failure_until_requeued(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "api-delivery-block.db")

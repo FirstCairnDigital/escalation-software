@@ -121,6 +121,10 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `POST /invoices/{invoice_id}/resolution/artifacts/promise-to-pay`
 - `POST /invoices/{invoice_id}/resolution/artifacts/settlement-agreement`
 - `POST /invoices/{invoice_id}/communications/{communication_id}/balance-corrections`
+- `POST /portal/actions/data-accuracy-challenge`
+- `POST /portal/actions/payment-plan-proposals`
+- `POST /portal/actions/settlement-offers`
+- `POST /portal/actions/confirm-paid`
 - `GET /invoices/{invoice_id}/evidence-artifacts?artifact_type=&limit=100&offset=0`
 - `GET /invoices/{invoice_id}/ledger-events?event_type=&limit=100&offset=0`
 - `GET /invoices/{invoice_id}/debtor-ledger`
@@ -207,6 +211,7 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 - Promise-to-Pay and Full & Final Settlement artifacts can be generated as tamper-evident PDF records.
 - Dispute carve-outs isolate disputed amounts from the immediately pursued undisputed balance.
 - Debtor portal verification view returns neutral resolution options and independent advice links messaging.
+- Debtor portal actions are executable workflows for data accuracy challenges, payment plan proposals, settlement offers, and payment reporting.
 - Evidence bundle generation can include resolution artifacts via `include_resolution_artifacts=true`.
 
 ## Viability & Proportionality
