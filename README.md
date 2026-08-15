@@ -87,6 +87,7 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `GET /health`
 - `GET /ready` (readiness check; public)
 - `GET /verify?case=&code=` (public anti-phishing verification)
+- `GET /portal?case=&code=` (public debtor verification portal view)
 - `GET /metrics` (admin role when auth enabled)
 - `GET /deployment/startup-config-validation` (admin role when auth enabled)
 - `GET /deployment/startup-config-validation/report` (admin role when auth enabled)
@@ -194,6 +195,7 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 - If a plan defaults, escalation resumes from `OVERDUE_CHASER` (Level 2 equivalent flow).
 - Settlement offers are finalized only after both debtor and creditor accept.
 - Dispute carve-outs isolate disputed amounts from the immediately pursued undisputed balance.
+- Debtor portal verification view returns neutral resolution options and independent advice links messaging.
 
 ## Deployment Runbook (Minimal)
 1. Set production environment variables (above).

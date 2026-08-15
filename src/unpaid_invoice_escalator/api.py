@@ -747,6 +747,34 @@ def create_app(
             raise HTTPException(status_code=404, detail=result.message)
         return {"valid": True, "message": result.message}
 
+    @app.get("/portal")
+    def debtor_portal(case: str, code: str) -> dict[str, object]:
+        result = debtor_verification_portal.verify(case_id=case, verification_code=code)
+        if not result.valid:
+            raise HTTPException(status_code=404, detail=result.message)
+        creditor_name = result.creditor_name or "the creditor"
+        return {
+            "valid": True,
+            "case_id": result.case_id,
+            "message": result.message,
+            "source_of_data_notice": (
+                "First Cairn Digital holds your contact details as a Data Processor on behalf of "
+                f"{creditor_name} (Data Controller) for the sole purpose of invoice administration. "
+                "You may obtain independent legal or professional advice at any time from Citizens Advice, "
+                "Business Debtline, or a solicitor."
+            ),
+            "resolution_options": [
+                "Pay Full Balance Now",
+                "Confirm Payment Date",
+                "I Have Already Paid",
+                "Propose Payment Plan / Settlement",
+                "Ask Question About Invoice",
+                "Dispute All or Part of Amount",
+                "Correct Inaccurate Information",
+                "View Independent Legal Advice Links",
+            ],
+        }
+
     @app.get("/deployment/startup-config-validation")
     def startup_config_validation() -> dict[str, object]:
         return _startup_config_report()

@@ -225,6 +225,8 @@ class TestApiSecurity(unittest.TestCase):
             with TestClient(app) as client:
                 verify_resp = client.get("/verify?case=FCD-R-2026-000001&code=ABCDEFGH")
                 self.assertEqual(verify_resp.status_code, 404)
+                portal_resp = client.get("/portal?case=FCD-R-2026-000001&code=ABCDEFGH")
+                self.assertEqual(portal_resp.status_code, 404)
 
     def test_readiness_fails_with_invalid_upload_limit(self) -> None:
         tmp_dir = mkdtemp()

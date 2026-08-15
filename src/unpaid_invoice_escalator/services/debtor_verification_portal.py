@@ -22,6 +22,9 @@ class DebtorVerificationRegistration:
 class DebtorVerificationResult:
     valid: bool
     message: str
+    creditor_name: str | None = None
+    invoice_reference: str | None = None
+    case_id: str | None = None
 
 
 class DebtorVerificationPortal:
@@ -85,6 +88,9 @@ class DebtorVerificationPortal:
             return DebtorVerificationResult(valid=False, message="Verification failed. Case details not recognized.")
         return DebtorVerificationResult(
             valid=True,
+            case_id=record.case_id,
+            creditor_name=record.creditor_name,
+            invoice_reference=record.invoice_reference,
             message=(
                 "This is a genuine First Cairn Digital communication issued on behalf of "
                 f"{record.creditor_name} regarding Invoice {record.invoice_reference}."

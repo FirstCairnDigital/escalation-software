@@ -68,6 +68,12 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(verify_resp.status_code, 200)
             self.assertTrue(verify_resp.json()["valid"])
+            portal_resp = client.get(
+                f"/portal?case={verification_body['case_id']}&code={verification_body['verification_code']}"
+            )
+            self.assertEqual(portal_resp.status_code, 200)
+            self.assertIn("resolution_options", portal_resp.json())
+            self.assertIn("Data Processor", portal_resp.json()["source_of_data_notice"])
 
             legal_gate_resp = client.post(
                 "/invoices/inv-api-1/legal-safety-gate/confirm",
