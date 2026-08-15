@@ -188,6 +188,17 @@ class TestApiSecurity(unittest.TestCase):
                 self.assertTrue(validation_body["ready"])
                 self.assertEqual(validation_body["manifest_key_id"], "fcd-kms-key-ready")
                 self.assertIn("database-connectivity", {entry["check"] for entry in validation_body["checks"]})
+                self.assertIn("append-only-triggers", {entry["check"] for entry in validation_body["checks"]})
+                self.assertGreaterEqual(validation_body["summary"]["total_checks"], 1)
+                self.assertIn("generated_at_utc", validation_body)
+
+                report_resp = client.get(
+                    "/deployment/startup-config-validation/report", headers={"x-api-key": "admin-key"}
+                )
+                self.assertEqual(report_resp.status_code, 200)
+                report_body = report_resp.json()
+                self.assertIn("runbook", report_body)
+                self.assertIn("steps", report_body["runbook"])
 
                 runbook_forbidden = client.get("/deployment/runbook", headers={"x-api-key": "viewer-key"})
                 self.assertEqual(runbook_forbidden.status_code, 403)

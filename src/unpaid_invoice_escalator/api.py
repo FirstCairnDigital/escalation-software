@@ -380,6 +380,34 @@ def create_app(
         "warning",
         "Strict filename policy enforces alphanumeric/._- names and max length 128.",
     )
+    _append_check(
+        "rate-limit-per-minute",
+        effective_rate_limit > 0,
+        "error",
+        f"Rate limit per minute set to {effective_rate_limit}.",
+    )
+    _append_check(
+        "alert-thresholds",
+        effective_auth_failure_threshold > 0
+        and effective_rate_limit_threshold > 0
+        and effective_server_error_threshold > 0,
+        "warning",
+        (
+            "Alert thresholds configured."
+            if (
+                effective_auth_failure_threshold > 0
+                and effective_rate_limit_threshold > 0
+                and effective_server_error_threshold > 0
+            )
+            else "One or more alert thresholds are non-positive."
+        ),
+    )
+    _append_check(
+        "manifest-key-id",
+        bool(manifest_key_id.strip()),
+        "error",
+        "Manifest key ID configured." if manifest_key_id.strip() else "Manifest key ID is empty.",
+    )
 
     def _runtime_readiness_checks() -> list[dict[str, str | bool]]:
         checks: list[dict[str, str | bool]] = []
@@ -410,6 +438,41 @@ def create_app(
             except OSError as exc:
                 add_runtime_check(check_name, False, f"Directory write failed for {directory}: {exc}")
 
+        required_append_only_triggers = (
+            "trg_ledger_events_no_update",
+            "trg_ledger_events_no_delete",
+            "trg_evidence_artifacts_no_update",
+            "trg_evidence_artifacts_no_delete",
+            "trg_debtor_ledger_no_update",
+            "trg_debtor_ledger_no_delete",
+            "trg_client_fee_no_update",
+            "trg_client_fee_no_delete",
+            "trg_hygiene_records_no_update",
+            "trg_hygiene_records_no_delete",
+            "trg_compliance_ledger_no_update",
+            "trg_compliance_ledger_no_delete",
+        )
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                rows = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_%'"
+                ).fetchall()
+            finally:
+                conn.close()
+            trigger_names = {str(row[0]) for row in rows}
+            missing_triggers = sorted(name for name in required_append_only_triggers if name not in trigger_names)
+            if missing_triggers:
+                add_runtime_check(
+                    "append-only-triggers",
+                    False,
+                    "Missing append-only triggers: " + ", ".join(missing_triggers),
+                )
+            else:
+                add_runtime_check("append-only-triggers", True, "Append-only triggers detected for protected tables.")
+        except sqlite3.Error as exc:
+            add_runtime_check("append-only-triggers", False, f"Trigger verification failed: {exc}")
+
         return checks
 
     def _startup_config_report() -> dict[str, object]:
@@ -417,7 +480,10 @@ def create_app(
         combined_checks = [*startup_checks, *runtime_checks]
         errors = [check for check in combined_checks if (not bool(check["passed"])) and check["severity"] == "error"]
         warnings = [check for check in combined_checks if (not bool(check["passed"])) and check["severity"] == "warning"]
+        passed_count = sum(1 for check in combined_checks if bool(check["passed"]))
+        failed_count = len(combined_checks) - passed_count
         return {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "environment": effective_env,
             "auth_enabled": effective_auth_enabled,
             "manifest_key_id": manifest_key_id,
@@ -430,6 +496,13 @@ def create_app(
             "checks": combined_checks,
             "errors": errors,
             "warnings": warnings,
+            "summary": {
+                "total_checks": len(combined_checks),
+                "passed_checks": passed_count,
+                "failed_checks": failed_count,
+                "error_count": len(errors),
+                "warning_count": len(warnings),
+            },
             "ready": len(errors) == 0,
         }
 
@@ -536,6 +609,20 @@ def create_app(
     @app.get("/deployment/startup-config-validation")
     def startup_config_validation() -> dict[str, object]:
         return _startup_config_report()
+
+    @app.get("/deployment/startup-config-validation/report")
+    def startup_config_validation_report() -> dict[str, object]:
+        report = _startup_config_report()
+        runbook = _deployment_runbook_report()
+        return {
+            **report,
+            "runbook": {
+                "ready": runbook["ready"],
+                "steps": runbook["steps"],
+                "pending_errors": runbook["pending_errors"],
+                "pending_warnings": runbook["pending_warnings"],
+            },
+        }
 
     @app.get("/deployment/runbook")
     def deployment_runbook() -> dict[str, object]:

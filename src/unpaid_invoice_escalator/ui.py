@@ -139,7 +139,18 @@ def render_home_html() -> str:
       <button onclick="viewInvoice()">Get Invoice</button>
       <button onclick="viewArtifacts()">List Artifacts</button>
       <button onclick="viewEvents()">List Ledger Events</button>
+      <button onclick="viewComplianceLedger()">Compliance Ledger</button>
+      <button onclick="viewFiveLedgerSummary()">Five-Ledger Summary</button>
       <button onclick="openWorkspace()">Open Invoice Workspace</button>
+    </section>
+
+    <section class="card">
+      <h2>Deployment Readiness</h2>
+      <p style="margin-top: 0;">Admin endpoints for startup validation and operational runbook checks.</p>
+      <button onclick="viewReady()">Public Readiness (/ready)</button>
+      <button onclick="viewStartupValidation()">Startup Validation</button>
+      <button onclick="viewStartupValidationReport()">Startup Validation Report</button>
+      <button onclick="viewDeploymentRunbook()">Deployment Runbook</button>
     </section>
   </div>
 
@@ -251,6 +262,12 @@ def render_home_html() -> str:
       params.set("offset", view_event_offset.value || "0");
       await request(`/invoices/${view_invoice_id.value}/ledger-events?${params.toString()}`, "GET");
     }
+    async function viewComplianceLedger() { await request(`/invoices/${view_invoice_id.value}/compliance-ledger`, "GET"); }
+    async function viewFiveLedgerSummary() { await request(`/invoices/${view_invoice_id.value}/five-ledger-summary`, "GET"); }
+    async function viewReady() { await request("/ready", "GET"); }
+    async function viewStartupValidation() { await request("/deployment/startup-config-validation", "GET"); }
+    async function viewStartupValidationReport() { await request("/deployment/startup-config-validation/report", "GET"); }
+    async function viewDeploymentRunbook() { await request("/deployment/runbook", "GET"); }
     function openWorkspace() {
       window.location.href = `/ui/invoices/${encodeURIComponent(view_invoice_id.value)}`;
     }
@@ -291,6 +308,7 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
     <button id="tab-summary" class="tab active" onclick="loadTab('summary')">Summary</button>
     <button id="tab-evidence" class="tab" onclick="loadTab('evidence')">Evidence</button>
     <button id="tab-ledger" class="tab" onclick="loadTab('ledger')">Ledger</button>
+    <button id="tab-compliance" class="tab" onclick="loadTab('compliance')">Compliance</button>
     <button id="tab-hygiene" class="tab" onclick="loadTab('hygiene')">Hygiene</button>
     <button id="tab-actions" class="tab" onclick="loadTab('actions')">Actions</button>
   </div>
@@ -404,6 +422,31 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
         await viewWorkspaceHygiene();
         return;
       }
+      if (tabName === "compliance") {
+        panel.innerHTML = `
+          <div class="row">
+            <label>User ID:<input id="c_user_id" value="USER-102" /></label>
+            <label>Amount Claimed GBP:<input id="c_amount_claimed" value="1200" /></label>
+            <label>Payments Recorded GBP:<input id="c_payments_recorded" value="0" /></label>
+          </div>
+          <div class="row">
+            <button onclick="confirmLegalSafetyGate()">Confirm Legal Safety Gate</button>
+            <button onclick="runDiscrepancyCheck()">Run Discrepancy Check</button>
+          </div>
+          <div class="row">
+            <label>Claim Amount:<input id="c_claim_amount" value="1200" /></label>
+            <label>Evidence Amount:<input id="c_evidence_amount" value="1200" /></label>
+            <label>Principal:<input id="c_principal" value="1200" /></label>
+            <label>Payments Recorded:<input id="c_payments" value="0" /></label>
+            <label>Outstanding Entered:<input id="c_outstanding" value="1200" /></label>
+          </div>
+          <div class="row">
+            <button onclick="viewComplianceLedger()">Compliance Ledger</button>
+            <button onclick="viewFiveLedgerSummary()">Five-Ledger Summary</button>
+          </div>`;
+        await viewComplianceLedger();
+        return;
+      }
       panel.innerHTML = `
         <div class="row"><label>Today:<input id="a_today" value="2026-02-10" /></label>
         <label>State:
@@ -434,6 +477,31 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
     }
     async function viewDebtorLedger() { await request(`/invoices/${invoiceId}/debtor-ledger`, "GET"); }
     async function viewClientFeeLedger() { await request(`/invoices/${invoiceId}/client-fee-ledger`, "GET"); }
+    async function viewComplianceLedger() { await request(`/invoices/${invoiceId}/compliance-ledger`, "GET"); }
+    async function viewFiveLedgerSummary() { await request(`/invoices/${invoiceId}/five-ledger-summary`, "GET"); }
+    async function confirmLegalSafetyGate() {
+      await request(`/invoices/${invoiceId}/legal-safety-gate/confirm`, "POST", {
+        user_id: document.getElementById("c_user_id").value,
+        amount_claimed_gbp: document.getElementById("c_amount_claimed").value,
+        payments_recorded_gbp: document.getElementById("c_payments_recorded").value,
+        authorised_to_act: true,
+        info_accurate: true,
+        invoice_unpaid: true,
+        payments_recorded_complete: true,
+        genuine_supporting_docs: true,
+        no_unresolved_dispute: true,
+        commercial_not_excluded: true
+      });
+    }
+    async function runDiscrepancyCheck() {
+      await request(`/invoices/${invoiceId}/discrepancy-check`, "POST", {
+        claim_amount: document.getElementById("c_claim_amount").value,
+        evidence_document_amount: document.getElementById("c_evidence_amount").value,
+        principal: document.getElementById("c_principal").value,
+        payments_recorded: document.getElementById("c_payments").value,
+        outstanding_entered: document.getElementById("c_outstanding").value
+      });
+    }
     async function recordWorkspaceHygiene() {
       await request(`/invoices/${invoiceId}/pre-overdue-hygiene`, "POST", {
         creditor_legal_entity_name: document.getElementById("h_creditor_name").value,
