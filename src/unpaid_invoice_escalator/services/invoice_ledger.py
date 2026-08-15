@@ -90,6 +90,7 @@ class InvoiceLedger:
         file_path: str,
         user_id: str,
         artifact_type: ArtifactType = ArtifactType.OTHER,
+        actor: Actor = Actor.CLIENT,
         upload_timestamp: datetime | None = None,
     ) -> EvidenceArtifact:
         path = Path(file_path)
@@ -106,7 +107,7 @@ class InvoiceLedger:
         )
         self.append_event(
             invoice_id=invoice_id,
-            actor=Actor.CLIENT,
+            actor=actor,
             event_type="EVIDENCE_ARTIFACT_UPLOADED",
             data_payload={
                 "document_id": artifact.document_id,

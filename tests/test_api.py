@@ -995,7 +995,9 @@ class TestApi(unittest.TestCase):
                 json={"plan_id": plan_id, "output_filename": "promise-to-pay.pdf"},
             )
             self.assertEqual(promise_artifact_resp.status_code, 200)
-            self.assertTrue(Path(promise_artifact_resp.json()["artifact_path"]).exists())
+            promise_body = promise_artifact_resp.json()
+            self.assertEqual(promise_body["artifact_type"], "PROMISE_TO_PAY")
+            self.assertTrue(Path(promise_body["artifact_path"]).exists())
 
             resumed_escalate_resp = client.post(
                 "/invoices/inv-api-resolution/escalate",
@@ -1035,7 +1037,20 @@ class TestApi(unittest.TestCase):
                 json={"offer_id": offer_id, "output_filename": "settlement-agreement.pdf"},
             )
             self.assertEqual(settlement_artifact_resp.status_code, 200)
-            self.assertTrue(Path(settlement_artifact_resp.json()["artifact_path"]).exists())
+            settlement_body = settlement_artifact_resp.json()
+            self.assertEqual(settlement_body["artifact_type"], "FULL_AND_FINAL_SETTLEMENT")
+            self.assertTrue(Path(settlement_body["artifact_path"]).exists())
+
+            promise_artifacts_resp = client.get(
+                "/invoices/inv-api-resolution/evidence-artifacts?artifact_type=PROMISE_TO_PAY&limit=10&offset=0"
+            )
+            self.assertEqual(promise_artifacts_resp.status_code, 200)
+            self.assertGreaterEqual(promise_artifacts_resp.json()["count"], 1)
+            settlement_artifacts_resp = client.get(
+                "/invoices/inv-api-resolution/evidence-artifacts?artifact_type=FULL_AND_FINAL_SETTLEMENT&limit=10&offset=0"
+            )
+            self.assertEqual(settlement_artifacts_resp.status_code, 200)
+            self.assertGreaterEqual(settlement_artifacts_resp.json()["count"], 1)
 
             offers_resp = client.get("/invoices/inv-api-resolution/resolution/settlement-offers")
             self.assertEqual(offers_resp.status_code, 200)

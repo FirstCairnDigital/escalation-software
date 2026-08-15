@@ -150,6 +150,8 @@ Defined in [models.py](C:/Dev/projects/P26003-escalation-software/src/unpaid_inv
 - `CONTRACT`
 - `PROOF_OF_DELIVERY`
 - `PRE_ACTION_NOTICE`
+- `PROMISE_TO_PAY`
+- `FULL_AND_FINAL_SETTLEMENT`
 - `OTHER`
 
 ## Rule Pack Notes

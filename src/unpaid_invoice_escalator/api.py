@@ -22,6 +22,7 @@ from unpaid_invoice_escalator.models import (
     ComplianceLedgerEntry,
     DebtorLedgerEntryType,
     DebtorType,
+    EvidenceArtifact,
     Invoice,
     InvoiceState,
     Jurisdiction,
@@ -756,7 +757,7 @@ def create_app(
             )
         return outstanding
 
-    def _generate_promise_to_pay_artifact(invoice_id: str, plan_id: str, output_filename: str) -> str:
+    def _generate_promise_to_pay_artifact(invoice_id: str, plan_id: str, output_filename: str) -> EvidenceArtifact:
         agreements = store.payment_plan_agreements_for_invoice(invoice_id)
         agreement = next((item for item in agreements if item.plan_id == plan_id), None)
         if agreement is None:
@@ -770,9 +771,16 @@ def create_app(
             payments=payments,
             output_path=str(output_path),
         )
-        return generated_path
+        artifact = ledger.record_evidence_artifact(
+            invoice_id=invoice_id,
+            file_path=generated_path,
+            user_id="SYSTEM",
+            artifact_type=ArtifactType.PROMISE_TO_PAY,
+            actor=Actor.SYSTEM,
+        )
+        return artifact
 
-    def _generate_settlement_artifact(invoice_id: str, offer_id: str, output_filename: str) -> str:
+    def _generate_settlement_artifact(invoice_id: str, offer_id: str, output_filename: str) -> EvidenceArtifact:
         offer = store.settlement_offer_by_id(offer_id)
         if offer is None or offer.invoice_id != invoice_id:
             raise HTTPException(status_code=404, detail="Settlement offer not found for invoice.")
@@ -786,7 +794,14 @@ def create_app(
             acceptances=acceptances,
             output_path=str(output_path),
         )
-        return generated_path
+        artifact = ledger.record_evidence_artifact(
+            invoice_id=invoice_id,
+            file_path=generated_path,
+            user_id="SYSTEM",
+            artifact_type=ArtifactType.FULL_AND_FINAL_SETTLEMENT,
+            actor=Actor.SYSTEM,
+        )
+        return artifact
 
     @app.middleware("http")
     async def security_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
@@ -1829,7 +1844,7 @@ def create_app(
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
-        generated_path = _generate_promise_to_pay_artifact(
+        generated_artifact = _generate_promise_to_pay_artifact(
             invoice_id=invoice_id,
             plan_id=payload.plan_id,
             output_filename=payload.output_filename,
@@ -1841,7 +1856,12 @@ def create_app(
                 invoice_id=invoice_id,
                 timestamp=now,
                 event_type="PROMISE_TO_PAY_ARTIFACT_GENERATED",
-                details={"plan_id": payload.plan_id, "artifact_path": generated_path},
+                details={
+                    "plan_id": payload.plan_id,
+                    "artifact_path": generated_artifact.file_path,
+                    "document_id": generated_artifact.document_id,
+                    "file_hash": generated_artifact.file_hash,
+                },
             )
         )
         ledger.append_event(
@@ -1849,9 +1869,21 @@ def create_app(
             actor=Actor.SYSTEM,
             event_type="PROMISE_TO_PAY_ARTIFACT_GENERATED",
             timestamp=now,
-            data_payload={"plan_id": payload.plan_id, "artifact_path": generated_path},
+            data_payload={
+                "plan_id": payload.plan_id,
+                "artifact_path": generated_artifact.file_path,
+                "document_id": generated_artifact.document_id,
+                "file_hash": generated_artifact.file_hash,
+            },
         )
-        return {"invoice_id": invoice_id, "plan_id": payload.plan_id, "artifact_path": generated_path}
+        return {
+            "invoice_id": invoice_id,
+            "plan_id": payload.plan_id,
+            "artifact_path": generated_artifact.file_path,
+            "document_id": generated_artifact.document_id,
+            "file_hash": generated_artifact.file_hash,
+            "artifact_type": generated_artifact.artifact_type.value,
+        }
 
     @app.post("/invoices/{invoice_id}/resolution/artifacts/settlement-agreement")
     def generate_settlement_agreement_artifact(
@@ -1860,7 +1892,7 @@ def create_app(
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
-        generated_path = _generate_settlement_artifact(
+        generated_artifact = _generate_settlement_artifact(
             invoice_id=invoice_id,
             offer_id=payload.offer_id,
             output_filename=payload.output_filename,
@@ -1872,7 +1904,12 @@ def create_app(
                 invoice_id=invoice_id,
                 timestamp=now,
                 event_type="SETTLEMENT_AGREEMENT_ARTIFACT_GENERATED",
-                details={"offer_id": payload.offer_id, "artifact_path": generated_path},
+                details={
+                    "offer_id": payload.offer_id,
+                    "artifact_path": generated_artifact.file_path,
+                    "document_id": generated_artifact.document_id,
+                    "file_hash": generated_artifact.file_hash,
+                },
             )
         )
         ledger.append_event(
@@ -1880,9 +1917,21 @@ def create_app(
             actor=Actor.SYSTEM,
             event_type="SETTLEMENT_AGREEMENT_ARTIFACT_GENERATED",
             timestamp=now,
-            data_payload={"offer_id": payload.offer_id, "artifact_path": generated_path},
+            data_payload={
+                "offer_id": payload.offer_id,
+                "artifact_path": generated_artifact.file_path,
+                "document_id": generated_artifact.document_id,
+                "file_hash": generated_artifact.file_hash,
+            },
         )
-        return {"invoice_id": invoice_id, "offer_id": payload.offer_id, "artifact_path": generated_path}
+        return {
+            "invoice_id": invoice_id,
+            "offer_id": payload.offer_id,
+            "artifact_path": generated_artifact.file_path,
+            "document_id": generated_artifact.document_id,
+            "file_hash": generated_artifact.file_hash,
+            "artifact_type": generated_artifact.artifact_type.value,
+        }
 
     @app.get("/invoices/{invoice_id}/debtor-ledger")
     def get_debtor_ledger(invoice_id: str) -> dict[str, object]:
@@ -2529,24 +2578,22 @@ def create_app(
         resolution_artifact_paths: list[str] = []
         if payload.include_resolution_artifacts:
             for plan in store.payment_plan_agreements_for_invoice(invoice_id):
-                resolution_artifact_paths.append(
-                    _generate_promise_to_pay_artifact(
-                        invoice_id=invoice_id,
-                        plan_id=plan.plan_id,
-                        output_filename=f"promise_to_pay_{plan.plan_id}.pdf",
-                    )
+                generated_artifact = _generate_promise_to_pay_artifact(
+                    invoice_id=invoice_id,
+                    plan_id=plan.plan_id,
+                    output_filename=f"promise_to_pay_{plan.plan_id}.pdf",
                 )
+                resolution_artifact_paths.append(generated_artifact.file_path)
             for offer in store.settlement_offers_for_invoice(invoice_id):
                 acceptances = store.settlement_acceptances_for_offer(offer.offer_id)
                 if {item.accepter_role for item in acceptances} != {"DEBTOR", "CREDITOR"}:
                     continue
-                resolution_artifact_paths.append(
-                    _generate_settlement_artifact(
-                        invoice_id=invoice_id,
-                        offer_id=offer.offer_id,
-                        output_filename=f"full_final_settlement_{offer.offer_id}.pdf",
-                    )
+                generated_artifact = _generate_settlement_artifact(
+                    invoice_id=invoice_id,
+                    offer_id=offer.offer_id,
+                    output_filename=f"full_final_settlement_{offer.offer_id}.pdf",
                 )
+                resolution_artifact_paths.append(generated_artifact.file_path)
         pre_action_notice_paths = [
             artifact.file_path for artifact in artifacts if artifact.artifact_type == ArtifactType.PRE_ACTION_NOTICE
         ]
