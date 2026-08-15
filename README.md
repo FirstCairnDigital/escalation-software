@@ -118,6 +118,8 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `POST /invoices/{invoice_id}/resolution/settlement-offers/{offer_id}/accept`
 - `POST /invoices/{invoice_id}/resolution/dispute-carve-outs`
 - `GET /invoices/{invoice_id}/resolution/dispute-carve-outs`
+- `POST /invoices/{invoice_id}/resolution/artifacts/promise-to-pay`
+- `POST /invoices/{invoice_id}/resolution/artifacts/settlement-agreement`
 - `GET /invoices/{invoice_id}/evidence-artifacts?artifact_type=&limit=100&offset=0`
 - `GET /invoices/{invoice_id}/ledger-events?event_type=&limit=100&offset=0`
 - `GET /invoices/{invoice_id}/debtor-ledger`
@@ -199,8 +201,10 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 - While a payment plan is `ACTIVE`, escalation is blocked and chasers remain paused.
 - If a plan defaults, escalation resumes from `OVERDUE_CHASER` (Level 2 equivalent flow).
 - Settlement offers are finalized only after both debtor and creditor accept.
+- Promise-to-Pay and Full & Final Settlement artifacts can be generated as tamper-evident PDF records.
 - Dispute carve-outs isolate disputed amounts from the immediately pursued undisputed balance.
 - Debtor portal verification view returns neutral resolution options and independent advice links messaging.
+- Evidence bundle generation can include resolution artifacts via `include_resolution_artifacts=true`.
 
 ## Viability & Proportionality
 - Viability assessments combine projected FCD action fee, projected court fee, and estimated time-cost against current outstanding amount.

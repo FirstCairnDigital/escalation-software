@@ -44,6 +44,7 @@ from unpaid_invoice_escalator.services.late_payment_engine import LatePaymentEng
 from unpaid_invoice_escalator.services.legal_safety_gate_manager import LegalSafetyGateManager
 from unpaid_invoice_escalator.services.pre_overdue_hygiene_engine import PreOverdueHygieneEngine
 from unpaid_invoice_escalator.services.resolution_settlement_engine import ResolutionAndSettlementEngine
+from unpaid_invoice_escalator.services.resolution_artifact_generator import ResolutionArtifactGenerator
 from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
 from unpaid_invoice_escalator.services.viability_proportionality_calculator import ViabilityProportionalityCalculator
 from unpaid_invoice_escalator.security import ApiSecurityController, ROLE_RANK
@@ -88,6 +89,7 @@ class EscalateRequest(BaseModel):
 class BundleRequest(BaseModel):
     communications: list[str] = Field(default_factory=list)
     formal_notices: list[str] = Field(default_factory=list)
+    include_resolution_artifacts: bool = True
     output_filename: str = "evidence_bundle.pdf"
 
 
@@ -258,6 +260,16 @@ class ViabilityAssessmentRequest(BaseModel):
     company_status: str = "UNKNOWN"
 
 
+class PromiseToPayArtifactRequest(BaseModel):
+    plan_id: str
+    output_filename: str = "promise_to_pay.pdf"
+
+
+class SettlementAgreementArtifactRequest(BaseModel):
+    offer_id: str
+    output_filename: str = "full_final_settlement.pdf"
+
+
 class CommunicationCreateRequest(BaseModel):
     channel: str
     recipient: str
@@ -412,6 +424,7 @@ def create_app(
     communication_severity_engine = CommunicationSeverityEngine(rule_pack_loader=rule_pack_loader)
     communication_delivery_tracker = CommunicationDeliveryTracker(store=store, event_ledger=ledger)
     viability_calculator = ViabilityProportionalityCalculator(store=store)
+    resolution_artifact_generator = ResolutionArtifactGenerator()
     artifacts_root = Path(artifacts_dir)
     bundles_root = Path(bundles_dir)
     quarantine_root = Path(effective_quarantine_dir)
@@ -742,6 +755,38 @@ def create_app(
                 detail="Pre-send balance lock failed: no positive outstanding balance available for communication.",
             )
         return outstanding
+
+    def _generate_promise_to_pay_artifact(invoice_id: str, plan_id: str, output_filename: str) -> str:
+        agreements = store.payment_plan_agreements_for_invoice(invoice_id)
+        agreement = next((item for item in agreements if item.plan_id == plan_id), None)
+        if agreement is None:
+            raise HTTPException(status_code=404, detail="Payment plan not found for invoice.")
+        installments = store.payment_plan_installments_for_plan(plan_id)
+        payments = store.payment_plan_payments_for_plan(plan_id)
+        output_path = bundles_root / invoice_id / "resolution" / output_filename
+        generated_path = resolution_artifact_generator.generate_promise_to_pay(
+            agreement=agreement,
+            installments=installments,
+            payments=payments,
+            output_path=str(output_path),
+        )
+        return generated_path
+
+    def _generate_settlement_artifact(invoice_id: str, offer_id: str, output_filename: str) -> str:
+        offer = store.settlement_offer_by_id(offer_id)
+        if offer is None or offer.invoice_id != invoice_id:
+            raise HTTPException(status_code=404, detail="Settlement offer not found for invoice.")
+        acceptances = store.settlement_acceptances_for_offer(offer_id)
+        accepted_roles = {item.accepter_role for item in acceptances}
+        if accepted_roles != {"DEBTOR", "CREDITOR"}:
+            raise HTTPException(status_code=409, detail="Settlement artifact requires bilateral acceptance.")
+        output_path = bundles_root / invoice_id / "resolution" / output_filename
+        generated_path = resolution_artifact_generator.generate_settlement_agreement(
+            offer=offer,
+            acceptances=acceptances,
+            output_path=str(output_path),
+        )
+        return generated_path
 
     @app.middleware("http")
     async def security_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
@@ -1777,6 +1822,68 @@ def create_app(
             ],
         }
 
+    @app.post("/invoices/{invoice_id}/resolution/artifacts/promise-to-pay")
+    def generate_promise_to_pay_artifact(
+        invoice_id: str, payload: PromiseToPayArtifactRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        generated_path = _generate_promise_to_pay_artifact(
+            invoice_id=invoice_id,
+            plan_id=payload.plan_id,
+            output_filename=payload.output_filename,
+        )
+        now = datetime.now(timezone.utc)
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="PROMISE_TO_PAY_ARTIFACT_GENERATED",
+                details={"plan_id": payload.plan_id, "artifact_path": generated_path},
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.SYSTEM,
+            event_type="PROMISE_TO_PAY_ARTIFACT_GENERATED",
+            timestamp=now,
+            data_payload={"plan_id": payload.plan_id, "artifact_path": generated_path},
+        )
+        return {"invoice_id": invoice_id, "plan_id": payload.plan_id, "artifact_path": generated_path}
+
+    @app.post("/invoices/{invoice_id}/resolution/artifacts/settlement-agreement")
+    def generate_settlement_agreement_artifact(
+        invoice_id: str, payload: SettlementAgreementArtifactRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        generated_path = _generate_settlement_artifact(
+            invoice_id=invoice_id,
+            offer_id=payload.offer_id,
+            output_filename=payload.output_filename,
+        )
+        now = datetime.now(timezone.utc)
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="SETTLEMENT_AGREEMENT_ARTIFACT_GENERATED",
+                details={"offer_id": payload.offer_id, "artifact_path": generated_path},
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.SYSTEM,
+            event_type="SETTLEMENT_AGREEMENT_ARTIFACT_GENERATED",
+            timestamp=now,
+            data_payload={"offer_id": payload.offer_id, "artifact_path": generated_path},
+        )
+        return {"invoice_id": invoice_id, "offer_id": payload.offer_id, "artifact_path": generated_path}
+
     @app.get("/invoices/{invoice_id}/debtor-ledger")
     def get_debtor_ledger(invoice_id: str) -> dict[str, object]:
         invoice = store.get_invoice(invoice_id)
@@ -2371,6 +2478,27 @@ def create_app(
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
         artifacts = store.artifacts_for_invoice(invoice_id)
+        resolution_artifact_paths: list[str] = []
+        if payload.include_resolution_artifacts:
+            for plan in store.payment_plan_agreements_for_invoice(invoice_id):
+                resolution_artifact_paths.append(
+                    _generate_promise_to_pay_artifact(
+                        invoice_id=invoice_id,
+                        plan_id=plan.plan_id,
+                        output_filename=f"promise_to_pay_{plan.plan_id}.pdf",
+                    )
+                )
+            for offer in store.settlement_offers_for_invoice(invoice_id):
+                acceptances = store.settlement_acceptances_for_offer(offer.offer_id)
+                if {item.accepter_role for item in acceptances} != {"DEBTOR", "CREDITOR"}:
+                    continue
+                resolution_artifact_paths.append(
+                    _generate_settlement_artifact(
+                        invoice_id=invoice_id,
+                        offer_id=offer.offer_id,
+                        output_filename=f"full_final_settlement_{offer.offer_id}.pdf",
+                    )
+                )
         output_path = bundles_root / invoice_id / payload.output_filename
         output_path.parent.mkdir(parents=True, exist_ok=True)
         generated_path = runner.compile_evidence_bundle(
@@ -2395,6 +2523,7 @@ def create_app(
                 )
                 for entry in store.client_fee_entries_for_invoice(invoice_id)
             ],
+            resolution_artifact_paths=resolution_artifact_paths,
         )
         return {"invoice_id": invoice_id, "bundle_path": generated_path}
 

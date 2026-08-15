@@ -19,6 +19,7 @@ class EvidenceBundleInput:
     generated_at: datetime
     debtor_ledger_breakdown: tuple[str, ...] = ()
     client_fee_ledger_breakdown: tuple[str, ...] = ()
+    resolution_artifact_paths: tuple[str, ...] = ()
 
 
 class EvidencePackCompiler:
@@ -91,6 +92,16 @@ class EvidencePackCompiler:
         lines.append("")
         lines.append("FCD Client Fee Ledger Breakdown:")
         lines.extend([f"- {line}" for line in bundle.client_fee_ledger_breakdown] or ["- None provided"])
+        lines.append("")
+        lines.append("Resolution Artifacts:")
+        if bundle.resolution_artifact_paths:
+            for raw_path in bundle.resolution_artifact_paths:
+                path = Path(raw_path)
+                exists = path.exists()
+                checksum = hashlib.sha256(path.read_bytes()).hexdigest() if exists else "MISSING_FILE"
+                lines.append(f"- {path.name} | Exists={exists} | SHA256={checksum}")
+        else:
+            lines.append("- None provided")
         return lines
 
     @staticmethod

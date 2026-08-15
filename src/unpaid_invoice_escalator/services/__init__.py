@@ -17,6 +17,7 @@ from .legal_safety_gate_manager import LegalSafetyGateManager, LegalSafetyGateRe
 from .late_payment_engine import LatePaymentCalculationResult, LatePaymentEngine
 from .pre_overdue_hygiene_engine import PreOverdueHygieneAssessment, PreOverdueHygieneEngine
 from .resolution_settlement_engine import PaymentPlanStatus, ResolutionAndSettlementEngine
+from .resolution_artifact_generator import ResolutionArtifactGenerator
 from .viability_proportionality_calculator import ViabilityAssessment, ViabilityProportionalityCalculator
 from .invoice_ledger import InvoiceLedger
 from .jurisdiction_engine import JurisdictionEngine
@@ -52,6 +53,7 @@ __all__ = [
     "PreOverdueHygieneAssessment",
     "PreOverdueHygieneEngine",
     "PaymentPlanStatus",
+    "ResolutionArtifactGenerator",
     "ResolutionAndSettlementEngine",
     "ViabilityAssessment",
     "ViabilityProportionalityCalculator",

@@ -990,6 +990,13 @@ class TestApi(unittest.TestCase):
             self.assertEqual(plans_list_resp.status_code, 200)
             self.assertEqual(plans_list_resp.json()["plans"][0]["status"], "DEFAULTED")
 
+            promise_artifact_resp = client.post(
+                "/invoices/inv-api-resolution/resolution/artifacts/promise-to-pay",
+                json={"plan_id": plan_id, "output_filename": "promise-to-pay.pdf"},
+            )
+            self.assertEqual(promise_artifact_resp.status_code, 200)
+            self.assertTrue(Path(promise_artifact_resp.json()["artifact_path"]).exists())
+
             resumed_escalate_resp = client.post(
                 "/invoices/inv-api-resolution/escalate",
                 json={"today": "2026-08-01", "current_state": "FRIENDLY_REMINDER"},
@@ -1023,6 +1030,13 @@ class TestApi(unittest.TestCase):
             self.assertEqual(accept_creditor_resp.status_code, 200)
             self.assertTrue(accept_creditor_resp.json()["finalized"])
 
+            settlement_artifact_resp = client.post(
+                "/invoices/inv-api-resolution/resolution/artifacts/settlement-agreement",
+                json={"offer_id": offer_id, "output_filename": "settlement-agreement.pdf"},
+            )
+            self.assertEqual(settlement_artifact_resp.status_code, 200)
+            self.assertTrue(Path(settlement_artifact_resp.json()["artifact_path"]).exists())
+
             offers_resp = client.get("/invoices/inv-api-resolution/resolution/settlement-offers")
             self.assertEqual(offers_resp.status_code, 200)
             self.assertEqual(offers_resp.json()["offers"][0]["status"], "FINALIZED")
@@ -1041,6 +1055,18 @@ class TestApi(unittest.TestCase):
             carve_outs_resp = client.get("/invoices/inv-api-resolution/resolution/dispute-carve-outs")
             self.assertEqual(carve_outs_resp.status_code, 200)
             self.assertEqual(len(carve_outs_resp.json()["carve_outs"]), 1)
+
+            bundle_resp = client.post(
+                "/invoices/inv-api-resolution/evidence-bundles",
+                json={
+                    "communications": ["Resolution update"],
+                    "formal_notices": ["Procedural notice"],
+                    "include_resolution_artifacts": True,
+                    "output_filename": "resolution_bundle.pdf",
+                },
+            )
+            self.assertEqual(bundle_resp.status_code, 200)
+            self.assertTrue(Path(bundle_resp.json()["bundle_path"]).exists())
 
 
 if __name__ == "__main__":
