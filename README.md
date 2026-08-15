@@ -60,6 +60,7 @@ $env:FCD_MAX_UPLOAD_BYTES="5242880"
 $env:FCD_ALLOWED_UPLOAD_CONTENT_TYPES="application/pdf,text/plain,image/png,image/jpeg"
 $env:FCD_ALLOWED_UPLOAD_EXTENSIONS=".pdf,.txt,.png,.jpg,.jpeg"
 $env:FCD_QUARANTINE_DIR="data/quarantine"
+$env:FCD_DATA_RETENTION_DAYS="2190"
 ```
 
 Notes:
@@ -71,6 +72,7 @@ Notes:
 - `FCD_ALLOWED_UPLOAD_CONTENT_TYPES` restricts evidence uploads by MIME type.
 - `FCD_ALLOWED_UPLOAD_EXTENSIONS` restricts evidence uploads by filename extension.
 - `FCD_QUARANTINE_DIR` stores rejected upload payloads and metadata for audit review.
+- `FCD_DATA_RETENTION_DAYS` sets minimum case age before controlled evidence-file disposal is permitted.
 
 ### Web Interface
 - Open `http://127.0.0.1:8000/` for the in-app operations UI.
@@ -107,6 +109,9 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `POST /invoices/{invoice_id}/legal-safety-gate/confirm`
 - `POST /invoices/{invoice_id}/discrepancy-check`
 - `GET /invoices/{invoice_id}/compliance-ledger`
+- `GET /data-retention-policy`
+- `GET /invoices/{invoice_id}/data-retention-review?as_of_date=YYYY-MM-DD`
+- `POST /invoices/{invoice_id}/data-retention-disposals`
 - `POST /invoices/{invoice_id}/debtor-verification/register`
 - `POST /invoices/{invoice_id}/debtor-actions/data-accuracy-challenge`
 - `POST /invoices/{invoice_id}/debtor-actions/data-accuracy-challenge/resolve`

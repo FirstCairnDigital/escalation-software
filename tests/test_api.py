@@ -1072,6 +1072,60 @@ class TestApi(unittest.TestCase):
             quarantine_files = list((Path(quarantine_dir) / "inv-api-quarantine").glob("*"))
             self.assertGreaterEqual(len(quarantine_files), 2)
 
+    def test_data_retention_disposal_workflow(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-retention.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-retention",
+                    "currency": "GBP",
+                    "principal_amount": "600",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            upload_resp = client.post(
+                "/invoices/inv-api-retention/evidence-artifacts",
+                data={"user_id": "client-1", "artifact_type": "CONTRACT"},
+                files={"file": ("contract.txt", b"signed terms", "text/plain")},
+            )
+            self.assertEqual(upload_resp.status_code, 200)
+            artifact_path = Path(upload_resp.json()["file_path"])
+            self.assertTrue(artifact_path.exists())
+
+            policy_resp = client.get("/data-retention-policy")
+            self.assertEqual(policy_resp.status_code, 200)
+            self.assertGreater(policy_resp.json()["policy"]["retention_days"], 0)
+
+            review_resp = client.get("/invoices/inv-api-retention/data-retention-review?as_of_date=2035-01-01")
+            self.assertEqual(review_resp.status_code, 200)
+            self.assertTrue(review_resp.json()["eligible_for_disposal"])
+
+            dispose_resp = client.post(
+                "/invoices/inv-api-retention/data-retention-disposals",
+                json={"approved_by": "ADMIN-1", "reason": "Retention period complete", "as_of_date": "2035-01-01"},
+            )
+            self.assertEqual(dispose_resp.status_code, 200)
+            self.assertEqual(dispose_resp.json()["deleted_file_count"], 1)
+            self.assertFalse(artifact_path.exists())
+
+            compliance_resp = client.get("/invoices/inv-api-retention/compliance-ledger")
+            self.assertEqual(compliance_resp.status_code, 200)
+            self.assertIn(
+                "DATA_RETENTION_DISPOSAL_EXECUTED",
+                {entry["event_type"] for entry in compliance_resp.json()["entries"]},
+            )
+
     def test_resolution_and_settlement_endpoints(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "api-resolution.db")

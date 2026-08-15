@@ -327,6 +327,12 @@ class PortalPaymentReportedActionRequest(BaseModel):
     payment_reference: str = ""
 
 
+class DataRetentionDisposalRequest(BaseModel):
+    approved_by: str
+    reason: str
+    as_of_date: date | None = None
+
+
 def _parse_api_keys(raw: str) -> dict[str, str]:
     keys: dict[str, str] = {}
     for item in raw.split(","):
@@ -435,6 +441,9 @@ def create_app(
         effective_allowed_upload_extensions = tuple(token.lower() for token in _parse_csv_tokens(raw_upload_extensions))
     allowed_upload_extension_set = {token.lower() for token in effective_allowed_upload_extensions}
     effective_quarantine_dir = quarantine_dir or os.getenv("FCD_QUARANTINE_DIR", "data/quarantine")
+    effective_data_retention_days = int(os.getenv("FCD_DATA_RETENTION_DAYS", "2190"))
+    if effective_data_retention_days <= 0:
+        raise ValueError("FCD_DATA_RETENTION_DAYS must be a positive integer.")
 
     app = FastAPI(title="Unpaid Invoice Escalator API")
     security = ApiSecurityController(
@@ -578,6 +587,12 @@ def create_app(
         ),
     )
     _append_check(
+        "data-retention-days",
+        effective_data_retention_days > 0,
+        "error",
+        f"Data retention days set to {effective_data_retention_days}.",
+    )
+    _append_check(
         "manifest-key-id",
         bool(manifest_key_id.strip()),
         "error",
@@ -685,6 +700,7 @@ def create_app(
             "max_upload_bytes": effective_max_upload_bytes,
             "allowed_upload_content_types": list(effective_allowed_upload_content_types),
             "allowed_upload_extensions": list(effective_allowed_upload_extensions),
+            "data_retention_days": effective_data_retention_days,
             "quarantine_dir": str(quarantine_root),
             "checks": combined_checks,
             "errors": errors,
@@ -885,6 +901,53 @@ def create_app(
                 },
             )
         return cancelled_communications
+
+    def _data_retention_review(invoice_id: str, *, as_of_date: date) -> dict[str, object]:
+        ledger_events = store.events_for_invoice(invoice_id)
+        compliance_entries = store.compliance_entries_for_invoice(invoice_id)
+        artifacts = store.artifacts_for_invoice(invoice_id)
+        last_activity_dt = None
+        if ledger_events:
+            last_activity_dt = ledger_events[-1].timestamp
+        age_days = 0 if last_activity_dt is None else max(0, (as_of_date - last_activity_dt.date()).days)
+        blockers: list[str] = []
+        if _data_accuracy_challenge_is_open(invoice_id):
+            blockers.append("Open data accuracy challenge restricts recovery and disposal.")
+        if age_days < effective_data_retention_days:
+            blockers.append(
+                f"Case age {age_days} days is below retention threshold ({effective_data_retention_days} days)."
+            )
+        return {
+            "invoice_id": invoice_id,
+            "as_of_date": as_of_date.isoformat(),
+            "retention_days_required": effective_data_retention_days,
+            "last_activity_at": None if last_activity_dt is None else last_activity_dt.isoformat(),
+            "case_age_days": age_days,
+            "artifacts_count": len(artifacts),
+            "events_count": len(ledger_events),
+            "compliance_entries_count": len(compliance_entries),
+            "eligible_for_disposal": len(blockers) == 0,
+            "blockers": blockers,
+        }
+
+    def _ensure_managed_storage_path(path: Path) -> None:
+        resolved = path.resolve()
+        artifacts_base = artifacts_root.resolve()
+        bundles_base = bundles_root.resolve()
+        try:
+            resolved.relative_to(artifacts_base)
+            return
+        except ValueError:
+            pass
+        try:
+            resolved.relative_to(bundles_base)
+            return
+        except ValueError:
+            pass
+        raise HTTPException(
+            status_code=409,
+            detail=f"Artifact path is outside managed storage roots and cannot be disposed: {resolved}",
+        )
 
     def _generate_promise_to_pay_artifact(invoice_id: str, plan_id: str, output_filename: str) -> EvidenceArtifact:
         agreements = store.payment_plan_agreements_for_invoice(invoice_id)
@@ -1921,6 +1984,83 @@ def create_app(
                 }
                 for entry in entries
             ],
+        }
+
+    @app.get("/data-retention-policy")
+    def data_retention_policy() -> dict[str, object]:
+        return {
+            "policy": {
+                "retention_days": effective_data_retention_days,
+                "disposal_scope": "evidence_file_payloads_only",
+                "immutable_records_retained": True,
+                "managed_storage_roots": [str(artifacts_root), str(bundles_root)],
+            }
+        }
+
+    @app.get("/invoices/{invoice_id}/data-retention-review")
+    def data_retention_review(invoice_id: str, as_of_date: date | None = None) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        return _data_retention_review(invoice_id, as_of_date=as_of_date or date.today())
+
+    @app.post("/invoices/{invoice_id}/data-retention-disposals")
+    def execute_data_retention_disposal(
+        invoice_id: str, payload: DataRetentionDisposalRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        review = _data_retention_review(invoice_id, as_of_date=payload.as_of_date or date.today())
+        if not bool(review["eligible_for_disposal"]):
+            raise HTTPException(
+                status_code=409,
+                detail="Data retention disposal blocked: " + "; ".join(review["blockers"]),
+            )
+        artifacts = store.artifacts_for_invoice(invoice_id)
+        deleted_paths: list[str] = []
+        missing_paths: list[str] = []
+        for artifact in artifacts:
+            path = Path(artifact.file_path)
+            _ensure_managed_storage_path(path)
+            if path.exists():
+                path.unlink()
+                deleted_paths.append(str(path))
+            else:
+                missing_paths.append(str(path))
+        now = datetime.now(timezone.utc)
+        details = {
+            "approved_by": payload.approved_by,
+            "reason": payload.reason,
+            "as_of_date": review["as_of_date"],
+            "retention_days_required": review["retention_days_required"],
+            "deleted_file_count": len(deleted_paths),
+            "missing_file_count": len(missing_paths),
+            "deleted_paths": deleted_paths,
+            "missing_paths": missing_paths,
+        }
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="DATA_RETENTION_DISPOSAL_EXECUTED",
+                details=details,
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.SYSTEM,
+            event_type="DATA_RETENTION_DISPOSAL_EXECUTED",
+            timestamp=now,
+            data_payload=details,
+        )
+        return {
+            "invoice_id": invoice_id,
+            "deleted_file_count": len(deleted_paths),
+            "missing_file_count": len(missing_paths),
+            "deleted_paths": deleted_paths,
+            "missing_paths": missing_paths,
         }
 
     @app.post("/invoices/{invoice_id}/resolution/payment-plans")
