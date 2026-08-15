@@ -712,6 +712,78 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(resumed_escalate.status_code, 200)
 
+    def test_balance_correction_withdraws_and_reissues_statement(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-balance-correction.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-correction",
+                    "currency": "GBP",
+                    "principal_amount": "900",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+            communication_resp = client.post(
+                "/invoices/inv-api-correction/communications",
+                json={
+                    "channel": "EMAIL",
+                    "recipient": "debtor@example.com",
+                    "subject": "Outstanding Balance Notice",
+                    "body_summary": "Balance reminder",
+                    "automated": True,
+                },
+            )
+            self.assertEqual(communication_resp.status_code, 200)
+            communication_id = communication_resp.json()["communication_id"]
+            queue_resp = client.post(
+                f"/invoices/inv-api-correction/communications/{communication_id}/delivery-events",
+                json={"state": "QUEUED", "note": "queued"},
+            )
+            self.assertEqual(queue_resp.status_code, 200)
+
+            correction_resp = client.post(
+                f"/invoices/inv-api-correction/communications/{communication_id}/balance-corrections",
+                json={
+                    "corrected_by": "USER-1",
+                    "correction_reason": "Payment allocation error corrected.",
+                    "corrected_statement_summary": "Revised balance statement issued after correction.",
+                    "corrected_statement_subject": "Corrected Balance Statement",
+                },
+            )
+            self.assertEqual(correction_resp.status_code, 200)
+            self.assertTrue(correction_resp.json()["cancelled_original"])
+
+            comms_resp = client.get("/invoices/inv-api-correction/communications")
+            self.assertEqual(comms_resp.status_code, 200)
+            by_id = {item["communication_id"]: item for item in comms_resp.json()["communications"]}
+            self.assertEqual(by_id[communication_id]["latest_state"], "CANCELLED")
+            self.assertIn("Withdrawal Notice:", by_id[correction_resp.json()["withdrawal_notice_communication_id"]]["subject"])
+            self.assertEqual(
+                by_id[correction_resp.json()["corrected_statement_communication_id"]]["subject"],
+                "Corrected Balance Statement",
+            )
+
+            compliance_resp = client.get("/invoices/inv-api-correction/compliance-ledger")
+            self.assertEqual(compliance_resp.status_code, 200)
+            event_types = {item["event_type"] for item in compliance_resp.json()["entries"]}
+            self.assertIn("ERROR_CORRECTED", event_types)
+            self.assertIn("COMMUNICATION_WITHDRAWN", event_types)
+
+            ledger_resp = client.get("/invoices/inv-api-correction/ledger-events")
+            self.assertEqual(ledger_resp.status_code, 200)
+            ledger_event_types = {item["event_type"] for item in ledger_resp.json()["events"]}
+            self.assertIn("ERROR_CORRECTED", ledger_event_types)
+            self.assertIn("COMMUNICATION_WITHDRAWN", ledger_event_types)
+
     def test_payment_or_credit_cancels_pending_automated_communications(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "api-cancel-pending.db")

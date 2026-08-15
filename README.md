@@ -120,6 +120,7 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `GET /invoices/{invoice_id}/resolution/dispute-carve-outs`
 - `POST /invoices/{invoice_id}/resolution/artifacts/promise-to-pay`
 - `POST /invoices/{invoice_id}/resolution/artifacts/settlement-agreement`
+- `POST /invoices/{invoice_id}/communications/{communication_id}/balance-corrections`
 - `GET /invoices/{invoice_id}/evidence-artifacts?artifact_type=&limit=100&offset=0`
 - `GET /invoices/{invoice_id}/ledger-events?event_type=&limit=100&offset=0`
 - `GET /invoices/{invoice_id}/debtor-ledger`
@@ -233,6 +234,7 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 - Recording payment or credit entries automatically cancels pending automated communications (`CREATED`/`QUEUED`).
 - Evidence bundles now include a communication delivery timeline and correction/withdrawal notice section sourced from compliance events.
 - Evidence bundles also include an artifact inventory, compliance snapshot, and event-chain attestation (validity, event count, latest hash).
+- Balance corrections now log `ERROR_CORRECTED`, issue a withdrawal notice, and dispatch a corrected statement with immutable audit entries.
 
 ## Deployment Runbook (Minimal)
 1. Set production environment variables (above).

@@ -284,6 +284,13 @@ class CommunicationDeliveryUpdateRequest(BaseModel):
     note: str = ""
 
 
+class BalanceCorrectionRequest(BaseModel):
+    corrected_by: str
+    correction_reason: str
+    corrected_statement_summary: str
+    corrected_statement_subject: str = "Corrected Statement"
+
+
 def _parse_api_keys(raw: str) -> dict[str, str]:
     keys: dict[str, str] = {}
     for item in raw.split(","):
@@ -1124,6 +1131,113 @@ def create_app(
                 }
                 for item in snapshots
             ],
+        }
+
+    @app.post("/invoices/{invoice_id}/communications/{communication_id}/balance-corrections")
+    def correct_communication_balance_error(
+        invoice_id: str, communication_id: str, payload: BalanceCorrectionRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        target_snapshot = next(
+            (
+                snapshot
+                for snapshot in communication_delivery_tracker.snapshots_for_invoice(invoice_id)
+                if snapshot.communication.communication_id == communication_id
+            ),
+            None,
+        )
+        if target_snapshot is None:
+            raise HTTPException(status_code=404, detail="Communication not found for invoice.")
+
+        now = datetime.now(timezone.utc)
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="ERROR_CORRECTED",
+                details={
+                    "communication_id": communication_id,
+                    "corrected_by": payload.corrected_by,
+                    "correction_reason": payload.correction_reason,
+                },
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.SYSTEM,
+            event_type="ERROR_CORRECTED",
+            timestamp=now,
+            data_payload={
+                "communication_id": communication_id,
+                "corrected_by": payload.corrected_by,
+                "correction_reason": payload.correction_reason,
+            },
+        )
+
+        cancelled_original = False
+        if target_snapshot.latest_state in {CommunicationDeliveryState.CREATED, CommunicationDeliveryState.QUEUED}:
+            communication_delivery_tracker.record_delivery_event(
+                invoice_id=invoice_id,
+                communication_id=communication_id,
+                next_state=CommunicationDeliveryState.CANCELLED,
+                note="Original communication withdrawn after balance correction.",
+            )
+            cancelled_original = True
+
+        withdrawal_snapshot = communication_delivery_tracker.create_communication(
+            invoice_id=invoice_id,
+            channel=target_snapshot.communication.channel,
+            recipient=target_snapshot.communication.recipient,
+            subject=f"Withdrawal Notice: {target_snapshot.communication.subject}",
+            body_summary=(
+                "Prior communication is withdrawn due to a balance correction. "
+                f"Reason: {payload.correction_reason}"
+            ),
+            automated=False,
+        )
+        corrected_snapshot = communication_delivery_tracker.create_communication(
+            invoice_id=invoice_id,
+            channel=target_snapshot.communication.channel,
+            recipient=target_snapshot.communication.recipient,
+            subject=payload.corrected_statement_subject,
+            body_summary=payload.corrected_statement_summary,
+            automated=False,
+        )
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="COMMUNICATION_WITHDRAWN",
+                details={
+                    "original_communication_id": communication_id,
+                    "withdrawal_notice_communication_id": withdrawal_snapshot.communication.communication_id,
+                    "corrected_statement_communication_id": corrected_snapshot.communication.communication_id,
+                    "cancelled_original": cancelled_original,
+                },
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.SYSTEM,
+            event_type="COMMUNICATION_WITHDRAWN",
+            timestamp=now,
+            data_payload={
+                "original_communication_id": communication_id,
+                "withdrawal_notice_communication_id": withdrawal_snapshot.communication.communication_id,
+                "corrected_statement_communication_id": corrected_snapshot.communication.communication_id,
+                "cancelled_original": cancelled_original,
+            },
+        )
+        return {
+            "invoice_id": invoice_id,
+            "original_communication_id": communication_id,
+            "cancelled_original": cancelled_original,
+            "withdrawal_notice_communication_id": withdrawal_snapshot.communication.communication_id,
+            "corrected_statement_communication_id": corrected_snapshot.communication.communication_id,
         }
 
     @app.post("/invoices/{invoice_id}/case-health-check")
