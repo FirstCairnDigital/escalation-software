@@ -1,12 +1,21 @@
 from datetime import date
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 
-from unpaid_invoice_escalator.models import Actor, DebtorType, Invoice, Jurisdiction
+from unpaid_invoice_escalator.models import (
+    Actor,
+    ClientFeeAction,
+    DebtorType,
+    Invoice,
+    Jurisdiction,
+    PreOverdueHygieneRecord,
+)
 from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
+from unpaid_invoice_escalator.services.dual_ledger_engine import DualLedgerEngine
 from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
 
 
@@ -73,6 +82,99 @@ class TestSQLiteStore(unittest.TestCase):
                         "DELETE FROM ledger_events WHERE invoice_id = ?",
                         (invoice.invoice_id,),
                     )
+                conn.rollback()
+            finally:
+                conn.close()
+
+    def test_dual_ledger_tables_are_append_only(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "escalator.db")
+            store = SQLiteStore(db_path)
+            event_ledger = SQLiteInvoiceLedger(store)
+            dual = DualLedgerEngine(store=store, event_ledger=event_ledger)
+            invoice = Invoice(
+                invoice_id="inv-db-3",
+                currency="GBP",
+                principal_amount=Decimal("2000"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            dual.add_client_action_fee(
+                case_id="CASE-3",
+                client_id="CLI-3",
+                invoice_id=invoice.invoice_id,
+                action_selected=ClientFeeAction.FORMAL_ESCALATION,
+                accepted_by_user="Tester",
+            )
+
+            conn = sqlite3.connect(db_path)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("UPDATE client_fee_entries SET fee_amount_gbp = '99.99'")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM client_fee_entries")
+                conn.rollback()
+            finally:
+                conn.close()
+
+    def test_pre_overdue_hygiene_table_is_append_only(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "escalator.db")
+            store = SQLiteStore(db_path)
+            invoice = Invoice(
+                invoice_id="inv-db-4",
+                currency="GBP",
+                principal_amount=Decimal("1500"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            store.append_pre_overdue_hygiene_record(
+                PreOverdueHygieneRecord(
+                    record_id="hyg-1",
+                    invoice_id=invoice.invoice_id,
+                    timestamp=datetime.now(timezone.utc),
+                    creditor_legal_entity_name="First Cairn Digital Ltd",
+                    creditor_companies_house_number="SC123456",
+                    creditor_vat_number="GB123456789",
+                    creditor_trading_address="1 Example Street",
+                    debtor_legal_entity_name="Buyer Ltd",
+                    debtor_companies_house_number="NI654321",
+                    debtor_vat_number="GB987654321",
+                    debtor_trading_address="2 Example Road",
+                    po_required=True,
+                    po_reference="PO-1",
+                    payment_terms_days=30,
+                    contractual_interest_clause_present=True,
+                    contractual_recovery_clause_present=True,
+                    proof_of_delivery_required=True,
+                    suggested_clause_text="Clause",
+                    suggested_clause_requires_legal_review=True,
+                    checklist_complete=True,
+                    missing_items=(),
+                    warning_tier="MEDIUM",
+                    format_warnings=("Creditor VAT number format is non-standard.",),
+                    notes="ok",
+                )
+            )
+            records = store.pre_overdue_hygiene_records_for_invoice(invoice.invoice_id)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].warning_tier, "MEDIUM")
+            self.assertEqual(records[0].format_warnings, ("Creditor VAT number format is non-standard.",))
+
+            conn = sqlite3.connect(db_path)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("UPDATE pre_overdue_hygiene_records SET notes = 'changed'")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM pre_overdue_hygiene_records")
                 conn.rollback()
             finally:
                 conn.close()

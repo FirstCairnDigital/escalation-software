@@ -1,0 +1,15 @@
+{
+  "schedule_id": "hmcts-court-fees",
+  "jurisdiction": "ENGLAND_WALES",
+  "version": "v2026.08",
+  "effective_from": "2026-01-01",
+  "effective_to": null,
+  "source_reference": "HMCTS issue fee schedule (operational pack)",
+  "fee_bands": [
+    { "min_claim": 0, "max_claim": 300, "fixed_fee": 35, "percentage_rate": null },
+    { "min_claim": 3000.01, "max_claim": 5000, "fixed_fee": 205, "percentage_rate": null },
+    { "min_claim": 5000.01, "max_claim": 10000, "fixed_fee": 455, "percentage_rate": null },
+    { "min_claim": 10000.01, "max_claim": null, "fixed_fee": null, "percentage_rate": 0.05 }
+  ]
+}
+

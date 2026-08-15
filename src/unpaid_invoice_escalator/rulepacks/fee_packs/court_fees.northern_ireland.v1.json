@@ -1,0 +1,16 @@
+{
+  "schedule_id": "ni-direct-small-claims-fees",
+  "jurisdiction": "NORTHERN_IRELAND",
+  "version": "v2026.08",
+  "effective_from": "2026-01-01",
+  "effective_to": null,
+  "source_reference": "NI Direct small claims fee schedule (operational pack)",
+  "fee_bands": [
+    { "min_claim": 0, "max_claim": 300, "fixed_fee": 49, "percentage_rate": null },
+    { "min_claim": 300.01, "max_claim": 500, "fixed_fee": 81, "percentage_rate": null },
+    { "min_claim": 500.01, "max_claim": 1000, "fixed_fee": 113, "percentage_rate": null },
+    { "min_claim": 1000.01, "max_claim": 3000, "fixed_fee": 163, "percentage_rate": null },
+    { "min_claim": 3000.01, "max_claim": 5000, "fixed_fee": 244, "percentage_rate": null }
+  ]
+}
+

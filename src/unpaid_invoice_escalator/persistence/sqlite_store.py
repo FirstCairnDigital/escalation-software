@@ -9,7 +9,22 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from unpaid_invoice_escalator.models import Actor, ArtifactType, DebtorType, EvidenceArtifact, Invoice, InvoiceState, Jurisdiction, LedgerEvent
+from unpaid_invoice_escalator.models import (
+    Actor,
+    ArtifactType,
+    ClientFeeAction,
+    ClientFeeEntry,
+    DebtorLedgerEntry,
+    DebtorLedgerEntryType,
+    DebtorType,
+    EvidenceArtifact,
+    Invoice,
+    InvoiceState,
+    Jurisdiction,
+    LedgerEvent,
+    PreOverdueHygieneRecord,
+    RecoveryCostCategory,
+)
 
 
 class SQLiteStore:
@@ -86,8 +101,110 @@ class SQLiteStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS debtor_ledger_entries (
+                    entry_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    entry_type TEXT NOT NULL,
+                    amount_gbp TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    recovery_cost_category TEXT,
+                    linked_client_fee_entry_id TEXT,
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS client_fee_entries (
+                    entry_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    invoice_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    pricing_schedule_version TEXT NOT NULL,
+                    action_selected TEXT NOT NULL,
+                    fee_amount_gbp TEXT NOT NULL,
+                    vat_gbp TEXT NOT NULL,
+                    accepted_by_user TEXT NOT NULL,
+                    external_fee INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pre_overdue_hygiene_records (
+                    record_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    creditor_legal_entity_name TEXT NOT NULL,
+                    creditor_companies_house_number TEXT NOT NULL,
+                    creditor_vat_number TEXT NOT NULL,
+                    creditor_trading_address TEXT NOT NULL,
+                    debtor_legal_entity_name TEXT NOT NULL,
+                    debtor_companies_house_number TEXT NOT NULL DEFAULT '',
+                    debtor_vat_number TEXT NOT NULL DEFAULT '',
+                    debtor_trading_address TEXT NOT NULL,
+                    po_required INTEGER NOT NULL,
+                    po_reference TEXT,
+                    payment_terms_days INTEGER NOT NULL,
+                    contractual_interest_clause_present INTEGER NOT NULL,
+                    contractual_recovery_clause_present INTEGER NOT NULL,
+                    proof_of_delivery_required INTEGER NOT NULL,
+                    suggested_clause_text TEXT,
+                    suggested_clause_requires_legal_review INTEGER NOT NULL,
+                    checklist_complete INTEGER NOT NULL,
+                    missing_items_json TEXT NOT NULL,
+                    warning_tier TEXT NOT NULL DEFAULT 'NONE',
+                    format_warnings_json TEXT NOT NULL DEFAULT '[]',
+                    notes TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            hygiene_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(pre_overdue_hygiene_records)").fetchall()
+            }
+            if "warning_tier" not in hygiene_columns:
+                conn.execute(
+                    "ALTER TABLE pre_overdue_hygiene_records ADD COLUMN warning_tier TEXT NOT NULL DEFAULT 'NONE'"
+                )
+            if "format_warnings_json" not in hygiene_columns:
+                conn.execute(
+                    "ALTER TABLE pre_overdue_hygiene_records ADD COLUMN format_warnings_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "debtor_companies_house_number" not in hygiene_columns:
+                conn.execute(
+                    "ALTER TABLE pre_overdue_hygiene_records ADD COLUMN debtor_companies_house_number TEXT NOT NULL DEFAULT ''"
+                )
+            if "debtor_vat_number" not in hygiene_columns:
+                conn.execute(
+                    "ALTER TABLE pre_overdue_hygiene_records ADD COLUMN debtor_vat_number TEXT NOT NULL DEFAULT ''"
+                )
+            conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_ledger_events_invoice_time
                 ON ledger_events(invoice_id, timestamp)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_debtor_ledger_invoice_time
+                ON debtor_ledger_entries(invoice_id, timestamp)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_client_fee_invoice_time
+                ON client_fee_entries(invoice_id, timestamp)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_hygiene_records_invoice_time
+                ON pre_overdue_hygiene_records(invoice_id, timestamp)
                 """
             )
             conn.execute(
@@ -147,6 +264,60 @@ class SQLiteStore:
                 BEFORE DELETE ON evidence_artifacts
                 BEGIN
                     SELECT RAISE(ABORT, 'evidence_artifacts is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_debtor_ledger_no_update
+                BEFORE UPDATE ON debtor_ledger_entries
+                BEGIN
+                    SELECT RAISE(ABORT, 'debtor_ledger_entries is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_debtor_ledger_no_delete
+                BEFORE DELETE ON debtor_ledger_entries
+                BEGIN
+                    SELECT RAISE(ABORT, 'debtor_ledger_entries is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_client_fee_no_update
+                BEFORE UPDATE ON client_fee_entries
+                BEGIN
+                    SELECT RAISE(ABORT, 'client_fee_entries is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_client_fee_no_delete
+                BEFORE DELETE ON client_fee_entries
+                BEGIN
+                    SELECT RAISE(ABORT, 'client_fee_entries is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_hygiene_records_no_update
+                BEFORE UPDATE ON pre_overdue_hygiene_records
+                BEGIN
+                    SELECT RAISE(ABORT, 'pre_overdue_hygiene_records is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_hygiene_records_no_delete
+                BEFORE DELETE ON pre_overdue_hygiene_records
+                BEGIN
+                    SELECT RAISE(ABORT, 'pre_overdue_hygiene_records is append-only');
                 END;
                 """
             )
@@ -328,3 +499,207 @@ class SQLiteStore:
                 return False
             previous = event.hash
         return True
+
+    def append_debtor_ledger_entry(self, entry: DebtorLedgerEntry) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO debtor_ledger_entries (
+                    entry_id, invoice_id, timestamp, entry_type, amount_gbp, description,
+                    recovery_cost_category, linked_client_fee_entry_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry.entry_id,
+                    entry.invoice_id,
+                    entry.timestamp.isoformat(),
+                    entry.entry_type.value,
+                    str(entry.amount_gbp),
+                    entry.description,
+                    None if entry.recovery_cost_category is None else entry.recovery_cost_category.value,
+                    entry.linked_client_fee_entry_id,
+                ),
+            )
+            conn.commit()
+
+    def append_client_fee_entry(self, entry: ClientFeeEntry) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO client_fee_entries (
+                    entry_id, case_id, client_id, invoice_id, timestamp, pricing_schedule_version,
+                    action_selected, fee_amount_gbp, vat_gbp, accepted_by_user, external_fee
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry.entry_id,
+                    entry.case_id,
+                    entry.client_id,
+                    entry.invoice_id,
+                    entry.timestamp.isoformat(),
+                    entry.pricing_schedule_version,
+                    entry.action_selected.value,
+                    str(entry.fee_amount_gbp),
+                    str(entry.vat_gbp),
+                    entry.accepted_by_user,
+                    1 if entry.external_fee else 0,
+                ),
+            )
+            conn.commit()
+
+    def debtor_ledger_entries_for_invoice(self, invoice_id: str) -> tuple[DebtorLedgerEntry, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT entry_id, invoice_id, timestamp, entry_type, amount_gbp, description,
+                       recovery_cost_category, linked_client_fee_entry_id
+                FROM debtor_ledger_entries
+                WHERE invoice_id = ?
+                ORDER BY timestamp ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            DebtorLedgerEntry(
+                entry_id=row["entry_id"],
+                invoice_id=row["invoice_id"],
+                timestamp=datetime.fromisoformat(row["timestamp"]),
+                entry_type=DebtorLedgerEntryType(row["entry_type"]),
+                amount_gbp=Decimal(row["amount_gbp"]),
+                description=row["description"],
+                recovery_cost_category=(
+                    None
+                    if row["recovery_cost_category"] is None
+                    else RecoveryCostCategory(row["recovery_cost_category"])
+                ),
+                linked_client_fee_entry_id=row["linked_client_fee_entry_id"],
+            )
+            for row in rows
+        )
+
+    def client_fee_entries_for_invoice(self, invoice_id: str) -> tuple[ClientFeeEntry, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT entry_id, case_id, client_id, invoice_id, timestamp, pricing_schedule_version,
+                       action_selected, fee_amount_gbp, vat_gbp, accepted_by_user, external_fee
+                FROM client_fee_entries
+                WHERE invoice_id = ?
+                ORDER BY timestamp ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            ClientFeeEntry(
+                entry_id=row["entry_id"],
+                case_id=row["case_id"],
+                client_id=row["client_id"],
+                invoice_id=row["invoice_id"],
+                timestamp=datetime.fromisoformat(row["timestamp"]),
+                pricing_schedule_version=row["pricing_schedule_version"],
+                action_selected=ClientFeeAction(row["action_selected"]),
+                fee_amount_gbp=Decimal(row["fee_amount_gbp"]),
+                vat_gbp=Decimal(row["vat_gbp"]),
+                accepted_by_user=row["accepted_by_user"],
+                external_fee=bool(row["external_fee"]),
+            )
+            for row in rows
+        )
+
+    def debtor_ledger_balance_for_invoice(self, invoice_id: str) -> Decimal:
+        entries = self.debtor_ledger_entries_for_invoice(invoice_id)
+        return sum((entry.amount_gbp for entry in entries), start=Decimal("0.00"))
+
+    def client_fee_balance_for_invoice(self, invoice_id: str) -> Decimal:
+        entries = self.client_fee_entries_for_invoice(invoice_id)
+        return sum((entry.fee_amount_gbp + entry.vat_gbp for entry in entries), start=Decimal("0.00"))
+
+    def append_pre_overdue_hygiene_record(self, record: PreOverdueHygieneRecord) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO pre_overdue_hygiene_records (
+                    record_id, invoice_id, timestamp, creditor_legal_entity_name, creditor_companies_house_number,
+                    creditor_vat_number, creditor_trading_address, debtor_legal_entity_name,
+                    debtor_companies_house_number, debtor_vat_number, debtor_trading_address, po_required, po_reference,
+                    payment_terms_days, contractual_interest_clause_present,
+                    contractual_recovery_clause_present, proof_of_delivery_required, suggested_clause_text,
+                    suggested_clause_requires_legal_review, checklist_complete, missing_items_json,
+                    warning_tier, format_warnings_json, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.record_id,
+                    record.invoice_id,
+                    record.timestamp.isoformat(),
+                    record.creditor_legal_entity_name,
+                    record.creditor_companies_house_number,
+                    record.creditor_vat_number,
+                    record.creditor_trading_address,
+                    record.debtor_legal_entity_name,
+                    record.debtor_companies_house_number,
+                    record.debtor_vat_number,
+                    record.debtor_trading_address,
+                    1 if record.po_required else 0,
+                    record.po_reference,
+                    record.payment_terms_days,
+                    1 if record.contractual_interest_clause_present else 0,
+                    1 if record.contractual_recovery_clause_present else 0,
+                    1 if record.proof_of_delivery_required else 0,
+                    record.suggested_clause_text,
+                    1 if record.suggested_clause_requires_legal_review else 0,
+                    1 if record.checklist_complete else 0,
+                    json.dumps(list(record.missing_items), sort_keys=True),
+                    record.warning_tier,
+                    json.dumps(list(record.format_warnings), sort_keys=True),
+                    record.notes,
+                ),
+            )
+            conn.commit()
+
+    def pre_overdue_hygiene_records_for_invoice(self, invoice_id: str) -> tuple[PreOverdueHygieneRecord, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT record_id, invoice_id, timestamp, creditor_legal_entity_name, creditor_companies_house_number,
+                       creditor_vat_number, creditor_trading_address, debtor_legal_entity_name,
+                       debtor_companies_house_number, debtor_vat_number, debtor_trading_address,
+                       po_required, po_reference, payment_terms_days, contractual_interest_clause_present,
+                       contractual_recovery_clause_present, proof_of_delivery_required, suggested_clause_text,
+                       suggested_clause_requires_legal_review, checklist_complete, missing_items_json,
+                       warning_tier, format_warnings_json, notes
+                FROM pre_overdue_hygiene_records
+                WHERE invoice_id = ?
+                ORDER BY timestamp ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            PreOverdueHygieneRecord(
+                record_id=row["record_id"],
+                invoice_id=row["invoice_id"],
+                timestamp=datetime.fromisoformat(row["timestamp"]),
+                creditor_legal_entity_name=row["creditor_legal_entity_name"],
+                creditor_companies_house_number=row["creditor_companies_house_number"],
+                creditor_vat_number=row["creditor_vat_number"],
+                creditor_trading_address=row["creditor_trading_address"],
+                debtor_legal_entity_name=row["debtor_legal_entity_name"],
+                debtor_companies_house_number=row["debtor_companies_house_number"],
+                debtor_vat_number=row["debtor_vat_number"],
+                debtor_trading_address=row["debtor_trading_address"],
+                po_required=bool(row["po_required"]),
+                po_reference=row["po_reference"],
+                payment_terms_days=int(row["payment_terms_days"]),
+                contractual_interest_clause_present=bool(row["contractual_interest_clause_present"]),
+                contractual_recovery_clause_present=bool(row["contractual_recovery_clause_present"]),
+                proof_of_delivery_required=bool(row["proof_of_delivery_required"]),
+                suggested_clause_text=row["suggested_clause_text"],
+                suggested_clause_requires_legal_review=bool(row["suggested_clause_requires_legal_review"]),
+                checklist_complete=bool(row["checklist_complete"]),
+                missing_items=tuple(json.loads(row["missing_items_json"])),
+                warning_tier=row["warning_tier"],
+                format_warnings=tuple(json.loads(row["format_warnings_json"])),
+                notes=row["notes"],
+            )
+            for row in rows
+        )

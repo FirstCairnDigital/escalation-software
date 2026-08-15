@@ -1,6 +1,10 @@
 from .models import (
     Actor,
     ArtifactType,
+    ClientFeeAction,
+    ClientFeeEntry,
+    DebtorLedgerEntry,
+    DebtorLedgerEntryType,
     DebtorType,
     EngineDecision,
     EvidenceArtifact,
@@ -8,11 +12,16 @@ from .models import (
     InvoiceState,
     Jurisdiction,
     LedgerEvent,
+    RecoveryCostCategory,
 )
 
 __all__ = [
     "Actor",
     "ArtifactType",
+    "ClientFeeAction",
+    "ClientFeeEntry",
+    "DebtorLedgerEntry",
+    "DebtorLedgerEntryType",
     "DebtorType",
     "EngineDecision",
     "EvidenceArtifact",
@@ -20,4 +29,5 @@ __all__ = [
     "InvoiceState",
     "Jurisdiction",
     "LedgerEvent",
+    "RecoveryCostCategory",
 ]

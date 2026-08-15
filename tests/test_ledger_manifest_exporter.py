@@ -46,7 +46,45 @@ class TestLedgerManifestExporter(unittest.TestCase):
             invalid = exporter.verify_invoice_manifest(invoice_id=invoice.invoice_id, manifest_path=str(manifest_path))
             self.assertFalse(invalid["overall_valid"])
 
+    def test_verify_supports_key_rotation_window(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "manifest-rotation.db")
+            store = SQLiteStore(db_path)
+            ledger = SQLiteInvoiceLedger(store)
+            signer = LedgerManifestExporter(store=store, signing_key="legacy-key", key_id="legacy-2026q2")
+            verifier = LedgerManifestExporter(
+                store=store,
+                signing_key="current-key",
+                key_id="current-2026q3",
+                verification_keys={
+                    "legacy-2026q2": "legacy-key",
+                    "current-2026q3": "current-key",
+                },
+            )
+            invoice = Invoice(
+                invoice_id="inv-man-rotation",
+                currency="GBP",
+                principal_amount=Decimal("1200"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            ledger.append_event(
+                invoice_id=invoice.invoice_id,
+                actor=Actor.SYSTEM,
+                event_type="INVOICE_CREATED",
+                data_payload={"rotation": "legacy"},
+            )
+
+            manifest_path = Path(tmp_dir) / "manifest-rotation.json"
+            signer.export_invoice_manifest(invoice_id=invoice.invoice_id, output_path=str(manifest_path))
+            verification = verifier.verify_invoice_manifest(invoice_id=invoice.invoice_id, manifest_path=str(manifest_path))
+            self.assertTrue(verification["overall_valid"])
+            self.assertEqual(verification["signature_key_id"], "legacy-2026q2")
+            self.assertEqual(verification["verified_with_key_id"], "legacy-2026q2")
+
 
 if __name__ == "__main__":
     unittest.main()
-

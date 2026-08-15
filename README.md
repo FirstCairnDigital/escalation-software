@@ -15,6 +15,8 @@ Credit-control and evidence-assembly software for B2B invoice recovery workflows
 - SQLite persistence with triggers preventing `UPDATE`/`DELETE` on evidence tables.
 - Signed ledger manifests (JSON + PDF) and verification endpoint.
 - Late-payment calculator with BoE base-rate reference data and ledger logging.
+- Dual-ledger engine with strict debtor-claim and FCD-client-fee isolation.
+- Pre-overdue contract hygiene workflow with legal-review disclaimer handling.
 - Claim-ready evidence bundle PDF generation.
 
 ## Project Structure
@@ -41,8 +43,32 @@ python -m unpaid_invoice_escalator.api
 
 Server default: `http://127.0.0.1:8000`
 
+### Production Security Configuration
+Set these before startup in production:
+
+```powershell
+$env:FCD_APP_ENV="production"
+$env:FCD_MANIFEST_SIGNING_KEY="<strong-secret-or-kms-material>"
+$env:FCD_MANIFEST_KEY_ID="fcd-kms-key-1"
+$env:FCD_MANIFEST_VERIFY_KEYS="fcd-kms-key-1:<current-key>,fcd-kms-key-0:<previous-key>"
+$env:FCD_API_KEYS="admin-key:admin,ops-key:operator,ro-key:viewer"
+$env:FCD_RATE_LIMIT_PER_MINUTE="120"
+$env:FCD_AUTH_FAILURE_ALERT_THRESHOLD="10"
+$env:FCD_RATE_LIMIT_ALERT_THRESHOLD="10"
+$env:FCD_SERVER_ERROR_ALERT_THRESHOLD="5"
+$env:FCD_MAX_UPLOAD_BYTES="5242880"
+```
+
+Notes:
+- `FCD_APP_ENV=production` enforces non-default signing keys.
+- API keys are supplied via `x-api-key` header.
+- Role levels: `viewer` (read), `operator` (write), `admin` (metrics/ops).
+- `FCD_MANIFEST_VERIFY_KEYS` enables key-rotation verification windows.
+- `FCD_MAX_UPLOAD_BYTES` enforces maximum uploaded artifact size.
+
 ### Web Interface
 - Open `http://127.0.0.1:8000/` for the in-app operations UI.
+- Open `http://127.0.0.1:8000/ui/invoices/{invoice_id}` for a tabbed invoice workspace.
 
 ## Run the CLI
 
@@ -53,13 +79,25 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 
 ## API Endpoints
 - `GET /health`
+- `GET /ready` (readiness check; public)
+- `GET /metrics` (admin role when auth enabled)
+- `GET /deployment/startup-config-validation` (admin role when auth enabled)
 - `GET /` (Web UI)
+- `GET /ui/invoices/{invoice_id}` (Tabbed invoice workspace)
 - `GET /rule-packs/{jurisdiction}/active?on_date=YYYY-MM-DD`
 - `POST /invoices`
 - `GET /invoices/{invoice_id}`
-- `GET /invoices/{invoice_id}/evidence-artifacts`
-- `GET /invoices/{invoice_id}/ledger-events?limit=100`
+- `GET /invoices/{invoice_id}/evidence-artifacts?artifact_type=&limit=100&offset=0`
+- `GET /invoices/{invoice_id}/ledger-events?event_type=&limit=100&offset=0`
+- `GET /invoices/{invoice_id}/debtor-ledger`
+- `GET /invoices/{invoice_id}/client-fee-ledger`
 - `POST /invoices/{invoice_id}/escalate`
+- `POST /invoices/{invoice_id}/client-fee-ledger/actions`
+- `POST /invoices/{invoice_id}/debtor-ledger/entries`
+- `POST /invoices/{invoice_id}/recovery-cost-assessments`
+- `POST /invoices/{invoice_id}/court-fee-quotes`
+- `POST /invoices/{invoice_id}/pre-overdue-hygiene`
+- `GET /invoices/{invoice_id}/pre-overdue-hygiene`
 - `POST /invoices/{invoice_id}/evidence-artifacts` (multipart; supports `artifact_type`)
 - `POST /invoices/{invoice_id}/evidence-bundles`
 - `POST /invoices/{invoice_id}/ledger-manifests` (`json` or `pdf`)
@@ -87,3 +125,41 @@ Current automation limits from rule packs:
 - Northern Ireland: £5,000
 
 These limits and protocol timings are data-driven via JSON rule packs, not hard-coded constants.
+
+## Pre-Overdue Contract Hygiene
+- Captures creditor/debtor legal entity, Companies House number, VAT number, trading address metadata, PO requirement flags, payment terms, and contractual remedy clauses.
+- Returns checklist completeness and missing items for credit-control setup quality.
+- Applies strict format checks for Companies House and VAT numbers with warning tiers (`NONE`, `MEDIUM`, `HIGH`).
+- Any suggested clause text is automatically marked with the disclaimer:
+  - `Requires Client Independent Legal Review`
+
+## Monitoring & Alerts
+- Use `GET /metrics` for request counters, auth failures, 429s, and 5xx totals.
+- `GET /metrics` also returns structured `recent_audit_events`, `alert_policy`, and `active_alerts`.
+- Alert on sustained increases in:
+  - `auth_failures_total`
+  - `rate_limited_total`
+  - `server_errors_total`
+- Treat non-null `last_alert` as an operational signal to review logs.
+- All responses include `x-request-id` and security headers (`x-content-type-options`, `x-frame-options`, `referrer-policy`, `cache-control`) for traceability and browser hardening.
+
+## Readiness & Deployment Validation
+- `GET /ready` returns:
+  - `200` with `status=ready` when all error-severity checks pass.
+  - `503` with `status=not_ready` when any error-severity check fails.
+- `GET /deployment/startup-config-validation` returns a full startup/runtime config validation report with:
+  - environment and effective security settings
+  - check list (pass/fail + severity + detail)
+  - aggregated `errors` and `warnings`
+
+## Deployment Runbook (Minimal)
+1. Set production environment variables (above).
+2. Start service (`python -m unpaid_invoice_escalator.api`) behind TLS/reverse proxy.
+3. Smoke test:
+   - `GET /health` (no auth)
+   - `GET /metrics` with admin API key
+   - `POST /invoices` with operator API key
+4. Verify signing and verification flow:
+   - `POST /invoices/{id}/ledger-manifests`
+   - `POST /invoices/{id}/ledger-manifests/verify`
+5. Configure alerting on `metrics` counters and HTTP 5xx logs.

@@ -33,6 +33,32 @@ class ArtifactType(str, Enum):
     OTHER = "OTHER"
 
 
+class RecoveryCostCategory(str, Enum):
+    CLIENT_COST_ONLY = "CLIENT_COST_ONLY"
+    STATUTORY_REASONABLE_RECOVERY_COST = "STATUTORY_REASONABLE_RECOVERY_COST"
+    CONTRACTUAL_RECOVERY_COST = "CONTRACTUAL_RECOVERY_COST"
+    OFFICIAL_COURT_FEE = "OFFICIAL_COURT_FEE"
+
+
+class DebtorLedgerEntryType(str, Enum):
+    ORIGINAL_PRINCIPAL = "ORIGINAL_PRINCIPAL"
+    STATUTORY_INTEREST = "STATUTORY_INTEREST"
+    FIXED_COMPENSATION = "FIXED_COMPENSATION"
+    CONTRACTUAL_RECOVERY_COST = "CONTRACTUAL_RECOVERY_COST"
+    OFFICIAL_COURT_FEE = "OFFICIAL_COURT_FEE"
+    PAYMENT_RECEIVED = "PAYMENT_RECEIVED"
+    ADJUSTMENT = "ADJUSTMENT"
+
+
+class ClientFeeAction(str, Enum):
+    MONTHLY_SAAS_TIER = "MONTHLY_SAAS_TIER"
+    FORMAL_ESCALATION = "FORMAL_ESCALATION"
+    NOTICE_PACK = "NOTICE_PACK"
+    PRE_ACTION_PACK = "PRE_ACTION_PACK"
+    COURT_READY_PACK = "COURT_READY_PACK"
+    REVIEW_SETUP_SERVICE = "REVIEW_SETUP_SERVICE"
+
+
 class InvoiceState(str, Enum):
     ISSUED = "ISSUED"
     FRIENDLY_REMINDER = "FRIENDLY_REMINDER"
@@ -87,3 +113,58 @@ class EngineDecision:
     instructions: str
     documents_to_generate: tuple[str, ...] = ()
     wait_until: date | None = None
+
+
+@dataclass(frozen=True)
+class DebtorLedgerEntry:
+    entry_id: str
+    invoice_id: str
+    timestamp: datetime
+    entry_type: DebtorLedgerEntryType
+    amount_gbp: Decimal
+    description: str
+    recovery_cost_category: RecoveryCostCategory | None = None
+    linked_client_fee_entry_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ClientFeeEntry:
+    entry_id: str
+    case_id: str
+    client_id: str
+    invoice_id: str
+    timestamp: datetime
+    pricing_schedule_version: str
+    action_selected: ClientFeeAction
+    fee_amount_gbp: Decimal
+    vat_gbp: Decimal
+    accepted_by_user: str
+    external_fee: bool = False
+
+
+@dataclass(frozen=True)
+class PreOverdueHygieneRecord:
+    record_id: str
+    invoice_id: str
+    timestamp: datetime
+    creditor_legal_entity_name: str
+    creditor_companies_house_number: str
+    creditor_vat_number: str
+    creditor_trading_address: str
+    debtor_legal_entity_name: str
+    debtor_companies_house_number: str
+    debtor_vat_number: str
+    debtor_trading_address: str
+    po_required: bool
+    po_reference: str | None
+    payment_terms_days: int
+    contractual_interest_clause_present: bool
+    contractual_recovery_clause_present: bool
+    proof_of_delivery_required: bool
+    suggested_clause_text: str | None
+    suggested_clause_requires_legal_review: bool
+    checklist_complete: bool
+    missing_items: tuple[str, ...] = ()
+    warning_tier: str = "NONE"
+    format_warnings: tuple[str, ...] = ()
+    notes: str = ""

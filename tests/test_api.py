@@ -32,6 +32,121 @@ class TestApi(unittest.TestCase):
                 },
             )
             self.assertEqual(create_resp.status_code, 200)
+            fee_action_resp = client.post(
+                "/invoices/inv-api-1/client-fee-ledger/actions",
+                json={
+                    "case_id": "FCD-R-2026-000184",
+                    "client_id": "CLI-8841",
+                    "action_selected": "FORMAL_ESCALATION",
+                    "accepted_by_user": "John Smith (USER-102)",
+                },
+            )
+            self.assertEqual(fee_action_resp.status_code, 200)
+            self.assertEqual(fee_action_resp.json()["fee_amount_gbp"], "9.95")
+
+            court_quote_resp = client.post(
+                "/invoices/inv-api-1/court-fee-quotes",
+                json={"claim_value_gbp": "2800"},
+            )
+            self.assertEqual(court_quote_resp.status_code, 200)
+            self.assertEqual(court_quote_resp.json()["official_court_fee_gbp"], "163")
+
+            cost_assess_resp = client.post(
+                "/invoices/inv-api-1/recovery-cost-assessments",
+                json={
+                    "recovery_cost_gbp": "39.95",
+                    "has_contractual_recovery_clause": False,
+                    "is_official_court_fee": False,
+                    "statutory_reasonable_recovery_allowed": True,
+                },
+            )
+            self.assertEqual(cost_assess_resp.status_code, 200)
+            self.assertEqual(
+                cost_assess_resp.json()["category"],
+                "STATUTORY_REASONABLE_RECOVERY_COST",
+            )
+
+            debtor_entry_resp = client.post(
+                "/invoices/inv-api-1/debtor-ledger/entries",
+                json={
+                    "entry_type": "STATUTORY_INTEREST",
+                    "amount_gbp": "12.50",
+                    "description": "Accrued interest",
+                },
+            )
+            self.assertEqual(debtor_entry_resp.status_code, 200)
+
+            debtor_ledger_resp = client.get("/invoices/inv-api-1/debtor-ledger")
+            self.assertEqual(debtor_ledger_resp.status_code, 200)
+            self.assertEqual(debtor_ledger_resp.json()["balance_gbp"], "12.50")
+            client_ledger_resp = client.get("/invoices/inv-api-1/client-fee-ledger")
+            self.assertEqual(client_ledger_resp.status_code, 200)
+            self.assertEqual(client_ledger_resp.json()["balance_gbp"], "11.94")
+
+            hygiene_resp = client.post(
+                "/invoices/inv-api-1/pre-overdue-hygiene",
+                json={
+                    "creditor_legal_entity_name": "First Cairn Digital Ltd",
+                    "creditor_companies_house_number": "SC123456",
+                    "creditor_vat_number": "GB123456789",
+                    "creditor_trading_address": "1 Example Street, Glasgow",
+                    "debtor_legal_entity_name": "Example Buyer Ltd",
+                    "debtor_companies_house_number": "NI654321",
+                    "debtor_vat_number": "GB987654321",
+                    "debtor_trading_address": "2 Sample Road, Belfast",
+                    "po_required": True,
+                    "po_reference": None,
+                    "payment_terms_days": 30,
+                    "contractual_interest_clause_present": True,
+                    "contractual_recovery_clause_present": False,
+                    "proof_of_delivery_required": True,
+                    "suggested_clause_text": "Draft clause",
+                    "notes": "Initial setup review",
+                },
+            )
+            self.assertEqual(hygiene_resp.status_code, 200)
+            hygiene_body = hygiene_resp.json()
+            self.assertFalse(hygiene_body["checklist_complete"])
+            self.assertIn("Contractual recovery charges clause", hygiene_body["missing_items"])
+            self.assertEqual(hygiene_body["warning_tier"], "NONE")
+            self.assertEqual(hygiene_body["format_warnings"], [])
+            self.assertEqual(hygiene_body["disclaimer"], "Requires Client Independent Legal Review")
+
+            hygiene_warn_resp = client.post(
+                "/invoices/inv-api-1/pre-overdue-hygiene",
+                json={
+                    "creditor_legal_entity_name": "First Cairn Digital Ltd",
+                    "creditor_companies_house_number": "BAD-123",
+                    "creditor_vat_number": "XX999",
+                    "creditor_trading_address": "1 Example Street, Glasgow",
+                    "debtor_legal_entity_name": "Example Buyer Ltd",
+                    "debtor_companies_house_number": "BAD-456",
+                    "debtor_vat_number": "YY999",
+                    "debtor_trading_address": "2 Sample Road, Belfast",
+                    "po_required": False,
+                    "po_reference": None,
+                    "payment_terms_days": 30,
+                    "contractual_interest_clause_present": True,
+                    "contractual_recovery_clause_present": True,
+                    "proof_of_delivery_required": True,
+                    "suggested_clause_text": None,
+                    "notes": "format checks",
+                },
+            )
+            self.assertEqual(hygiene_warn_resp.status_code, 200)
+            hygiene_warn_body = hygiene_warn_resp.json()
+            self.assertEqual(hygiene_warn_body["warning_tier"], "HIGH")
+            self.assertEqual(len(hygiene_warn_body["format_warnings"]), 4)
+
+            hygiene_list_resp = client.get("/invoices/inv-api-1/pre-overdue-hygiene")
+            self.assertEqual(hygiene_list_resp.status_code, 200)
+            hygiene_list_body = hygiene_list_resp.json()
+            self.assertEqual(hygiene_list_body["count"], 2)
+            self.assertEqual(hygiene_list_body["records"][1]["warning_tier"], "HIGH")
+
+            workspace_resp = client.get("/ui/invoices/inv-api-1")
+            self.assertEqual(workspace_resp.status_code, 200)
+            self.assertIn("Invoice Workspace", workspace_resp.text)
             rule_resp = client.get("/rule-packs/NORTHERN_IRELAND/active?on_date=2026-02-01")
             self.assertEqual(rule_resp.status_code, 200)
             self.assertEqual(rule_resp.json()["rule_id"], "ni-commercial-invoice-recovery")
@@ -58,18 +173,21 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(upload_resp.status_code, 200)
 
-            artifacts_resp = client.get("/invoices/inv-api-1/evidence-artifacts")
+            artifacts_resp = client.get("/invoices/inv-api-1/evidence-artifacts?artifact_type=CONTRACT&limit=1&offset=0")
             self.assertEqual(artifacts_resp.status_code, 200)
             artifacts_body = artifacts_resp.json()
-            self.assertEqual(artifacts_body["count"], 2)
+            self.assertEqual(artifacts_body["count"], 1)
+            self.assertEqual(artifacts_body["total_count"], 1)
             self.assertEqual(artifacts_body["artifacts"][0]["artifact_type"], "CONTRACT")
-            self.assertEqual(artifacts_body["artifacts"][1]["artifact_type"], "PROOF_OF_DELIVERY")
 
-            events_resp = client.get("/invoices/inv-api-1/ledger-events?limit=5")
+            events_resp = client.get(
+                "/invoices/inv-api-1/ledger-events?event_type=EVIDENCE_ARTIFACT_UPLOADED&limit=1&offset=0"
+            )
             self.assertEqual(events_resp.status_code, 200)
             events_body = events_resp.json()
             self.assertTrue(events_body["chain_valid"])
-            self.assertGreaterEqual(events_body["count"], 1)
+            self.assertEqual(events_body["count"], 1)
+            self.assertGreaterEqual(events_body["total_count"], 2)
 
             bundle_resp = client.post(
                 "/invoices/inv-api-1/evidence-bundles",
@@ -124,6 +242,40 @@ class TestApi(unittest.TestCase):
             self.assertTrue(calc_body["eligible"])
             self.assertEqual(calc_body["rule_id"], "ni-commercial-invoice-recovery")
             self.assertIsNotNone(calc_body["breakdown"])
+
+    def test_upload_limit_enforced(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-limit.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=artifacts_dir,
+                bundles_dir=bundles_dir,
+                max_upload_bytes=8,
+            )
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-limit",
+                    "currency": "GBP",
+                    "principal_amount": "100",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            upload_resp = client.post(
+                "/invoices/inv-api-limit/evidence-artifacts",
+                data={"user_id": "client-1", "artifact_type": "CONTRACT"},
+                files={"file": ("contract.txt", b"123456789", "text/plain")},
+            )
+            self.assertEqual(upload_resp.status_code, 413)
 
 
 if __name__ == "__main__":

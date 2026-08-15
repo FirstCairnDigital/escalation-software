@@ -11,10 +11,20 @@ from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
 
 
 class LedgerManifestExporter:
-    def __init__(self, *, store: SQLiteStore, signing_key: str, key_id: str = "fcd-local-key") -> None:
+    def __init__(
+        self,
+        *,
+        store: SQLiteStore,
+        signing_key: str,
+        key_id: str = "fcd-local-key",
+        verification_keys: dict[str, str] | None = None,
+    ) -> None:
         self._store = store
         self._signing_key = signing_key
         self._key_id = key_id
+        keys = dict(verification_keys or {})
+        keys.setdefault(key_id, signing_key)
+        self._verification_keys = keys
 
     def export_invoice_manifest(self, *, invoice_id: str, output_path: str) -> dict[str, Any]:
         manifest = self._build_manifest(invoice_id=invoice_id)
@@ -36,12 +46,28 @@ class LedgerManifestExporter:
         path = Path(manifest_path)
         manifest = json.loads(path.read_text(encoding="utf-8"))
         signature = manifest.get("signature", {})
+        signature_key_id = str(signature.get("key_id", ""))
         signature_value = str(signature.get("value", ""))
 
         manifest_core = dict(manifest)
         manifest_core.pop("signature", None)
-        computed_signature = self._sign_manifest_core(manifest_core)
-        signature_valid = hmac.compare_digest(signature_value, computed_signature)
+        verification_candidates: list[tuple[str, str]] = []
+        selected_key = self._verification_keys.get(signature_key_id)
+        if selected_key is not None:
+            verification_candidates.append((signature_key_id, selected_key))
+        for candidate_key_id, candidate_key in self._verification_keys.items():
+            if candidate_key_id == signature_key_id:
+                continue
+            verification_candidates.append((candidate_key_id, candidate_key))
+
+        verified_with_key_id: str | None = None
+        signature_valid = False
+        for candidate_key_id, candidate_key in verification_candidates:
+            computed_signature = self._sign_manifest_core(manifest_core, candidate_key)
+            if hmac.compare_digest(signature_value, computed_signature):
+                signature_valid = True
+                verified_with_key_id = candidate_key_id
+                break
 
         expected_manifest = self._build_manifest(invoice_id=invoice_id)
         expected_core = dict(expected_manifest)
@@ -55,6 +81,8 @@ class LedgerManifestExporter:
         chain_valid = bool(manifest.get("chain_valid")) and core_matches_current_ledger
         return {
             "signature_valid": signature_valid,
+            "signature_key_id": signature_key_id or None,
+            "verified_with_key_id": verified_with_key_id,
             "core_matches_current_ledger": core_matches_current_ledger,
             "chain_valid": chain_valid,
             "overall_valid": signature_valid and core_matches_current_ledger and chain_valid,
@@ -115,9 +143,10 @@ class LedgerManifestExporter:
         }
         return manifest
 
-    def _sign_manifest_core(self, manifest_core: dict[str, Any]) -> str:
+    def _sign_manifest_core(self, manifest_core: dict[str, Any], signing_key: str | None = None) -> str:
         canonical = json.dumps(manifest_core, sort_keys=True, separators=(",", ":"), default=str)
-        return hmac.new(self._signing_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+        key = self._signing_key if signing_key is None else signing_key
+        return hmac.new(key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def _manifest_lines(self, manifest: dict[str, Any]) -> list[str]:
         lines: list[str] = [

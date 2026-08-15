@@ -17,6 +17,8 @@ class EvidenceBundleInput:
     formal_notices: tuple[str, ...]
     ledger_events: tuple[LedgerEvent, ...]
     generated_at: datetime
+    debtor_ledger_breakdown: tuple[str, ...] = ()
+    client_fee_ledger_breakdown: tuple[str, ...] = ()
 
 
 class EvidencePackCompiler:
@@ -83,6 +85,12 @@ class EvidencePackCompiler:
                 )
         else:
             lines.append("- None provided")
+        lines.append("")
+        lines.append("Debtor Ledger Breakdown:")
+        lines.extend([f"- {line}" for line in bundle.debtor_ledger_breakdown] or ["- None provided"])
+        lines.append("")
+        lines.append("FCD Client Fee Ledger Breakdown:")
+        lines.extend([f"- {line}" for line in bundle.client_fee_ledger_breakdown] or ["- None provided"])
         return lines
 
     @staticmethod

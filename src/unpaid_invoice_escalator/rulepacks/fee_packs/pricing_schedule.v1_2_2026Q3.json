@@ -1,0 +1,17 @@
+{
+  "schedule_id": "fcd-pricing-schedule",
+  "version": "v1.2-2026Q3",
+  "effective_from": "2026-07-01",
+  "effective_to": null,
+  "source_reference": "FCD Commercial Invoice Recovery Pricing Schedule",
+  "vat_rate": 0.20,
+  "action_fees": {
+    "MONTHLY_SAAS_TIER": 0.00,
+    "FORMAL_ESCALATION": 9.95,
+    "NOTICE_PACK": 19.95,
+    "PRE_ACTION_PACK": 39.95,
+    "COURT_READY_PACK": 99.00,
+    "REVIEW_SETUP_SERVICE": 49.00
+  }
+}
+
