@@ -344,6 +344,48 @@ def create_app(
             "ready": len(errors) == 0,
         }
 
+    def _deployment_runbook_report() -> dict[str, object]:
+        report = _startup_config_report()
+        check_map = {str(item["check"]): bool(item["passed"]) for item in report["checks"]}
+        steps = [
+            {
+                "step": 1,
+                "title": "Validate signing and verification keys",
+                "completed": check_map.get("manifest-signing-key", False) and check_map.get(
+                    "manifest-verification-keys", False
+                ),
+                "detail": "Ensure active signing key and verification key ring are configured.",
+            },
+            {
+                "step": 2,
+                "title": "Validate auth and RBAC configuration",
+                "completed": check_map.get("auth-enabled-in-production", False)
+                and check_map.get("api-keys-configured", False),
+                "detail": "Ensure API keys are present and role model is enforceable.",
+            },
+            {
+                "step": 3,
+                "title": "Validate runtime dependencies",
+                "completed": check_map.get("database-connectivity", False)
+                and check_map.get("artifacts-directory-writable", False)
+                and check_map.get("bundles-directory-writable", False),
+                "detail": "Confirm DB access and writable storage locations.",
+            },
+            {
+                "step": 4,
+                "title": "Validate operational guardrails",
+                "completed": check_map.get("max-upload-bytes", False),
+                "detail": "Confirm upload size limits and request controls are active.",
+            },
+        ]
+        return {
+            "environment": report["environment"],
+            "ready": report["ready"],
+            "pending_errors": report["errors"],
+            "pending_warnings": report["warnings"],
+            "steps": steps,
+        }
+
     @app.middleware("http")
     async def security_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
         request_id = request.headers.get("x-request-id") or str(uuid4())
@@ -402,6 +444,10 @@ def create_app(
     @app.get("/deployment/startup-config-validation")
     def startup_config_validation() -> dict[str, object]:
         return _startup_config_report()
+
+    @app.get("/deployment/runbook")
+    def deployment_runbook() -> dict[str, object]:
+        return _deployment_runbook_report()
 
     @app.get("/", response_class=HTMLResponse)
     def home() -> str:

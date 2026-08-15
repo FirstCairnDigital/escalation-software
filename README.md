@@ -82,6 +82,7 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `GET /ready` (readiness check; public)
 - `GET /metrics` (admin role when auth enabled)
 - `GET /deployment/startup-config-validation` (admin role when auth enabled)
+- `GET /deployment/runbook` (admin role when auth enabled)
 - `GET /` (Web UI)
 - `GET /ui/invoices/{invoice_id}` (Tabbed invoice workspace)
 - `GET /rule-packs/{jurisdiction}/active?on_date=YYYY-MM-DD`
@@ -151,6 +152,7 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
   - environment and effective security settings
   - check list (pass/fail + severity + detail)
   - aggregated `errors` and `warnings`
+- `GET /deployment/runbook` returns deployment action steps with completion flags based on current checks.
 
 ## Deployment Runbook (Minimal)
 1. Set production environment variables (above).

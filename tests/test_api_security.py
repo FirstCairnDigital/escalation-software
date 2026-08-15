@@ -188,6 +188,14 @@ class TestApiSecurity(unittest.TestCase):
                 self.assertTrue(validation_body["ready"])
                 self.assertEqual(validation_body["manifest_key_id"], "fcd-kms-key-ready")
                 self.assertIn("database-connectivity", {entry["check"] for entry in validation_body["checks"]})
+
+                runbook_forbidden = client.get("/deployment/runbook", headers={"x-api-key": "viewer-key"})
+                self.assertEqual(runbook_forbidden.status_code, 403)
+                runbook_resp = client.get("/deployment/runbook", headers={"x-api-key": "admin-key"})
+                self.assertEqual(runbook_resp.status_code, 200)
+                runbook_body = runbook_resp.json()
+                self.assertTrue(runbook_body["ready"])
+                self.assertEqual(len(runbook_body["steps"]), 4)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
