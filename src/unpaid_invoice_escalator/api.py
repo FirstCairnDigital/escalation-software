@@ -327,6 +327,40 @@ class PortalPaymentReportedActionRequest(BaseModel):
     payment_reference: str = ""
 
 
+class PortalDisputeActionRequest(BaseModel):
+    case: str
+    code: str
+    debtor_identifier: str
+    reason: str
+    disputed_amount_gbp: Decimal | None = None
+    details: str = ""
+
+
+class PortalQuestionActionRequest(BaseModel):
+    case: str
+    code: str
+    debtor_identifier: str
+    question: str
+
+
+class PortalPaymentDateActionRequest(BaseModel):
+    case: str
+    code: str
+    debtor_identifier: str
+    promised_payment_date: date
+    notes: str = ""
+
+
+class PortalAlreadyPaidActionRequest(BaseModel):
+    case: str
+    code: str
+    debtor_identifier: str
+    payment_reference: str = ""
+    payment_date: date | None = None
+    amount_gbp: Decimal | None = None
+    details: str = ""
+
+
 class DataRetentionDisposalRequest(BaseModel):
     approved_by: str
     reason: str
@@ -344,6 +378,11 @@ class DataRetentionLegalHoldReleaseRequest(BaseModel):
     released_by: str
     reason: str
     notes: str = ""
+
+
+class ResolveDebtorDisputeRequest(BaseModel):
+    creditor_user_id: str
+    resolution_notes: str
 
 
 def _parse_api_keys(raw: str) -> dict[str, str]:
@@ -788,6 +827,31 @@ def create_app(
                 return False
             if entry.event_type == "DATA_ACCURACY_CHALLENGE_OPEN":
                 return True
+        return False
+
+    def _debtor_dispute_is_open(invoice_id: str) -> bool:
+        entries = store.compliance_entries_for_invoice(invoice_id)
+        for entry in reversed(entries):
+            if entry.event_type == "DEBTOR_DISPUTE_RESOLVED":
+                return False
+            if entry.event_type == "DEBTOR_DISPUTE_OPEN":
+                return True
+        return False
+
+    def _portal_payment_date_pending(invoice_id: str, *, as_of_date: date) -> bool:
+        entries = store.compliance_entries_for_invoice(invoice_id)
+        for entry in reversed(entries):
+            if entry.event_type == "PORTAL_PAYMENT_DATE_FULFILLED":
+                return False
+            if entry.event_type == "PORTAL_PAYMENT_DATE_CONFIRMED":
+                promised = str(entry.details.get("promised_payment_date", "")).strip()
+                if not promised:
+                    return False
+                try:
+                    promised_date = date.fromisoformat(promised)
+                except ValueError:
+                    return False
+                return as_of_date < promised_date
         return False
 
     def _latest_discrepancy_invalid(invoice_id: str) -> bool:
@@ -1246,6 +1310,23 @@ def create_app(
                 },
             )
         )
+        if _portal_payment_date_pending(invoice_id=verification_case.invoice_id, as_of_date=date.today()):
+            store.append_compliance_entry(
+                ComplianceLedgerEntry(
+                    entry_id=str(uuid4()),
+                    invoice_id=verification_case.invoice_id,
+                    timestamp=now,
+                    event_type="PORTAL_PAYMENT_DATE_FULFILLED",
+                    details={"entry_id": entry.entry_id, "source": "PORTAL_CONFIRM_PAID"},
+                )
+            )
+            ledger.append_event(
+                invoice_id=verification_case.invoice_id,
+                actor=Actor.DEBTOR,
+                event_type="PORTAL_PAYMENT_DATE_FULFILLED",
+                timestamp=now,
+                data_payload={"entry_id": entry.entry_id, "source": "PORTAL_CONFIRM_PAID"},
+            )
         ledger.append_event(
             invoice_id=verification_case.invoice_id,
             actor=Actor.DEBTOR,
@@ -1264,6 +1345,134 @@ def create_app(
             "entry_id": entry.entry_id,
             "amount_gbp": str(amount),
             "cancelled_pending_communication_ids": cancelled,
+        }
+
+    @app.post("/portal/actions/disputes")
+    def portal_submit_dispute(payload: PortalDisputeActionRequest) -> dict[str, object]:
+        verification_case, _ = _resolve_verified_portal_case(case=payload.case, code=payload.code)
+        now = datetime.now(timezone.utc)
+        details: dict[str, object] = {
+            "debtor_identifier": payload.debtor_identifier,
+            "reason": payload.reason,
+            "details": payload.details,
+        }
+        carve_out_id: str | None = None
+        if payload.disputed_amount_gbp is not None:
+            try:
+                carve_out = resolution_engine.create_dispute_carve_out(
+                    invoice_id=verification_case.invoice_id,
+                    disputed_amount_gbp=payload.disputed_amount_gbp,
+                    reason=payload.reason,
+                    created_by=f"DEBTOR_PORTAL:{payload.debtor_identifier}",
+                )
+                carve_out_id = carve_out.carve_out_id
+                details["disputed_amount_gbp"] = str(carve_out.disputed_amount_gbp)
+                details["undisputed_amount_gbp"] = str(carve_out.undisputed_amount_gbp)
+                details["carve_out_id"] = carve_out.carve_out_id
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=verification_case.invoice_id,
+                timestamp=now,
+                event_type="DEBTOR_DISPUTE_OPEN",
+                details=details,
+            )
+        )
+        ledger.append_event(
+            invoice_id=verification_case.invoice_id,
+            actor=Actor.DEBTOR,
+            event_type="DEBTOR_DISPUTE_OPEN",
+            timestamp=now,
+            data_payload=details,
+        )
+        return {
+            "invoice_id": verification_case.invoice_id,
+            "case_id": verification_case.case_id,
+            "status": "DISPUTE_OPEN",
+            "carve_out_id": carve_out_id,
+            "recovery_restricted": True,
+        }
+
+    @app.post("/portal/actions/confirm-payment-date")
+    def portal_confirm_payment_date(payload: PortalPaymentDateActionRequest) -> dict[str, object]:
+        verification_case, _ = _resolve_verified_portal_case(case=payload.case, code=payload.code)
+        now = datetime.now(timezone.utc)
+        details = {
+            "debtor_identifier": payload.debtor_identifier,
+            "promised_payment_date": payload.promised_payment_date.isoformat(),
+            "notes": payload.notes,
+        }
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=verification_case.invoice_id,
+                timestamp=now,
+                event_type="PORTAL_PAYMENT_DATE_CONFIRMED",
+                details=details,
+            )
+        )
+        ledger.append_event(
+            invoice_id=verification_case.invoice_id,
+            actor=Actor.DEBTOR,
+            event_type="PORTAL_PAYMENT_DATE_CONFIRMED",
+            timestamp=now,
+            data_payload=details,
+        )
+        return {
+            "invoice_id": verification_case.invoice_id,
+            "case_id": verification_case.case_id,
+            "status": "PAYMENT_DATE_CONFIRMED",
+            "promised_payment_date": payload.promised_payment_date.isoformat(),
+        }
+
+    @app.post("/portal/actions/questions")
+    def portal_submit_question(payload: PortalQuestionActionRequest) -> dict[str, object]:
+        verification_case, _ = _resolve_verified_portal_case(case=payload.case, code=payload.code)
+        now = datetime.now(timezone.utc)
+        details = {"debtor_identifier": payload.debtor_identifier, "question": payload.question}
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=verification_case.invoice_id,
+                timestamp=now,
+                event_type="PORTAL_QUESTION_SUBMITTED",
+                details=details,
+            )
+        )
+        ledger.append_event(
+            invoice_id=verification_case.invoice_id,
+            actor=Actor.DEBTOR,
+            event_type="PORTAL_QUESTION_SUBMITTED",
+            timestamp=now,
+            data_payload=details,
+        )
+        return {"invoice_id": verification_case.invoice_id, "case_id": verification_case.case_id, "status": "RECORDED"}
+
+    @app.post("/portal/actions/already-paid")
+    def portal_already_paid(payload: PortalAlreadyPaidActionRequest) -> dict[str, object]:
+        verification_case, _ = _resolve_verified_portal_case(case=payload.case, code=payload.code)
+        details_suffix = []
+        if payload.payment_reference:
+            details_suffix.append(f"payment_reference={payload.payment_reference}")
+        if payload.payment_date is not None:
+            details_suffix.append(f"payment_date={payload.payment_date.isoformat()}")
+        if payload.amount_gbp is not None:
+            details_suffix.append(f"amount_gbp={abs(payload.amount_gbp)}")
+        if payload.details:
+            details_suffix.append(payload.details)
+        _open_data_accuracy_challenge(
+            invoice_id=verification_case.invoice_id,
+            debtor_identifier=payload.debtor_identifier,
+            challenge_reason="PAYMENT_ALREADY_MADE",
+            challenge_details="; ".join(details_suffix) if details_suffix else "Debtor reported payment already made.",
+        )
+        return {
+            "invoice_id": verification_case.invoice_id,
+            "case_id": verification_case.case_id,
+            "recovery_restricted": True,
+            "status": "RECOVERY_RESTRICTED",
         }
 
     @app.get("/deployment/startup-config-validation")
@@ -1913,6 +2122,35 @@ def create_app(
             "recovery_restricted": False,
             "status": "RECOVERY_RESTORED",
         }
+
+    @app.post("/invoices/{invoice_id}/debtor-actions/dispute/resolve")
+    def resolve_debtor_dispute(invoice_id: str, payload: ResolveDebtorDisputeRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        if not _debtor_dispute_is_open(invoice_id):
+            raise HTTPException(status_code=409, detail="No open debtor dispute to resolve.")
+        now = datetime.now(timezone.utc)
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="DEBTOR_DISPUTE_RESOLVED",
+                details={
+                    "creditor_user_id": payload.creditor_user_id,
+                    "resolution_notes": payload.resolution_notes,
+                },
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.CLIENT,
+            event_type="DEBTOR_DISPUTE_RESOLVED",
+            timestamp=now,
+            data_payload={"creditor_user_id": payload.creditor_user_id},
+        )
+        return {"invoice_id": invoice_id, "status": "DISPUTE_RESOLVED"}
 
     @app.get("/invoices/{invoice_id}/evidence-artifacts")
     def list_evidence_artifacts(
@@ -2829,6 +3067,16 @@ def create_app(
             raise HTTPException(
                 status_code=409,
                 detail="Escalation blocked while debtor data-accuracy challenge is open.",
+            )
+        if _debtor_dispute_is_open(invoice_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Escalation blocked while debtor dispute is open.",
+            )
+        if _portal_payment_date_pending(invoice_id, as_of_date=payload.today):
+            raise HTTPException(
+                status_code=409,
+                detail="Escalation blocked while promised debtor payment date has not yet passed.",
             )
         if _has_unresolved_delivery_failure(invoice_id):
             raise HTTPException(

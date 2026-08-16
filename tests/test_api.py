@@ -689,6 +689,43 @@ class TestApi(unittest.TestCase):
             self.assertEqual(offer_resp.status_code, 200)
             self.assertEqual(offer_resp.json()["status"], "OPEN")
 
+            question_resp = client.post(
+                "/portal/actions/questions",
+                json={
+                    "case": case_id,
+                    "code": code,
+                    "debtor_identifier": "debtor-portal",
+                    "question": "Can you confirm which invoice line this relates to?",
+                },
+            )
+            self.assertEqual(question_resp.status_code, 200)
+
+            promise_date_resp = client.post(
+                "/portal/actions/confirm-payment-date",
+                json={
+                    "case": case_id,
+                    "code": code,
+                    "debtor_identifier": "debtor-portal",
+                    "promised_payment_date": "2026-03-15",
+                    "notes": "Payment expected by bank transfer.",
+                },
+            )
+            self.assertEqual(promise_date_resp.status_code, 200)
+
+            already_paid_resp = client.post(
+                "/portal/actions/already-paid",
+                json={
+                    "case": case_id,
+                    "code": code,
+                    "debtor_identifier": "debtor-portal",
+                    "payment_reference": "PAID-REF-1",
+                    "payment_date": "2026-02-10",
+                    "amount_gbp": "100",
+                    "details": "Please reconcile this payment.",
+                },
+            )
+            self.assertEqual(already_paid_resp.status_code, 200)
+
             comm_resp = client.post(
                 "/invoices/inv-api-portal/communications",
                 json={
@@ -725,6 +762,8 @@ class TestApi(unittest.TestCase):
             self.assertIn("DATA_ACCURACY_CHALLENGE_OPEN", events)
             self.assertIn("PAYMENT_PLAN_PROPOSED", events)
             self.assertIn("SETTLEMENT_OFFER_PROPOSED", events)
+            self.assertIn("PORTAL_QUESTION_SUBMITTED", events)
+            self.assertIn("PORTAL_PAYMENT_DATE_CONFIRMED", events)
             self.assertIn("PORTAL_PAYMENT_REPORTED", events)
 
     def test_escalation_blocked_on_delivery_failure_until_requeued(self) -> None:
@@ -820,6 +859,108 @@ class TestApi(unittest.TestCase):
                 json={"today": "2026-02-01", "current_state": "OVERDUE_CHASER"},
             )
             self.assertEqual(resumed_escalate.status_code, 200)
+
+    def test_escalation_blocked_by_portal_dispute_and_promised_date(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-portal-blocks.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-portal-blocks",
+                    "currency": "GBP",
+                    "principal_amount": "950",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            client.post(
+                "/invoices/inv-api-portal-blocks/case-health-check",
+                json={
+                    "user_id": "USER-1",
+                    "correct_customer_legal_entity": True,
+                    "description_of_goods_or_services": True,
+                    "invoice_number_and_date_verified": True,
+                    "amount_matches_contract_or_quote": True,
+                    "correct_billing_address": True,
+                    "vat_numbers_checked": True,
+                    "purchase_order_supplied_if_required": True,
+                    "payment_terms_and_due_date_established": True,
+                    "delivery_or_acceptance_proof_attached": True,
+                    "no_unresolved_credit_notes": True,
+                    "direct_payments_checked": True,
+                    "no_known_dispute": True,
+                    "creditor_authority_verified": True,
+                    "limitation_period_checked": True,
+                    "debtor_contact_details_verified": True,
+                    "court_handoff_boundary_acknowledged": True,
+                },
+            )
+            client.post(
+                "/invoices/inv-api-portal-blocks/discrepancy-check",
+                json={
+                    "claim_amount": "950",
+                    "evidence_document_amount": "950",
+                    "principal": "950",
+                    "payments_recorded": "0",
+                    "outstanding_entered": "950",
+                },
+            )
+            reg = client.post(
+                "/invoices/inv-api-portal-blocks/debtor-verification/register",
+                json={"creditor_name": "Creditor Ltd", "invoice_reference": "INV-PORTAL-BLOCK"},
+            ).json()
+            case_id = reg["case_id"]
+            code = reg["verification_code"]
+
+            client.post(
+                "/portal/actions/disputes",
+                json={
+                    "case": case_id,
+                    "code": code,
+                    "debtor_identifier": "debtor-portal",
+                    "reason": "Quality dispute",
+                    "details": "Goods not as described",
+                },
+            )
+            blocked_dispute = client.post(
+                "/invoices/inv-api-portal-blocks/escalate",
+                json={"today": "2026-02-10", "current_state": "OVERDUE_CHASER"},
+            )
+            self.assertEqual(blocked_dispute.status_code, 409)
+
+            resolve_dispute = client.post(
+                "/invoices/inv-api-portal-blocks/debtor-actions/dispute/resolve",
+                json={"creditor_user_id": "USER-1", "resolution_notes": "Resolved by evidence review."},
+            )
+            self.assertEqual(resolve_dispute.status_code, 200)
+
+            client.post(
+                "/portal/actions/confirm-payment-date",
+                json={
+                    "case": case_id,
+                    "code": code,
+                    "debtor_identifier": "debtor-portal",
+                    "promised_payment_date": "2026-03-01",
+                    "notes": "Pending transfer",
+                },
+            )
+            blocked_promised_date = client.post(
+                "/invoices/inv-api-portal-blocks/escalate",
+                json={"today": "2026-02-20", "current_state": "OVERDUE_CHASER"},
+            )
+            self.assertEqual(blocked_promised_date.status_code, 409)
+
+            allowed_after_date = client.post(
+                "/invoices/inv-api-portal-blocks/escalate",
+                json={"today": "2026-03-02", "current_state": "OVERDUE_CHASER"},
+            )
+            self.assertEqual(allowed_after_date.status_code, 200)
 
     def test_balance_correction_withdraws_and_reissues_statement(self) -> None:
         with TemporaryDirectory() as tmp_dir:
