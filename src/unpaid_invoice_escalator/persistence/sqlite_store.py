@@ -12,12 +12,14 @@ from typing import Any
 from unpaid_invoice_escalator.models import (
     Actor,
     ArtifactType,
+    BankDetailVerificationState,
     ClientFeeAction,
     ClientFeeEntry,
     CommunicationDeliveryEvent,
     CommunicationDeliveryState,
     CommunicationRecord,
     ComplianceLedgerEntry,
+    ConfirmationOfPayeeResult,
     DebtorLedgerEntry,
     DebtorLedgerEntryType,
     DebtorVerificationCase,
@@ -33,6 +35,7 @@ from unpaid_invoice_escalator.models import (
     PaymentPlanPayment,
     PreOverdueHygieneRecord,
     RecoveryCostCategory,
+    SettlementBankDetailRecord,
     SettlementAcceptance,
     SettlementOffer,
 )
@@ -322,6 +325,26 @@ class SQLiteStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS settlement_bank_detail_records (
+                    record_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_by TEXT NOT NULL,
+                    account_holder_name TEXT NOT NULL,
+                    sort_code TEXT NOT NULL,
+                    account_number_last4 TEXT NOT NULL,
+                    iban_last4 TEXT,
+                    cop_state TEXT NOT NULL,
+                    cop_result TEXT,
+                    expected_payee_name TEXT,
+                    dual_control_approved_by TEXT,
+                    mfa_reauthenticated INTEGER NOT NULL,
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
             hygiene_columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(pre_overdue_hygiene_records)").fetchall()
@@ -388,6 +411,12 @@ class SQLiteStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_communications_invoice_time
                 ON communications(invoice_id, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_bank_details_invoice_time
+                ON settlement_bank_detail_records(invoice_id, created_at)
                 """
             )
             conn.execute(
@@ -619,6 +648,7 @@ class SQLiteStore:
                 "settlement_offers",
                 "settlement_acceptances",
                 "dispute_carve_outs",
+                "settlement_bank_detail_records",
             ):
                 conn.execute(
                     f"""
@@ -1550,3 +1580,69 @@ class SQLiteStore:
             )
             for row in rows
         )
+
+    def append_settlement_bank_detail_record(self, record: SettlementBankDetailRecord) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO settlement_bank_detail_records (
+                    record_id, invoice_id, created_at, updated_by, account_holder_name, sort_code,
+                    account_number_last4, iban_last4, cop_state, cop_result, expected_payee_name,
+                    dual_control_approved_by, mfa_reauthenticated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.record_id,
+                    record.invoice_id,
+                    record.created_at.isoformat(),
+                    record.updated_by,
+                    record.account_holder_name,
+                    record.sort_code,
+                    record.account_number_last4,
+                    record.iban_last4,
+                    record.cop_state.value,
+                    None if record.cop_result is None else record.cop_result.value,
+                    record.expected_payee_name,
+                    record.dual_control_approved_by,
+                    1 if record.mfa_reauthenticated else 0,
+                ),
+            )
+            conn.commit()
+
+    def settlement_bank_detail_records_for_invoice(self, invoice_id: str) -> tuple[SettlementBankDetailRecord, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT record_id, invoice_id, created_at, updated_by, account_holder_name, sort_code,
+                       account_number_last4, iban_last4, cop_state, cop_result, expected_payee_name,
+                       dual_control_approved_by, mfa_reauthenticated
+                FROM settlement_bank_detail_records
+                WHERE invoice_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            SettlementBankDetailRecord(
+                record_id=row["record_id"],
+                invoice_id=row["invoice_id"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_by=row["updated_by"],
+                account_holder_name=row["account_holder_name"],
+                sort_code=row["sort_code"],
+                account_number_last4=row["account_number_last4"],
+                iban_last4=row["iban_last4"],
+                cop_state=BankDetailVerificationState(row["cop_state"]),
+                cop_result=None if row["cop_result"] is None else ConfirmationOfPayeeResult(row["cop_result"]),
+                expected_payee_name=row["expected_payee_name"],
+                dual_control_approved_by=row["dual_control_approved_by"],
+                mfa_reauthenticated=bool(row["mfa_reauthenticated"]),
+            )
+            for row in rows
+        )
+
+    def latest_settlement_bank_detail_for_invoice(self, invoice_id: str) -> SettlementBankDetailRecord | None:
+        records = self.settlement_bank_detail_records_for_invoice(invoice_id)
+        if not records:
+            return None
+        return records[-1]

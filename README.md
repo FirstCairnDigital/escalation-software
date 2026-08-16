@@ -90,6 +90,10 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - Go-live command sheet: [go-live-command-sheet.ps1](C:/Dev/projects/P26003-escalation-software/scripts/ops/go-live-command-sheet.ps1)
 - Red/green signoff script: [go-live-red-green-signoff.ps1](C:/Dev/projects/P26003-escalation-software/scripts/ops/go-live-red-green-signoff.ps1)
 - Operator runbook template: [operator-go-live-runbook-template.md](C:/Dev/projects/P26003-escalation-software/scripts/ops/operator-go-live-runbook-template.md)
+- Production validator: [validate-production-config.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/validate-production-config.py)
+- Ledger reconciliation utility: [reconcile-ledger.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/reconcile-ledger.py)
+- SBC export utility: [export-sbc-bundle.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/export-sbc-bundle.py)
+- Retention audit utility: [audit-retention-holds.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/audit-retention-holds.py)
 
 ## API Endpoints
 - `GET /health`
@@ -134,6 +138,8 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `POST /invoices/{invoice_id}/resolution/artifacts/promise-to-pay`
 - `POST /invoices/{invoice_id}/resolution/artifacts/settlement-agreement`
 - `POST /invoices/{invoice_id}/communications/{communication_id}/balance-corrections`
+- `POST /invoices/{invoice_id}/settlement-bank-details`
+- `GET /invoices/{invoice_id}/settlement-bank-details`
 - `POST /portal/actions/data-accuracy-challenge`
 - `POST /portal/actions/disputes`
 - `POST /portal/actions/questions`
@@ -231,6 +237,8 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 - Debtor portal verification view returns neutral resolution options and independent advice links messaging.
 - Debtor portal actions are executable workflows for dispute intake, questions, promised payment-date confirmations, data accuracy challenges, payment plan proposals, settlement offers, and payment reporting.
 - Escalation is blocked while an open debtor dispute exists or while a confirmed debtor payment date remains in the future.
+- Settlement bank detail updates require MFA re-authentication or dual-control approval and are CoP-scored (`EXACT_MATCH`, `CLOSE_MATCH`, `NO_MATCH`).
+- Debtor portal hides settlement destination and payment links when CoP state is `COP_UNVERIFIED` or `COP_FAILED`.
 - Data-retention disposal is blocked when a case-level retention legal hold is open; holds are opened/released via dedicated endpoints with immutable audit entries.
 - Evidence bundle generation can include resolution artifacts via `include_resolution_artifacts=true`.
 

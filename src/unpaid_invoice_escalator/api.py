@@ -17,21 +17,27 @@ from pydantic import BaseModel, ConfigDict, Field
 from unpaid_invoice_escalator.models import (
     Actor,
     ArtifactType,
+    BankDetailVerificationState,
     ClientFeeAction,
     CommunicationDeliveryState,
     ComplianceLedgerEntry,
+    ConfirmationOfPayeeResult,
     DebtorLedgerEntryType,
     DebtorType,
     EvidenceArtifact,
     Invoice,
     InvoiceState,
     Jurisdiction,
+    LegalHoldType,
     RecoveryCostCategory,
+    RetentionVariant,
+    SettlementBankDetailRecord,
 )
 from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
 from unpaid_invoice_escalator.rulepacks import RulePackLoader, RulePackValidationError
 from unpaid_invoice_escalator.services.dual_ledger_engine import DualLedgerEngine
 from unpaid_invoice_escalator.services.case_health_check import CaseHealthCheck
+from unpaid_invoice_escalator.services.bank_detail_verification_guard import BankDetailVerificationGuard
 from unpaid_invoice_escalator.services.communication_delivery_tracker import CommunicationDeliveryTracker
 from unpaid_invoice_escalator.services.communication_severity_engine import CommunicationSeverityEngine
 from unpaid_invoice_escalator.services.data_discrepancy_validator import DataDiscrepancyValidator
@@ -42,6 +48,7 @@ from unpaid_invoice_escalator.services.five_ledger_engine import FiveLedgerEngin
 from unpaid_invoice_escalator.services.jurisdiction_engine import JurisdictionFacts
 from unpaid_invoice_escalator.services.ledger_manifest_exporter import LedgerManifestExporter
 from unpaid_invoice_escalator.services.late_payment_engine import LatePaymentEngine
+from unpaid_invoice_escalator.services.legal_hold_taxonomy import LegalHoldTaxonomy
 from unpaid_invoice_escalator.services.legal_safety_gate_manager import LegalSafetyGateManager
 from unpaid_invoice_escalator.services.pre_overdue_hygiene_engine import PreOverdueHygieneEngine
 from unpaid_invoice_escalator.services.resolution_settlement_engine import ResolutionAndSettlementEngine
@@ -368,9 +375,15 @@ class DataRetentionDisposalRequest(BaseModel):
 
 
 class DataRetentionLegalHoldOpenRequest(BaseModel):
-    held_by: str
-    reason: str
-    hold_type: str = "GENERAL"
+    held_by: str | None = None
+    applied_by: str | None = None
+    reason: str = ""
+    reason_code: str | None = None
+    holdType: str | None = None
+    hold_type: str | None = None
+    retentionVariant: str | None = None
+    retention_variant: str | None = None
+    version: int | None = None
     notes: str = ""
 
 
@@ -383,6 +396,18 @@ class DataRetentionLegalHoldReleaseRequest(BaseModel):
 class ResolveDebtorDisputeRequest(BaseModel):
     creditor_user_id: str
     resolution_notes: str
+
+
+class SettlementBankDetailUpdateRequest(BaseModel):
+    updated_by: str
+    account_holder_name: str
+    sort_code: str
+    account_number: str
+    iban: str | None = None
+    expected_payee_name: str | None = None
+    mfa_reauthenticated: bool = False
+    dual_control_approved_by: str | None = None
+    dual_control_approval_reference: str | None = None
 
 
 def _parse_api_keys(raw: str) -> dict[str, str]:
@@ -530,6 +555,7 @@ def create_app(
     communication_delivery_tracker = CommunicationDeliveryTracker(store=store, event_ledger=ledger)
     viability_calculator = ViabilityProportionalityCalculator(store=store)
     resolution_artifact_generator = ResolutionArtifactGenerator()
+    bank_detail_guard = BankDetailVerificationGuard()
     artifacts_root = Path(artifacts_dir)
     bundles_root = Path(bundles_dir)
     quarantine_root = Path(effective_quarantine_dir)
@@ -707,6 +733,8 @@ def create_app(
             "trg_settlement_acceptances_no_delete",
             "trg_dispute_carve_outs_no_update",
             "trg_dispute_carve_outs_no_delete",
+            "trg_settlement_bank_detail_records_no_update",
+            "trg_settlement_bank_detail_records_no_delete",
             "trg_communications_no_update",
             "trg_communications_no_delete",
             "trg_communication_delivery_events_no_update",
@@ -985,6 +1013,7 @@ def create_app(
         artifacts = store.artifacts_for_invoice(invoice_id)
         legal_hold_open = False
         legal_hold_details: dict[str, object] | None = None
+        retention_variant_name = RetentionVariant.STANDARD_COMMERCIAL.value
         for entry in reversed(compliance_entries):
             if entry.event_type == "DATA_RETENTION_LEGAL_HOLD_RELEASED":
                 legal_hold_open = False
@@ -993,7 +1022,12 @@ def create_app(
             if entry.event_type == "DATA_RETENTION_LEGAL_HOLD_OPENED":
                 legal_hold_open = True
                 legal_hold_details = entry.details
+                retention_variant_name = str(entry.details.get("retention_variant") or entry.details.get("retentionVariant") or retention_variant_name)
                 break
+        if legal_hold_open and legal_hold_details is not None and str(legal_hold_details.get("status") or "").upper() == "LEGAL_HOLD_ACTIVE":
+            retention_variant_name = RetentionVariant.LEGAL_HOLD_ACTIVE.value
+
+        required_days = LegalHoldTaxonomy.RETENTION_VARIANTS.get(retention_variant_name, LegalHoldTaxonomy.RETENTION_VARIANTS[RetentionVariant.STANDARD_COMMERCIAL.value])
         last_activity_dt = None
         if ledger_events:
             last_activity_dt = ledger_events[-1].timestamp
@@ -1001,16 +1035,20 @@ def create_app(
         blockers: list[str] = []
         if legal_hold_open:
             blockers.append("Active legal hold blocks retention disposal.")
+            blockers.append("LEGAL_HOLD_ACTIVE prevents deletion and triggers an audit warning.")
         if _data_accuracy_challenge_is_open(invoice_id):
             blockers.append("Open data accuracy challenge restricts recovery and disposal.")
-        if age_days < effective_data_retention_days:
+        if retention_variant_name == RetentionVariant.LEGAL_HOLD_ACTIVE.value:
+            blockers.append("Indefinite legal hold set; automated purge and anonymisation are disabled.")
+        elif age_days < required_days:
             blockers.append(
-                f"Case age {age_days} days is below retention threshold ({effective_data_retention_days} days)."
+                f"Case age {age_days} days is below retention threshold ({required_days} days) for {retention_variant_name}."
             )
         return {
             "invoice_id": invoice_id,
             "as_of_date": as_of_date.isoformat(),
-            "retention_days_required": effective_data_retention_days,
+            "retention_days_required": required_days,
+            "retention_variant": retention_variant_name,
             "last_activity_at": None if last_activity_dt is None else last_activity_dt.isoformat(),
             "case_age_days": age_days,
             "artifacts_count": len(artifacts),
@@ -1040,6 +1078,15 @@ def create_app(
             status_code=409,
             detail=f"Artifact path is outside managed storage roots and cannot be disposed: {resolved}",
         )
+
+    def _last4(value: str) -> str:
+        cleaned = "".join(ch for ch in value if ch.isalnum())
+        if len(cleaned) < 4:
+            raise HTTPException(status_code=400, detail="Bank detail fields must contain at least 4 alphanumeric characters.")
+        return cleaned[-4:]
+
+    def _bank_details_visible_in_portal(state: BankDetailVerificationState) -> bool:
+        return state in {BankDetailVerificationState.COP_EXACT_MATCH, BankDetailVerificationState.COP_CLOSE_MATCH}
 
     def _generate_promise_to_pay_artifact(invoice_id: str, plan_id: str, output_filename: str) -> EvidenceArtifact:
         agreements = store.payment_plan_agreements_for_invoice(invoice_id)
@@ -1131,12 +1178,20 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/ready")
-    def ready() -> JSONResponse:
+    @app.get("/health/liveness")
+    def health_liveness() -> dict[str, str]:
+        return {"status": "alive"}
+
+    @app.get("/health/readiness")
+    def health_readiness() -> JSONResponse:
         report = _startup_config_report()
         if bool(report["ready"]):
             return JSONResponse(status_code=200, content={"status": "ready", **report})
         return JSONResponse(status_code=503, content={"status": "not_ready", **report})
+
+    @app.get("/ready")
+    def ready() -> JSONResponse:
+        return health_readiness()
 
     @app.get("/metrics")
     def metrics() -> dict[str, object]:
@@ -1155,6 +1210,29 @@ def create_app(
         if not result.valid:
             raise HTTPException(status_code=404, detail=result.message)
         creditor_name = result.creditor_name or "the creditor"
+        verification_case = store.debtor_verification_case_by_case_id(case.strip())
+        settlement_destination: dict[str, object] | None = None
+        settlement_destination_available = False
+        settlement_destination_message = "No settlement destination configured."
+        if verification_case is not None:
+            latest_bank = store.latest_settlement_bank_detail_for_invoice(verification_case.invoice_id)
+            if latest_bank is not None:
+                if _bank_details_visible_in_portal(latest_bank.cop_state):
+                    settlement_destination_available = True
+                    settlement_destination_message = "Settlement destination is available."
+                    settlement_destination = {
+                        "account_holder_name": latest_bank.account_holder_name,
+                        "sort_code": latest_bank.sort_code,
+                        "account_number_last4": latest_bank.account_number_last4,
+                        "iban_last4": latest_bank.iban_last4,
+                        "cop_state": latest_bank.cop_state.value,
+                        "cop_result": None if latest_bank.cop_result is None else latest_bank.cop_result.value,
+                        "open_banking_payment_link": f"/portal/payment-link?case={result.case_id}",
+                    }
+                else:
+                    settlement_destination_message = (
+                        "Settlement destination hidden pending Confirmation of Payee verification."
+                    )
         return {
             "valid": True,
             "case_id": result.case_id,
@@ -1175,6 +1253,9 @@ def create_app(
                 "Correct Inaccurate Information",
                 "View Independent Legal Advice Links",
             ],
+            "settlement_destination_available": settlement_destination_available,
+            "settlement_destination_message": settlement_destination_message,
+            "settlement_destination": settlement_destination,
         }
 
     @app.post("/portal/actions/data-accuracy-challenge")
@@ -1473,6 +1554,152 @@ def create_app(
             "case_id": verification_case.case_id,
             "recovery_restricted": True,
             "status": "RECOVERY_RESTRICTED",
+        }
+
+    @app.post("/invoices/{invoice_id}/settlement-bank-details")
+    def update_settlement_bank_details(
+        invoice_id: str, payload: SettlementBankDetailUpdateRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        decision = bank_detail_guard.authorize_update(
+            updated_by=payload.updated_by,
+            mfa_reauthenticated=payload.mfa_reauthenticated,
+            dual_control_approved_by=payload.dual_control_approved_by,
+            dual_control_approval_reference=payload.dual_control_approval_reference,
+        )
+        if not decision.allowed:
+            raise HTTPException(status_code=403, detail=decision.reason or "Bank detail update not authorized.")
+
+        now = datetime.now(timezone.utc)
+        base_record = {
+            "record_id": str(uuid4()),
+            "invoice_id": invoice_id,
+            "created_at": now,
+            "updated_by": payload.updated_by,
+            "account_holder_name": payload.account_holder_name.strip(),
+            "sort_code": payload.sort_code.strip(),
+            "account_number_last4": _last4(payload.account_number),
+            "iban_last4": None if not payload.iban else _last4(payload.iban),
+            "cop_state": BankDetailVerificationState.COP_UNVERIFIED,
+            "cop_result": None,
+            "expected_payee_name": payload.expected_payee_name,
+            "dual_control_approved_by": payload.dual_control_approved_by,
+            "mfa_reauthenticated": payload.mfa_reauthenticated,
+        }
+        store.append_settlement_bank_detail_record(record=SettlementBankDetailRecord(**base_record))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="BANK_DETAILS_UPDATED_PENDING_COP",
+                details={
+                    "updated_by": payload.updated_by,
+                    "sort_code": payload.sort_code.strip(),
+                    "account_number_last4": _last4(payload.account_number),
+                    "mfa_reauthenticated": payload.mfa_reauthenticated,
+                    "dual_control_approved_by": payload.dual_control_approved_by,
+                },
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.CLIENT,
+            event_type="BANK_DETAILS_UPDATED_PENDING_COP",
+            timestamp=now,
+            data_payload={
+                "updated_by": payload.updated_by,
+                "cop_state": BankDetailVerificationState.COP_UNVERIFIED.value,
+            },
+        )
+        cop_result, cop_state = bank_detail_guard.evaluate_cop(
+            expected_payee_name=payload.expected_payee_name,
+            account_holder_name=payload.account_holder_name,
+        )
+        if cop_result is None:
+            store.append_compliance_entry(
+                ComplianceLedgerEntry(
+                    entry_id=str(uuid4()),
+                    invoice_id=invoice_id,
+                    timestamp=now,
+                    event_type="BANK_DETAILS_COP_CHECK_QUEUED",
+                    details={"updated_by": payload.updated_by},
+                )
+            )
+            ledger.append_event(
+                invoice_id=invoice_id,
+                actor=Actor.SYSTEM,
+                event_type="BANK_DETAILS_COP_CHECK_QUEUED",
+                timestamp=now,
+                data_payload={"updated_by": payload.updated_by},
+            )
+            return {
+                "invoice_id": invoice_id,
+                "cop_state": BankDetailVerificationState.COP_UNVERIFIED.value,
+                "cop_result": None,
+            }
+
+        verified_record = {
+            **base_record,
+            "record_id": str(uuid4()),
+            "cop_state": cop_state,
+            "cop_result": cop_result,
+        }
+        store.append_settlement_bank_detail_record(record=SettlementBankDetailRecord(**verified_record))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="BANK_DETAILS_COP_CHECK_COMPLETED",
+                details={
+                    "updated_by": payload.updated_by,
+                    "cop_result": cop_result.value,
+                    "cop_state": cop_state.value,
+                },
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.SYSTEM,
+            event_type="BANK_DETAILS_COP_CHECK_COMPLETED",
+            timestamp=now,
+            data_payload={"cop_result": cop_result.value, "cop_state": cop_state.value},
+        )
+        return {
+            "invoice_id": invoice_id,
+            "cop_state": cop_state.value,
+            "cop_result": cop_result.value,
+        }
+
+    @app.get("/invoices/{invoice_id}/settlement-bank-details")
+    def list_settlement_bank_details(invoice_id: str) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        records = store.settlement_bank_detail_records_for_invoice(invoice_id)
+        return {
+            "invoice_id": invoice_id,
+            "count": len(records),
+            "records": [
+                {
+                    "record_id": record.record_id,
+                    "created_at": record.created_at.isoformat(),
+                    "updated_by": record.updated_by,
+                    "account_holder_name": record.account_holder_name,
+                    "sort_code": record.sort_code,
+                    "account_number_last4": record.account_number_last4,
+                    "iban_last4": record.iban_last4,
+                    "cop_state": record.cop_state.value,
+                    "cop_result": None if record.cop_result is None else record.cop_result.value,
+                    "expected_payee_name": record.expected_payee_name,
+                    "dual_control_approved_by": record.dual_control_approved_by,
+                    "mfa_reauthenticated": record.mfa_reauthenticated,
+                }
+                for record in records
+            ],
         }
 
     @app.get("/deployment/startup-config-validation")
@@ -2257,6 +2484,12 @@ def create_app(
         return {
             "policy": {
                 "retention_days": effective_data_retention_days,
+                "retention_variants": {
+                    RetentionVariant.STANDARD_COMMERCIAL.value: LegalHoldTaxonomy.RETENTION_VARIANTS[RetentionVariant.STANDARD_COMMERCIAL.value],
+                    RetentionVariant.SCOTTISH_SIMPLE_PROCEDURE.value: LegalHoldTaxonomy.RETENTION_VARIANTS[RetentionVariant.SCOTTISH_SIMPLE_PROCEDURE.value],
+                    RetentionVariant.VAT_TAX_AUDIT.value: LegalHoldTaxonomy.RETENTION_VARIANTS[RetentionVariant.VAT_TAX_AUDIT.value],
+                    RetentionVariant.LEGAL_HOLD_ACTIVE.value: "INDEFINITE",
+                },
                 "disposal_scope": "evidence_file_payloads_only",
                 "immutable_records_retained": True,
                 "requires_legal_hold_clearance": True,
@@ -2281,11 +2514,31 @@ def create_app(
         review = _data_retention_review(invoice_id, as_of_date=date.today())
         if bool(review["legal_hold_open"]):
             raise HTTPException(status_code=409, detail="A data-retention legal hold is already open for this invoice.")
+
+        applied_by = payload.applied_by or payload.held_by or "system:unknown"
+        hold_payload = {
+            "holdType": payload.holdType or payload.hold_type or LegalHoldType.LITIGATION_PENDING.value,
+            "appliedBy": {"user_or_system_id": applied_by, "timestamp": datetime.now(timezone.utc).isoformat()},
+            "reasonCode": payload.reason_code or payload.reason or "LEGAL_HOLD_OPENED",
+            "version": payload.version or 1,
+            "retentionVariant": payload.retentionVariant or payload.retention_variant or RetentionVariant.STANDARD_COMMERCIAL.value,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            validated = LegalHoldTaxonomy.validate_hold_record(hold_payload=hold_payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         now = datetime.now(timezone.utc)
         details = {
-            "held_by": payload.held_by,
-            "reason": payload.reason,
-            "hold_type": payload.hold_type,
+            "held_by": applied_by,
+            "reason": payload.reason or validated["reasonCode"],
+            "hold_type": validated["holdType"],
+            "reason_code": validated["reasonCode"],
+            "version": validated["version"],
+            "retention_variant": validated["retentionVariant"],
+            "status": validated["status"],
+            "applied_by": validated["appliedBy"],
             "notes": payload.notes,
         }
         store.append_compliance_entry(
@@ -2350,6 +2603,27 @@ def create_app(
             raise HTTPException(status_code=404, detail="Invoice not found.")
         review = _data_retention_review(invoice_id, as_of_date=payload.as_of_date or date.today())
         if not bool(review["eligible_for_disposal"]):
+            hold_details = review.get("legal_hold_details") or {}
+            status = str(hold_details.get("status") or "").upper()
+            if status == "LEGAL_HOLD_ACTIVE":
+                warning = LegalHoldTaxonomy.audit_warning(invoice_id=invoice_id, hold_record=hold_details)
+                now = datetime.now(timezone.utc)
+                store.append_compliance_entry(
+                    ComplianceLedgerEntry(
+                        entry_id=str(uuid4()),
+                        invoice_id=invoice_id,
+                        timestamp=now,
+                        event_type="DATA_RETENTION_DISPOSAL_ABORTED_LEGAL_HOLD_ACTIVE",
+                        details={"warning": warning, "approved_by": payload.approved_by, "reason": payload.reason},
+                    )
+                )
+                ledger.append_event(
+                    invoice_id=invoice_id,
+                    actor=Actor.SYSTEM,
+                    event_type="DATA_RETENTION_DISPOSAL_ABORTED_LEGAL_HOLD_ACTIVE",
+                    timestamp=now,
+                    data_payload={"warning": warning, "approved_by": payload.approved_by, "reason": payload.reason},
+                )
             raise HTTPException(
                 status_code=409,
                 detail="Data retention disposal blocked: " + "; ".join(review["blockers"]),

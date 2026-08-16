@@ -1,5 +1,6 @@
 from .dual_ledger_engine import DualLedgerEngine, LedgerBalances
 from .case_health_check import CaseHealthCheck, CaseHealthCheckResult
+from .bank_detail_verification_guard import BankDetailVerificationDecision, BankDetailVerificationGuard
 from .communication_severity_engine import CommunicationPreview, CommunicationSeverityEngine
 from .communication_delivery_tracker import CommunicationDeliverySnapshot, CommunicationDeliveryTracker
 from .data_discrepancy_validator import DataDiscrepancyValidator, DiscrepancyValidationResult
@@ -15,6 +16,7 @@ from .five_ledger_engine import FiveLedgerEngine, FiveLedgerSummary
 from .ledger_manifest_exporter import LedgerManifestExporter
 from .legal_safety_gate_manager import LegalSafetyGateManager, LegalSafetyGateResult
 from .late_payment_engine import LatePaymentCalculationResult, LatePaymentEngine
+from .legal_hold_taxonomy import LegalHoldTaxonomy
 from .pre_overdue_hygiene_engine import PreOverdueHygieneAssessment, PreOverdueHygieneEngine
 from .resolution_settlement_engine import PaymentPlanStatus, ResolutionAndSettlementEngine
 from .resolution_artifact_generator import ResolutionArtifactGenerator
@@ -28,6 +30,8 @@ __all__ = [
     "EvidencePackCompiler",
     "CaseHealthCheck",
     "CaseHealthCheckResult",
+    "BankDetailVerificationDecision",
+    "BankDetailVerificationGuard",
     "CommunicationPreview",
     "CommunicationSeverityEngine",
     "CommunicationDeliverySnapshot",
@@ -48,6 +52,7 @@ __all__ = [
     "LedgerManifestExporter",
     "LegalSafetyGateManager",
     "LegalSafetyGateResult",
+    "LegalHoldTaxonomy",
     "LatePaymentCalculationResult",
     "LatePaymentEngine",
     "PreOverdueHygieneAssessment",

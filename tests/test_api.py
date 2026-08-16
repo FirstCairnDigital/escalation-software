@@ -5,6 +5,7 @@ import unittest
 from fastapi.testclient import TestClient
 
 from unpaid_invoice_escalator.api import create_app
+from unpaid_invoice_escalator.production_config import validate_production_config
 
 
 class TestApi(unittest.TestCase):
@@ -74,6 +75,65 @@ class TestApi(unittest.TestCase):
             self.assertEqual(portal_resp.status_code, 200)
             self.assertIn("resolution_options", portal_resp.json())
             self.assertIn("Data Processor", portal_resp.json()["source_of_data_notice"])
+            self.assertFalse(portal_resp.json()["settlement_destination_available"])
+
+            unauthorized_bank_update = client.post(
+                "/invoices/inv-api-1/settlement-bank-details",
+                json={
+                    "updated_by": "USER-102",
+                    "account_holder_name": "First Cairn Digital Client Ltd",
+                    "sort_code": "12-34-56",
+                    "account_number": "12345678",
+                    "expected_payee_name": "First Cairn Digital Client Ltd",
+                    "mfa_reauthenticated": False,
+                },
+            )
+            self.assertEqual(unauthorized_bank_update.status_code, 403)
+
+            authorized_bank_update = client.post(
+                "/invoices/inv-api-1/settlement-bank-details",
+                json={
+                    "updated_by": "USER-102",
+                    "account_holder_name": "First Cairn Digital Client Ltd",
+                    "sort_code": "12-34-56",
+                    "account_number": "12345678",
+                    "expected_payee_name": "First Cairn Digital Client Ltd",
+                    "dual_control_approved_by": "ADMIN-1",
+                    "dual_control_approval_reference": "APPROVAL-REF-1",
+                },
+            )
+            self.assertEqual(authorized_bank_update.status_code, 200)
+            self.assertEqual(authorized_bank_update.json()["cop_state"], "COP_EXACT_MATCH")
+
+            bank_details_resp = client.get("/invoices/inv-api-1/settlement-bank-details")
+            self.assertEqual(bank_details_resp.status_code, 200)
+            self.assertGreaterEqual(bank_details_resp.json()["count"], 2)
+
+            portal_with_verified_bank = client.get(
+                f"/portal?case={verification_body['case_id']}&code={verification_body['verification_code']}"
+            )
+            self.assertEqual(portal_with_verified_bank.status_code, 200)
+            self.assertTrue(portal_with_verified_bank.json()["settlement_destination_available"])
+
+            failed_bank_update = client.post(
+                "/invoices/inv-api-1/settlement-bank-details",
+                json={
+                    "updated_by": "USER-102",
+                    "account_holder_name": "Unexpected Name",
+                    "sort_code": "12-34-56",
+                    "account_number": "12345678",
+                    "expected_payee_name": "First Cairn Digital Client Ltd",
+                    "mfa_reauthenticated": True,
+                },
+            )
+            self.assertEqual(failed_bank_update.status_code, 200)
+            self.assertEqual(failed_bank_update.json()["cop_state"], "COP_FAILED")
+
+            portal_with_failed_bank = client.get(
+                f"/portal?case={verification_body['case_id']}&code={verification_body['verification_code']}"
+            )
+            self.assertEqual(portal_with_failed_bank.status_code, 200)
+            self.assertFalse(portal_with_failed_bank.json()["settlement_destination_available"])
 
             comm_create_resp = client.post(
                 "/invoices/inv-api-1/communications",
@@ -1330,6 +1390,56 @@ class TestApi(unittest.TestCase):
             self.assertEqual(dispose_after_release.status_code, 200)
             self.assertFalse(artifact_path.exists())
 
+    def test_data_retention_taxonomy_and_active_hold_guardrail(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-retention-taxonomy.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-retention-taxonomy",
+                    "currency": "GBP",
+                    "principal_amount": "1500",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "SCOTLAND",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            policy_resp = client.get("/data-retention-policy")
+            self.assertEqual(policy_resp.status_code, 200)
+            policy = policy_resp.json()["policy"]
+            self.assertIn("STANDARD_COMMERCIAL", policy["retention_variants"])
+            self.assertIn("VAT_TAX_AUDIT", policy["retention_variants"])
+
+            open_hold = client.post(
+                "/invoices/inv-api-retention-taxonomy/data-retention-legal-holds/open",
+                json={
+                    "held_by": "ADMIN-1",
+                    "reason": "Tax audit",
+                    "holdType": "TAX_AUDIT",
+                    "reason_code": "VAT-01",
+                    "version": 2,
+                    "retentionVariant": "VAT_TAX_AUDIT",
+                },
+            )
+            self.assertEqual(open_hold.status_code, 200)
+            self.assertEqual(open_hold.json()["details"]["hold_type"], "TAX_AUDIT")
+            self.assertEqual(open_hold.json()["details"]["version"], 2)
+
+            blocked_dispose = client.post(
+                "/invoices/inv-api-retention-taxonomy/data-retention-disposals",
+                json={"approved_by": "ADMIN-1", "reason": "Retention complete", "as_of_date": "2035-01-01"},
+            )
+            self.assertEqual(blocked_dispose.status_code, 409)
+            self.assertIn("LEGAL_HOLD_ACTIVE", blocked_dispose.json()["detail"])
+
     def test_resolution_and_settlement_endpoints(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "api-resolution.db")
@@ -1562,6 +1672,33 @@ class TestApi(unittest.TestCase):
             self.assertIn(b"Evidence Artifact Inventory:", bundle_bytes)
             self.assertIn(b"Compliance Snapshot:", bundle_bytes)
             self.assertIn(b"Event Chain Attestation:", bundle_bytes)
+
+    def test_health_and_production_readiness_aliases(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-health.db")
+            app = create_app(db_path=db_path, artifacts_dir=str(Path(tmp_dir) / "artifacts"), bundles_dir=str(Path(tmp_dir) / "bundles"))
+            client = TestClient(app)
+            self.assertEqual(client.get("/health").status_code, 200)
+            self.assertEqual(client.get("/health/liveness").status_code, 200)
+            readiness = client.get("/health/readiness")
+            self.assertIn(readiness.status_code, {200, 503})
+            self.assertIn("status", readiness.json())
+
+    def test_validate_production_config(self) -> None:
+        valid = validate_production_config(
+            {
+                "DATABASE_URL": "postgresql://user:pass@example.com:5432/app?sslmode=require",
+                "SBC_API_KEY": "sbc-key-123",
+                "SBC_ENDPOINT": "https://sbc.example.com",
+                "CRYPTO_SIGNING_KEY": "A" * 32,
+                "DATA_RETENTION_CRON_SCHEDULE": "0 2 * * *",
+            }
+        )
+        self.assertTrue(valid["valid"])
+
+        invalid = validate_production_config({})
+        self.assertFalse(invalid["valid"])
+        self.assertIn("DATABASE_URL", "\n".join(invalid["errors"]))
 
 
 if __name__ == "__main__":

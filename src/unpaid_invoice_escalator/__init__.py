@@ -14,6 +14,7 @@ from .models import (
     LedgerEvent,
     RecoveryCostCategory,
 )
+from .production_config import validate_production_config
 
 __all__ = [
     "Actor",
@@ -30,4 +31,5 @@ __all__ = [
     "Jurisdiction",
     "LedgerEvent",
     "RecoveryCostCategory",
+    "validate_production_config",
 ]

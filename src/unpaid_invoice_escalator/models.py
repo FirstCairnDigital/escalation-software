@@ -91,6 +91,33 @@ class CommunicationDeliveryState(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class RetentionVariant(str, Enum):
+    STANDARD_COMMERCIAL = "STANDARD_COMMERCIAL"
+    SCOTTISH_SIMPLE_PROCEDURE = "SCOTTISH_SIMPLE_PROCEDURE"
+    VAT_TAX_AUDIT = "VAT_TAX_AUDIT"
+    LEGAL_HOLD_ACTIVE = "LEGAL_HOLD_ACTIVE"
+
+
+class LegalHoldType(str, Enum):
+    LITIGATION_PENDING = "LITIGATION_PENDING"
+    SBC_ADJUDICATION = "SBC_ADJUDICATION"
+    REGULATORY_INQUIRY = "REGULATORY_INQUIRY"
+    TAX_AUDIT = "TAX_AUDIT"
+
+
+class ConfirmationOfPayeeResult(str, Enum):
+    EXACT_MATCH = "EXACT_MATCH"
+    CLOSE_MATCH = "CLOSE_MATCH"
+    NO_MATCH = "NO_MATCH"
+
+
+class BankDetailVerificationState(str, Enum):
+    COP_UNVERIFIED = "COP_UNVERIFIED"
+    COP_EXACT_MATCH = "COP_EXACT_MATCH"
+    COP_CLOSE_MATCH = "COP_CLOSE_MATCH"
+    COP_FAILED = "COP_FAILED"
+
+
 @dataclass(frozen=True)
 class Invoice:
     invoice_id: str
@@ -294,3 +321,20 @@ class CommunicationDeliveryEvent:
     state: CommunicationDeliveryState
     timestamp: datetime
     note: str = ""
+
+
+@dataclass(frozen=True)
+class SettlementBankDetailRecord:
+    record_id: str
+    invoice_id: str
+    created_at: datetime
+    updated_by: str
+    account_holder_name: str
+    sort_code: str
+    account_number_last4: str
+    iban_last4: str | None
+    cop_state: BankDetailVerificationState
+    cop_result: ConfirmationOfPayeeResult | None = None
+    expected_payee_name: str | None = None
+    dual_control_approved_by: str | None = None
+    mfa_reauthenticated: bool = False

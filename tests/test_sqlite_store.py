@@ -8,17 +8,20 @@ import unittest
 
 from unpaid_invoice_escalator.models import (
     Actor,
+    BankDetailVerificationState,
     ClientFeeAction,
     CommunicationDeliveryEvent,
     CommunicationDeliveryState,
     CommunicationRecord,
     ComplianceLedgerEntry,
+    ConfirmationOfPayeeResult,
     DebtorVerificationCase,
     DebtorType,
     Invoice,
     Jurisdiction,
     PaymentPlanAgreement,
     PreOverdueHygieneRecord,
+    SettlementBankDetailRecord,
 )
 from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
 from unpaid_invoice_escalator.services.dual_ledger_engine import DualLedgerEngine
@@ -215,6 +218,50 @@ class TestSQLiteStore(unittest.TestCase):
                 conn.rollback()
                 with self.assertRaises(sqlite3.DatabaseError):
                     conn.execute("DELETE FROM communication_delivery_events")
+                conn.rollback()
+            finally:
+                conn.close()
+
+    def test_settlement_bank_details_table_is_append_only(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "escalator.db")
+            store = SQLiteStore(db_path)
+            invoice = Invoice(
+                invoice_id="inv-db-9",
+                currency="GBP",
+                principal_amount=Decimal("700"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            store.append_settlement_bank_detail_record(
+                SettlementBankDetailRecord(
+                    record_id="bank-1",
+                    invoice_id=invoice.invoice_id,
+                    created_at=datetime.now(timezone.utc),
+                    updated_by="USER-1",
+                    account_holder_name="Creditor Ltd",
+                    sort_code="12-34-56",
+                    account_number_last4="6789",
+                    iban_last4=None,
+                    cop_state=BankDetailVerificationState.COP_EXACT_MATCH,
+                    cop_result=ConfirmationOfPayeeResult.EXACT_MATCH,
+                    expected_payee_name="Creditor Ltd",
+                    dual_control_approved_by="ADMIN-1",
+                    mfa_reauthenticated=False,
+                )
+            )
+            self.assertIsNotNone(store.latest_settlement_bank_detail_for_invoice(invoice.invoice_id))
+
+            conn = sqlite3.connect(db_path)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("UPDATE settlement_bank_detail_records SET updated_by = 'USER-X'")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM settlement_bank_detail_records")
                 conn.rollback()
             finally:
                 conn.close()
