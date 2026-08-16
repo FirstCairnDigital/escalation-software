@@ -85,6 +85,11 @@ $env:PYTHONPATH="C:\Dev\projects\P26003-escalation-software\src"
 python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --issue-date 2026-01-01 --due-date 2026-01-31 --jurisdiction ENGLAND_WALES --debtor-type LIMITED --today 2026-02-15
 ```
 
+## Ops Runbook Assets
+- Go-live command sheet: [go-live-command-sheet.ps1](C:/Dev/projects/P26003-escalation-software/scripts/ops/go-live-command-sheet.ps1)
+- Red/green signoff script: [go-live-red-green-signoff.ps1](C:/Dev/projects/P26003-escalation-software/scripts/ops/go-live-red-green-signoff.ps1)
+- Operator runbook template: [operator-go-live-runbook-template.md](C:/Dev/projects/P26003-escalation-software/scripts/ops/operator-go-live-runbook-template.md)
+
 ## API Endpoints
 - `GET /health`
 - `GET /ready` (readiness check; public)
