@@ -111,6 +111,8 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `GET /invoices/{invoice_id}/compliance-ledger`
 - `GET /data-retention-policy`
 - `GET /invoices/{invoice_id}/data-retention-review?as_of_date=YYYY-MM-DD`
+- `POST /invoices/{invoice_id}/data-retention-legal-holds/open`
+- `POST /invoices/{invoice_id}/data-retention-legal-holds/release`
 - `POST /invoices/{invoice_id}/data-retention-disposals`
 - `POST /invoices/{invoice_id}/debtor-verification/register`
 - `POST /invoices/{invoice_id}/debtor-actions/data-accuracy-challenge`
@@ -217,6 +219,7 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 - Dispute carve-outs isolate disputed amounts from the immediately pursued undisputed balance.
 - Debtor portal verification view returns neutral resolution options and independent advice links messaging.
 - Debtor portal actions are executable workflows for data accuracy challenges, payment plan proposals, settlement offers, and payment reporting.
+- Data-retention disposal is blocked when a case-level retention legal hold is open; holds are opened/released via dedicated endpoints with immutable audit entries.
 - Evidence bundle generation can include resolution artifacts via `include_resolution_artifacts=true`.
 
 ## Viability & Proportionality

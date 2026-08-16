@@ -333,6 +333,19 @@ class DataRetentionDisposalRequest(BaseModel):
     as_of_date: date | None = None
 
 
+class DataRetentionLegalHoldOpenRequest(BaseModel):
+    held_by: str
+    reason: str
+    hold_type: str = "GENERAL"
+    notes: str = ""
+
+
+class DataRetentionLegalHoldReleaseRequest(BaseModel):
+    released_by: str
+    reason: str
+    notes: str = ""
+
+
 def _parse_api_keys(raw: str) -> dict[str, str]:
     keys: dict[str, str] = {}
     for item in raw.split(","):
@@ -906,11 +919,24 @@ def create_app(
         ledger_events = store.events_for_invoice(invoice_id)
         compliance_entries = store.compliance_entries_for_invoice(invoice_id)
         artifacts = store.artifacts_for_invoice(invoice_id)
+        legal_hold_open = False
+        legal_hold_details: dict[str, object] | None = None
+        for entry in reversed(compliance_entries):
+            if entry.event_type == "DATA_RETENTION_LEGAL_HOLD_RELEASED":
+                legal_hold_open = False
+                legal_hold_details = entry.details
+                break
+            if entry.event_type == "DATA_RETENTION_LEGAL_HOLD_OPENED":
+                legal_hold_open = True
+                legal_hold_details = entry.details
+                break
         last_activity_dt = None
         if ledger_events:
             last_activity_dt = ledger_events[-1].timestamp
         age_days = 0 if last_activity_dt is None else max(0, (as_of_date - last_activity_dt.date()).days)
         blockers: list[str] = []
+        if legal_hold_open:
+            blockers.append("Active legal hold blocks retention disposal.")
         if _data_accuracy_challenge_is_open(invoice_id):
             blockers.append("Open data accuracy challenge restricts recovery and disposal.")
         if age_days < effective_data_retention_days:
@@ -926,6 +952,8 @@ def create_app(
             "artifacts_count": len(artifacts),
             "events_count": len(ledger_events),
             "compliance_entries_count": len(compliance_entries),
+            "legal_hold_open": legal_hold_open,
+            "legal_hold_details": legal_hold_details,
             "eligible_for_disposal": len(blockers) == 0,
             "blockers": blockers,
         }
@@ -1993,6 +2021,7 @@ def create_app(
                 "retention_days": effective_data_retention_days,
                 "disposal_scope": "evidence_file_payloads_only",
                 "immutable_records_retained": True,
+                "requires_legal_hold_clearance": True,
                 "managed_storage_roots": [str(artifacts_root), str(bundles_root)],
             }
         }
@@ -2003,6 +2032,76 @@ def create_app(
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
         return _data_retention_review(invoice_id, as_of_date=as_of_date or date.today())
+
+    @app.post("/invoices/{invoice_id}/data-retention-legal-holds/open")
+    def open_data_retention_legal_hold(
+        invoice_id: str, payload: DataRetentionLegalHoldOpenRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        review = _data_retention_review(invoice_id, as_of_date=date.today())
+        if bool(review["legal_hold_open"]):
+            raise HTTPException(status_code=409, detail="A data-retention legal hold is already open for this invoice.")
+        now = datetime.now(timezone.utc)
+        details = {
+            "held_by": payload.held_by,
+            "reason": payload.reason,
+            "hold_type": payload.hold_type,
+            "notes": payload.notes,
+        }
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="DATA_RETENTION_LEGAL_HOLD_OPENED",
+                details=details,
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.SYSTEM,
+            event_type="DATA_RETENTION_LEGAL_HOLD_OPENED",
+            timestamp=now,
+            data_payload=details,
+        )
+        return {"invoice_id": invoice_id, "legal_hold_open": True, "details": details}
+
+    @app.post("/invoices/{invoice_id}/data-retention-legal-holds/release")
+    def release_data_retention_legal_hold(
+        invoice_id: str, payload: DataRetentionLegalHoldReleaseRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        review = _data_retention_review(invoice_id, as_of_date=date.today())
+        if not bool(review["legal_hold_open"]):
+            raise HTTPException(status_code=409, detail="No open data-retention legal hold exists for this invoice.")
+        now = datetime.now(timezone.utc)
+        details = {
+            "released_by": payload.released_by,
+            "reason": payload.reason,
+            "notes": payload.notes,
+            "released_hold_details": review["legal_hold_details"],
+        }
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="DATA_RETENTION_LEGAL_HOLD_RELEASED",
+                details=details,
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.SYSTEM,
+            event_type="DATA_RETENTION_LEGAL_HOLD_RELEASED",
+            timestamp=now,
+            data_payload=details,
+        )
+        return {"invoice_id": invoice_id, "legal_hold_open": False, "details": details}
 
     @app.post("/invoices/{invoice_id}/data-retention-disposals")
     def execute_data_retention_disposal(

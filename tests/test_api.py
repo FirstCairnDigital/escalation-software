@@ -1126,6 +1126,69 @@ class TestApi(unittest.TestCase):
                 {entry["event_type"] for entry in compliance_resp.json()["entries"]},
             )
 
+    def test_data_retention_legal_hold_blocks_disposal(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-retention-hold.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-retention-hold",
+                    "currency": "GBP",
+                    "principal_amount": "700",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+            upload_resp = client.post(
+                "/invoices/inv-api-retention-hold/evidence-artifacts",
+                data={"user_id": "client-1", "artifact_type": "CONTRACT"},
+                files={"file": ("contract.txt", b"signed terms", "text/plain")},
+            )
+            self.assertEqual(upload_resp.status_code, 200)
+            artifact_path = Path(upload_resp.json()["file_path"])
+            self.assertTrue(artifact_path.exists())
+
+            open_hold = client.post(
+                "/invoices/inv-api-retention-hold/data-retention-legal-holds/open",
+                json={"held_by": "ADMIN-1", "reason": "Solicitor review pending", "hold_type": "LITIGATION_REVIEW"},
+            )
+            self.assertEqual(open_hold.status_code, 200)
+            self.assertTrue(open_hold.json()["legal_hold_open"])
+
+            review_resp = client.get("/invoices/inv-api-retention-hold/data-retention-review?as_of_date=2035-01-01")
+            self.assertEqual(review_resp.status_code, 200)
+            self.assertTrue(review_resp.json()["legal_hold_open"])
+            self.assertIn("Active legal hold blocks retention disposal.", review_resp.json()["blockers"])
+
+            blocked_dispose = client.post(
+                "/invoices/inv-api-retention-hold/data-retention-disposals",
+                json={"approved_by": "ADMIN-1", "reason": "Retention complete", "as_of_date": "2035-01-01"},
+            )
+            self.assertEqual(blocked_dispose.status_code, 409)
+            self.assertTrue(artifact_path.exists())
+
+            release_hold = client.post(
+                "/invoices/inv-api-retention-hold/data-retention-legal-holds/release",
+                json={"released_by": "ADMIN-2", "reason": "Review completed"},
+            )
+            self.assertEqual(release_hold.status_code, 200)
+            self.assertFalse(release_hold.json()["legal_hold_open"])
+
+            dispose_after_release = client.post(
+                "/invoices/inv-api-retention-hold/data-retention-disposals",
+                json={"approved_by": "ADMIN-1", "reason": "Retention complete", "as_of_date": "2035-01-01"},
+            )
+            self.assertEqual(dispose_after_release.status_code, 200)
+            self.assertFalse(artifact_path.exists())
+
     def test_resolution_and_settlement_endpoints(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "api-resolution.db")
