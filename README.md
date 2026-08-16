@@ -86,6 +86,7 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 ```
 
 ## Ops Runbook Assets
+- Simple all-in-one guide: [everything-manual-for-dummies.md](C:/Dev/projects/P26003-escalation-software/scripts/ops/everything-manual-for-dummies.md)
 - Go-live command sheet: [go-live-command-sheet.ps1](C:/Dev/projects/P26003-escalation-software/scripts/ops/go-live-command-sheet.ps1)
 - Red/green signoff script: [go-live-red-green-signoff.ps1](C:/Dev/projects/P26003-escalation-software/scripts/ops/go-live-red-green-signoff.ps1)
 - Operator runbook template: [operator-go-live-runbook-template.md](C:/Dev/projects/P26003-escalation-software/scripts/ops/operator-go-live-runbook-template.md)
