@@ -36,7 +36,8 @@ class TestDualLedgerEngine(unittest.TestCase):
             )
             self.assertEqual(fee_entry.fee_amount_gbp, Decimal("9.95"))
             self.assertEqual(store.client_fee_balance_for_invoice(invoice.invoice_id), Decimal("11.94"))
-            self.assertEqual(store.debtor_ledger_balance_for_invoice(invoice.invoice_id), Decimal("0.00"))
+            self.assertEqual(store.debtor_ledger_balance_for_invoice(invoice.invoice_id), Decimal("3850.00"))
+            self.assertEqual(store.debtor_ledger_entries_for_invoice(invoice.invoice_id)[0].entry_type, DebtorLedgerEntryType.ORIGINAL_PRINCIPAL)
 
             debtor_entry = engine.add_debtor_entry(
                 invoice_id=invoice.invoice_id,
@@ -45,10 +46,9 @@ class TestDualLedgerEngine(unittest.TestCase):
                 description="Accrued statutory late-payment interest",
             )
             self.assertEqual(debtor_entry.amount_gbp, Decimal("12.45"))
-            self.assertEqual(store.debtor_ledger_balance_for_invoice(invoice.invoice_id), Decimal("12.45"))
+            self.assertEqual(store.debtor_ledger_balance_for_invoice(invoice.invoice_id), Decimal("3862.45"))
             self.assertEqual(store.client_fee_balance_for_invoice(invoice.invoice_id), Decimal("11.94"))
 
 
 if __name__ == "__main__":
     unittest.main()
-

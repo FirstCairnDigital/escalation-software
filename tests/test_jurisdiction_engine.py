@@ -27,6 +27,27 @@ class TestJurisdictionEngine(unittest.TestCase):
         self.assertEqual(decision.next_state, InvoiceState.CLIENT_HANDOFF)
         self.assertTrue(decision.outreach_frozen)
 
+    def test_scotland_uses_current_outstanding_for_limit_check(self) -> None:
+        invoice = Invoice(
+            invoice_id="inv-sco-2",
+            currency="GBP",
+            principal_amount=Decimal("6500"),
+            issue_date=date(2026, 1, 1),
+            due_date=date(2026, 1, 31),
+            jurisdiction=Jurisdiction.SCOTLAND,
+            debtor_type=DebtorType.LIMITED,
+        )
+        decision = self.engine.decide(
+            invoice,
+            EscalationContext(
+                current_state=InvoiceState.ISSUED,
+                today=date(2026, 2, 1),
+                outstanding_amount=Decimal("4900"),
+            ),
+        )
+        self.assertEqual(decision.next_state, InvoiceState.FRIENDLY_REMINDER)
+        self.assertFalse(decision.outreach_frozen)
+
     def test_ew_sole_trader_starts_30_day_protocol(self) -> None:
         today = date(2026, 2, 1)
         invoice = Invoice(

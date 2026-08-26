@@ -11,7 +11,7 @@ from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from unpaid_invoice_escalator.models import (
@@ -24,6 +24,7 @@ from unpaid_invoice_escalator.models import (
     ConfirmationOfPayeeResult,
     DebtorLedgerEntryType,
     DebtorType,
+    AuditTrailEntry,
     EvidenceArtifact,
     Invoice,
     InvoiceState,
@@ -56,7 +57,17 @@ from unpaid_invoice_escalator.services.resolution_artifact_generator import Reso
 from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
 from unpaid_invoice_escalator.services.viability_proportionality_calculator import ViabilityProportionalityCalculator
 from unpaid_invoice_escalator.security import ApiSecurityController, ROLE_RANK
-from unpaid_invoice_escalator.ui import render_home_html, render_invoice_workspace_html
+from unpaid_invoice_escalator.ui import (
+    render_cases_html,
+    render_compliance_html,
+    render_creditors_html,
+    render_dashboard_html,
+    render_debtors_html,
+    render_disputes_html,
+    render_invoice_workspace_html,
+    render_operations_html,
+    render_reports_html,
+)
 
 SAFE_UPLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -447,6 +458,112 @@ def _parse_csv_tokens(raw: str) -> tuple[str, ...]:
     return tuple(token.strip() for token in raw.split(",") if token.strip())
 
 
+def _accepts_html(request: Request) -> bool:
+    accept_header = request.headers.get("accept", "")
+    return "text/html" in accept_header.lower() or "application/xhtml+xml" in accept_header.lower()
+
+
+def _render_verify_html(case_id: str | None, valid: bool, message: str) -> str:
+    title = "Verification check" if valid else "Verification failed"
+    status = "Valid verification" if valid else "Verification failed"
+    return f"""<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
+  <title>{title}</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f4f7fb; color: #172033; margin: 0; }}
+    .wrap {{ max-width: 760px; margin: 64px auto; background: white; border: 1px solid #dfe7f5; border-radius: 18px; padding: 32px; box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08); }}
+    .badge {{ display: inline-block; padding: 8px 12px; border-radius: 999px; font-weight: 700; background: #e8f5ec; color: #166534; }}
+    .badge.error {{ background: #feecec; color: #b91c1c; }}
+    h1 {{ margin-top: 18px; margin-bottom: 12px; font-size: 30px; }}
+    p {{ line-height: 1.6; color: #475569; }}
+    .meta {{ background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px; margin-top: 18px; font-family: monospace; }}
+    .actions {{ margin-top: 22px; display: flex; gap: 12px; flex-wrap: wrap; }}
+    a.button {{ display: inline-block; background: #275efe; color: white; padding: 10px 14px; border-radius: 10px; text-decoration: none; font-weight: 700; }}
+  </style>
+</head>
+<body>
+  <div class=\"wrap\">
+    <div class=\"badge {('error' if not valid else '')}\">{status}</div>
+    <h1>First Cairn Digital case verification</h1>
+    <p>{message}</p>
+    {f'<div class=\"meta\">Case ID: {case_id}</div>' if case_id else ''}
+    <div class=\"actions\">
+      <a class=\"button\" href=\"/portal?case={case_id or ''}&code={''}\">Open debtor portal</a>
+      <a class=\"button\" href=\"/\">Return to dashboard</a>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+
+def _render_portal_html(case_id: str, message: str, source_notice: str, resolution_options: list[str]) -> str:
+    options_html = "".join(f"<li>{option}</li>" for option in resolution_options)
+    return f"""<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
+  <title>Debtor verification portal</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f4f7fb; color: #172033; margin: 0; }}
+    .wrap {{ max-width: 920px; margin: 40px auto; background: white; border: 1px solid #dfe7f5; border-radius: 18px; padding: 32px; box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08); }}
+    h1 {{ margin-top: 0; font-size: 32px; }}
+    .message {{ background: #eef4ff; border-left: 4px solid #275efe; padding: 18px; border-radius: 10px; margin: 18px 0; }}
+    .notice {{ background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; margin-top: 22px; }}
+    ul {{ line-height: 1.7; color: #334155; }}
+    .button-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 18px; }}
+    .button-grid button {{ background: #275efe; color: white; padding: 12px; border: none; border-radius: 10px; font-weight: 700; cursor: pointer; }}
+    .secondary {{ background: #eef2ff; color: #1e3a8a; }}
+    .muted {{ color: #64748b; font-size: 14px; }}
+  </style>
+</head>
+<body>
+  <div class=\"wrap\">
+    <h1>Debtor verification portal</h1>
+    <div class=\"message\"><strong>Verified case:</strong> {case_id}<br />{message}</div>
+    <div class=\"button-grid\">
+      <button class=\"secondary\" type=\"button\">[ Pay Full Balance Now ]</button>
+      <button type=\"button\">[ Confirm Payment Date ]</button>
+      <button type=\"button\">[ I Have Already Paid ]</button>
+      <button type=\"button\">[ Propose Payment Plan / Settlement ]</button>
+      <button type=\"button\">[ Ask Question About Invoice ]</button>
+      <button type=\"button\">[ Dispute All or Part of Amount ]</button>
+      <button type=\"button\">[ Correct Inaccurate Information ]</button>
+      <button type=\"button\">[ View Independent Legal Advice Links ]</button>
+    </div>
+    <div class=\"notice\">
+      <strong>Source of data:</strong>
+      <p>{source_notice}</p>
+    </div>
+    <div style=\"margin-top: 18px;\">
+      <h2>Neutral options</h2>
+      <ul>{options_html}</ul>
+      <div class=\"muted\">This service is for invoice administration only and does not replace independent legal advice.</div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+
+def _validate_export_filename(filename: str, *, field_name: str) -> str:
+    candidate = filename.strip()
+    if not candidate:
+        raise HTTPException(status_code=400, detail=f"{field_name} must not be empty.")
+    if Path(candidate).name != candidate or candidate.startswith(("/", "\\")):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a simple filename.")
+    if not SAFE_UPLOAD_FILENAME_RE.match(candidate):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} contains unsupported characters. Use letters, numbers, dot, dash, or underscore.",
+        )
+    return candidate
+
+
 def create_app(
     *,
     db_path: str = "data/escalator.db",
@@ -719,6 +836,8 @@ def create_app(
             "trg_hygiene_records_no_delete",
             "trg_compliance_ledger_no_update",
             "trg_compliance_ledger_no_delete",
+            "trg_audit_trail_entries_no_update",
+            "trg_audit_trail_entries_no_delete",
             "trg_debtor_verification_no_update",
             "trg_debtor_verification_no_delete",
             "trg_payment_plan_agreements_no_update",
@@ -908,9 +1027,7 @@ def create_app(
 
     def _effective_outstanding_amount(invoice: Invoice) -> Decimal:
         entries = store.debtor_ledger_entries_for_invoice(invoice.invoice_id)
-        if not entries:
-            return invoice.principal_amount
-        return store.debtor_ledger_balance_for_invoice(invoice.invoice_id)
+        return store.debtor_ledger_balance_for_invoice(invoice.invoice_id) if entries else Decimal("0.00")
 
     def _assert_pre_send_balance_lock(invoice: Invoice) -> Decimal:
         outstanding = _effective_outstanding_amount(invoice)
@@ -1007,6 +1124,19 @@ def create_app(
             )
         return cancelled_communications
 
+    def _record_audit_trail(invoice_id: str, *, category: str, action: str, actor: str, details: dict[str, object]) -> None:
+        store.append_audit_trail_entry(
+            AuditTrailEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=datetime.now(timezone.utc),
+                category=category,
+                action=action,
+                actor=actor,
+                details=details,
+            )
+        )
+
     def _data_retention_review(invoice_id: str, *, as_of_date: date) -> dict[str, object]:
         ledger_events = store.events_for_invoice(invoice_id)
         compliance_entries = store.compliance_entries_for_invoice(invoice_id)
@@ -1095,7 +1225,8 @@ def create_app(
             raise HTTPException(status_code=404, detail="Payment plan not found for invoice.")
         installments = store.payment_plan_installments_for_plan(plan_id)
         payments = store.payment_plan_payments_for_plan(plan_id)
-        output_path = bundles_root / invoice_id / "resolution" / output_filename
+        safe_output_filename = _validate_export_filename(output_filename, field_name="output_filename")
+        output_path = bundles_root / invoice_id / "resolution" / safe_output_filename
         generated_path = resolution_artifact_generator.generate_promise_to_pay(
             agreement=agreement,
             installments=installments,
@@ -1119,7 +1250,8 @@ def create_app(
         accepted_roles = {item.accepter_role for item in acceptances}
         if accepted_roles != {"DEBTOR", "CREDITOR"}:
             raise HTTPException(status_code=409, detail="Settlement artifact requires bilateral acceptance.")
-        output_path = bundles_root / invoice_id / "resolution" / output_filename
+        safe_output_filename = _validate_export_filename(output_filename, field_name="output_filename")
+        output_path = bundles_root / invoice_id / "resolution" / safe_output_filename
         generated_path = resolution_artifact_generator.generate_settlement_agreement(
             offer=offer,
             acceptances=acceptances,
@@ -1197,17 +1329,24 @@ def create_app(
     def metrics() -> dict[str, object]:
         return security.metrics_snapshot()
 
-    @app.get("/verify")
-    def verify_case(case: str, code: str) -> dict[str, object]:
+    @app.get("/verify", response_model=None)
+    def verify_case(request: Request, case: str, code: str) -> dict[str, object] | HTMLResponse:
         result = debtor_verification_portal.verify(case_id=case, verification_code=code)
         if not result.valid:
+            if _accepts_html(request):
+                return HTMLResponse(_render_verify_html(case, False, result.message))
             raise HTTPException(status_code=404, detail=result.message)
-        return {"valid": True, "message": result.message}
+        payload = {"valid": True, "message": result.message}
+        if _accepts_html(request):
+            return HTMLResponse(_render_verify_html(case, True, result.message))
+        return payload
 
-    @app.get("/portal")
-    def debtor_portal(case: str, code: str) -> dict[str, object]:
+    @app.get("/portal", response_model=None)
+    def debtor_portal(request: Request, case: str, code: str) -> dict[str, object] | HTMLResponse:
         result = debtor_verification_portal.verify(case_id=case, verification_code=code)
         if not result.valid:
+            if _accepts_html(request):
+                return HTMLResponse(_render_verify_html(case, False, result.message))
             raise HTTPException(status_code=404, detail=result.message)
         creditor_name = result.creditor_name or "the creditor"
         verification_case = store.debtor_verification_case_by_case_id(case.strip())
@@ -1233,7 +1372,7 @@ def create_app(
                     settlement_destination_message = (
                         "Settlement destination hidden pending Confirmation of Payee verification."
                     )
-        return {
+        payload = {
             "valid": True,
             "case_id": result.case_id,
             "message": result.message,
@@ -1257,6 +1396,16 @@ def create_app(
             "settlement_destination_message": settlement_destination_message,
             "settlement_destination": settlement_destination,
         }
+        if _accepts_html(request):
+            return HTMLResponse(
+                _render_portal_html(
+                    case_id=result.case_id or case,
+                    message=result.message,
+                    source_notice=payload["source_of_data_notice"],
+                    resolution_options=payload["resolution_options"],
+                )
+            )
+        return payload
 
     @app.post("/portal/actions/data-accuracy-challenge")
     def portal_data_accuracy_challenge(payload: PortalDataAccuracyChallengeActionRequest) -> dict[str, object]:
@@ -1266,6 +1415,13 @@ def create_app(
             debtor_identifier=payload.debtor_identifier,
             challenge_reason=payload.challenge_reason,
             challenge_details=payload.challenge_details,
+        )
+        _record_audit_trail(
+            verification_case.invoice_id,
+            category="COMPLIANCE",
+            action="PORTAL_DATA_ACCURACY_CHALLENGE",
+            actor=Actor.DEBTOR.value,
+            details={"case_id": verification_case.case_id, "debtor_identifier": payload.debtor_identifier},
         )
         return {
             "invoice_id": verification_case.invoice_id,
@@ -1304,6 +1460,13 @@ def create_app(
                     "first_due_date": plan.first_due_date.isoformat(),
                 },
             )
+        )
+        _record_audit_trail(
+            verification_case.invoice_id,
+            category="RESOLUTION",
+            action="PORTAL_PAYMENT_PLAN_PROPOSED",
+            actor=Actor.DEBTOR.value,
+            details={"case_id": verification_case.case_id, "plan_id": plan.plan_id},
         )
         return {
             "invoice_id": verification_case.invoice_id,
@@ -1349,6 +1512,13 @@ def create_app(
                 },
             )
         )
+        _record_audit_trail(
+            verification_case.invoice_id,
+            category="RESOLUTION",
+            action="PORTAL_SETTLEMENT_OFFER_PROPOSED",
+            actor=Actor.DEBTOR.value,
+            details={"case_id": verification_case.case_id, "offer_id": offer.offer_id},
+        )
         return {
             "invoice_id": verification_case.invoice_id,
             "case_id": verification_case.case_id,
@@ -1391,6 +1561,13 @@ def create_app(
                 },
             )
         )
+        _record_audit_trail(
+            verification_case.invoice_id,
+            category="PAYMENT",
+            action="PORTAL_PAYMENT_REPORTED",
+            actor=Actor.DEBTOR.value,
+            details={"case_id": verification_case.case_id, "entry_id": entry.entry_id, "amount_gbp": str(amount)},
+        )
         if _portal_payment_date_pending(invoice_id=verification_case.invoice_id, as_of_date=date.today()):
             store.append_compliance_entry(
                 ComplianceLedgerEntry(
@@ -1407,6 +1584,13 @@ def create_app(
                 event_type="PORTAL_PAYMENT_DATE_FULFILLED",
                 timestamp=now,
                 data_payload={"entry_id": entry.entry_id, "source": "PORTAL_CONFIRM_PAID"},
+            )
+            _record_audit_trail(
+                verification_case.invoice_id,
+                category="PAYMENT",
+                action="PORTAL_PAYMENT_DATE_FULFILLED",
+                actor=Actor.SYSTEM.value,
+                details={"entry_id": entry.entry_id, "source": "PORTAL_CONFIRM_PAID"},
             )
         ledger.append_event(
             invoice_id=verification_case.invoice_id,
@@ -1726,7 +1910,187 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     def home() -> str:
-        return render_home_html()
+        return render_dashboard_html()
+
+    @app.get("/ui/dashboard", response_class=HTMLResponse)
+    def dashboard_page() -> str:
+        return render_dashboard_html()
+
+    @app.get("/ui/cases", response_class=HTMLResponse)
+    def cases_page() -> str:
+        return render_cases_html()
+
+    @app.get("/ui/debtors", response_class=HTMLResponse)
+    def debtors_page() -> str:
+        return render_debtors_html()
+
+    @app.get("/ui/creditors", response_class=HTMLResponse)
+    def creditors_page() -> str:
+        return render_creditors_html()
+
+    @app.get("/ui/disputes", response_class=HTMLResponse)
+    def disputes_page() -> str:
+        return render_disputes_html()
+
+    @app.get("/ui/operations", response_class=HTMLResponse)
+    def operations_page() -> str:
+        return render_operations_html()
+
+    @app.get("/ui/compliance", response_class=HTMLResponse)
+    def compliance_page() -> str:
+        return render_compliance_html()
+
+    @app.get("/ui/reports", response_class=HTMLResponse)
+    def reports_page() -> str:
+        return render_reports_html()
+
+    @app.get("/dashboard")
+    def dashboard() -> dict[str, object]:
+        today = date.today()
+        cases: list[dict[str, object]] = []
+        total_outstanding = Decimal("0.00")
+        due_today = 0
+        overdue = 0
+        blocked_or_paused = 0
+        handoff_ready = 0
+        resolved = 0
+
+        for invoice_meta in store.list_invoices():
+            invoice = store.get_invoice(str(invoice_meta["invoice_id"]))
+            if invoice is None:
+                continue
+            current_state = store.infer_state(invoice.invoice_id)
+            outstanding = store.debtor_ledger_balance_for_invoice(invoice.invoice_id)
+            total_outstanding += outstanding
+            events = store.events_for_invoice(invoice.invoice_id)
+            latest_event = events[-1] if events else None
+            is_overdue = invoice.due_date < today and outstanding > Decimal("0.00")
+            is_due_today = invoice.due_date == today and outstanding > Decimal("0.00")
+            if is_due_today:
+                due_today += 1
+            if is_overdue:
+                overdue += 1
+            if current_state in {
+                InvoiceState.DISPUTED,
+                InvoiceState.DISPUTE_REVIEW,
+                InvoiceState.BREATHING_SPACE_PAUSE,
+                InvoiceState.JURISDICTION_UNCERTAIN,
+            }:
+                blocked_or_paused += 1
+            if current_state == InvoiceState.CLIENT_HANDOFF:
+                handoff_ready += 1
+            if current_state == InvoiceState.RESOLVED_PAID:
+                resolved += 1
+
+            if current_state == InvoiceState.ISSUED:
+                next_step = "Monitor"
+            elif current_state == InvoiceState.FRIENDLY_REMINDER:
+                next_step = "Send reminder"
+            elif current_state == InvoiceState.OVERDUE_CHASER:
+                next_step = "Prepare formal notice"
+            elif current_state == InvoiceState.FORMAL_NOTICE:
+                next_step = "Prepare pre-action pack"
+            elif current_state == InvoiceState.PRE_ACTION_PROTOCOL:
+                next_step = "Handoff to client"
+            elif current_state in {InvoiceState.DISPUTED, InvoiceState.DISPUTE_REVIEW}:
+                next_step = "Pause and review"
+            elif current_state == InvoiceState.BREATHING_SPACE_PAUSE:
+                next_step = "Human pause"
+            elif current_state == InvoiceState.CLIENT_HANDOFF:
+                next_step = "Client handoff"
+            else:
+                next_step = "Closed"
+
+            cases.append(
+                {
+                    "invoice_id": invoice.invoice_id,
+                    "currency": invoice.currency,
+                    "principal_amount": str(invoice.principal_amount),
+                    "outstanding_balance_gbp": str(outstanding),
+                    "current_state": current_state.value,
+                    "jurisdiction": invoice.jurisdiction.value,
+                    "debtor_type": invoice.debtor_type.value,
+                    "issue_date": invoice.issue_date.isoformat(),
+                    "due_date": invoice.due_date.isoformat(),
+                    "is_overdue": is_overdue,
+                    "is_due_today": is_due_today,
+                    "latest_event_type": None if latest_event is None else latest_event.event_type,
+                    "latest_event_at": None if latest_event is None else latest_event.timestamp.isoformat(),
+                    "chain_valid": store.verify_chain(invoice.invoice_id),
+                    "next_step": next_step,
+                }
+            )
+
+        recent_activity = []
+        for case_item in cases:
+            if case_item.get("latest_event_at") is None:
+                continue
+            recent_activity.append(
+                {
+                    "invoice_id": case_item["invoice_id"],
+                    "event_type": case_item["latest_event_type"],
+                    "event_at": case_item["latest_event_at"],
+                }
+            )
+        recent_activity.sort(key=lambda item: item["event_at"], reverse=True)
+
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "metrics": {
+                "active_cases": len(cases),
+                "total_outstanding_gbp": str(total_outstanding),
+                "due_today": due_today,
+                "overdue": overdue,
+                "blocked_or_paused": blocked_or_paused,
+                "handoff_ready": handoff_ready,
+                "resolved": resolved,
+            },
+            "cases": cases,
+            "recent_activity": recent_activity[:8],
+        }
+
+    @app.get("/invoices/{invoice_id}/evidence-bundle")
+    def invoice_evidence_bundle(invoice_id: str, output_filename: str = "evidence_bundle.pdf") -> FileResponse:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        safe_name = _validate_export_filename(output_filename, field_name="output_filename")
+        bundle_path = bundles_root / safe_name
+        communications = store.communications_for_invoice(invoice_id)
+        artifact_records = store.artifacts_for_invoice(invoice_id)
+        ledger_entries = store.debtor_ledger_entries_for_invoice(invoice_id)
+        outstanding_balance = store.debtor_ledger_balance_for_invoice(invoice_id)
+        runner.compile_evidence_bundle(
+            invoice=invoice,
+            output_path=str(bundle_path),
+            communications=[f"{item.channel}: {item.subject}" for item in communications],
+            contract_paths=[artifact.file_path for artifact in artifact_records],
+            proof_of_supply_paths=[artifact.file_path for artifact in artifact_records],
+            formal_notices=[f"{item.channel}: {item.subject}" for item in communications],
+            debtor_ledger_breakdown=[
+                f"{entry.entry_type.value} {entry.amount_gbp} - {entry.description}" for entry in ledger_entries
+            ],
+            client_fee_ledger_breakdown=[],
+            resolution_artifact_paths=[],
+            communication_delivery_timeline=[
+                f"{item.channel}: {item.recipient} | {item.subject}" for item in communications
+            ],
+            correction_withdrawal_notices=[],
+            evidence_artifact_inventory=[
+                f"{artifact.artifact_type.value} | {Path(artifact.file_path).name} | {artifact.file_hash}"
+                for artifact in artifact_records
+            ],
+            compliance_snapshot=[
+                f"{entry.event_type} | {entry.timestamp.isoformat()} | {entry.details}"
+                for entry in store.compliance_entries_for_invoice(invoice_id)
+            ],
+            event_chain_attestation=[
+                f"{event.event_type} | {event.timestamp.isoformat()} | {event.hash}"
+                for event in store.events_for_invoice(invoice_id)
+            ],
+            outstanding_amount_gbp=outstanding_balance,
+        )
+        return FileResponse(str(bundle_path), media_type="application/pdf", filename=safe_name)
 
     @app.get("/ui/invoices/{invoice_id}", response_class=HTMLResponse)
     def invoice_workspace(invoice_id: str) -> str:
@@ -1774,6 +2138,17 @@ def create_app(
                 "debtor_type": invoice.debtor_type.value,
             },
         )
+        _record_audit_trail(
+            invoice.invoice_id,
+            category="COMPLIANCE",
+            action="INVOICE_CREATED",
+            actor=Actor.CLIENT.value,
+            details={
+                "principal_amount_gbp": str(invoice.principal_amount),
+                "jurisdiction": invoice.jurisdiction.value,
+                "debtor_type": invoice.debtor_type.value,
+            },
+        )
         return {"invoice_id": invoice.invoice_id, "status": "created"}
 
     @app.get("/invoices/{invoice_id}")
@@ -1786,6 +2161,7 @@ def create_app(
             "invoice_id": invoice.invoice_id,
             "currency": invoice.currency,
             "principal_amount": str(invoice.principal_amount),
+            "outstanding_balance_gbp": str(store.debtor_ledger_balance_for_invoice(invoice_id)),
             "issue_date": invoice.issue_date.isoformat(),
             "due_date": invoice.due_date.isoformat(),
             "jurisdiction": invoice.jurisdiction.value,
@@ -1807,6 +2183,7 @@ def create_app(
             on_date=on_date or date.today(),
             instructions="Procedural communication preview.",
             wait_until=None,
+            outstanding_amount=_effective_outstanding_amount(invoice),
         )
         return {
             "invoice_id": invoice_id,
@@ -2095,6 +2472,17 @@ def create_app(
                 "failed_criteria": list(result.failed_criteria),
             },
         )
+        _record_audit_trail(
+            invoice_id,
+            category="COMPLIANCE",
+            action="CASE_HEALTH_CHECK_RECORDED",
+            actor=Actor.SYSTEM.value,
+            details={
+                "case_confidence": result.confidence,
+                "passed_count": result.passed_count,
+                "total_count": result.total_count,
+            },
+        )
         return {
             "invoice_id": invoice_id,
             "case_confidence": result.confidence,
@@ -2141,6 +2529,13 @@ def create_app(
                 "reasons": list(result.reasons),
             },
         )
+        _record_audit_trail(
+            invoice_id,
+            category="COMPLIANCE",
+            action="DEVILS_ADVOCATE_REVIEW_RECORDED",
+            actor=Actor.SYSTEM.value,
+            details={"blocked": result.blocked, "reasons": list(result.reasons)},
+        )
         return {
             "invoice_id": invoice_id,
             "blocked": result.blocked,
@@ -2158,6 +2553,7 @@ def create_app(
         return {
             "invoice_id": invoice_id,
             "financial_ledger_balance_gbp": str(summary.financial_balance_gbp),
+            "outstanding_balance_gbp": str(summary.financial_balance_gbp),
             "evidence_ledger_artifacts_count": summary.evidence_artifacts_count,
             "event_audit_ledger_events_count": summary.event_audit_events_count,
             "compliance_ledger_events_count": summary.compliance_events_count,
@@ -2479,6 +2875,28 @@ def create_app(
             ],
         }
 
+    @app.get("/invoices/{invoice_id}/audit-trail")
+    def list_audit_trail(invoice_id: str) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        entries = store.audit_trail_entries_for_invoice(invoice_id)
+        return {
+            "invoice_id": invoice_id,
+            "count": len(entries),
+            "entries": [
+                {
+                    "entry_id": entry.entry_id,
+                    "timestamp": entry.timestamp.isoformat(),
+                    "category": entry.category,
+                    "action": entry.action,
+                    "actor": entry.actor,
+                    "details": entry.details,
+                }
+                for entry in entries
+            ],
+        }
+
     @app.get("/data-retention-policy")
     def data_retention_policy() -> dict[str, object]:
         return {
@@ -2550,6 +2968,13 @@ def create_app(
                 details=details,
             )
         )
+        _record_audit_trail(
+            invoice_id,
+            category="RETENTION",
+            action="DATA_RETENTION_LEGAL_HOLD_OPENED",
+            actor=Actor.SYSTEM.value,
+            details={"hold_type": validated["holdType"], "retention_variant": validated["retentionVariant"]},
+        )
         ledger.append_event(
             invoice_id=invoice_id,
             actor=Actor.SYSTEM,
@@ -2584,6 +3009,13 @@ def create_app(
                 event_type="DATA_RETENTION_LEGAL_HOLD_RELEASED",
                 details=details,
             )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="RETENTION",
+            action="DATA_RETENTION_LEGAL_HOLD_RELEASED",
+            actor=Actor.SYSTEM.value,
+            details={"reason": payload.reason},
         )
         ledger.append_event(
             invoice_id=invoice_id,
@@ -2624,6 +3056,13 @@ def create_app(
                     timestamp=now,
                     data_payload={"warning": warning, "approved_by": payload.approved_by, "reason": payload.reason},
                 )
+                _record_audit_trail(
+                    invoice_id,
+                    category="RETENTION",
+                    action="DATA_RETENTION_DISPOSAL_ABORTED_LEGAL_HOLD_ACTIVE",
+                    actor=Actor.SYSTEM.value,
+                    details={"approved_by": payload.approved_by, "reason": payload.reason},
+                )
             raise HTTPException(
                 status_code=409,
                 detail="Data retention disposal blocked: " + "; ".join(review["blockers"]),
@@ -2658,6 +3097,17 @@ def create_app(
                 event_type="DATA_RETENTION_DISPOSAL_EXECUTED",
                 details=details,
             )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="RETENTION",
+            action="DATA_RETENTION_DISPOSAL_EXECUTED",
+            actor=Actor.SYSTEM.value,
+            details={
+                "deleted_file_count": len(deleted_paths),
+                "missing_file_count": len(missing_paths),
+                "approved_by": payload.approved_by,
+            },
         )
         ledger.append_event(
             invoice_id=invoice_id,
@@ -2705,6 +3155,13 @@ def create_app(
                     "first_due_date": plan.first_due_date.isoformat(),
                 },
             )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="RESOLUTION",
+            action="PAYMENT_PLAN_PROPOSED",
+            actor=Actor.CLIENT.value,
+            details={"plan_id": plan.plan_id, "installment_count": plan.installment_count},
         )
         return {
             "invoice_id": invoice_id,
@@ -2794,6 +3251,13 @@ def create_app(
                 },
             )
         )
+        _record_audit_trail(
+            invoice_id,
+            category="PAYMENT",
+            action="PAYMENT_PLAN_PAYMENT_RECORDED",
+            actor=Actor.CLIENT.value,
+            details={"plan_id": payment.plan_id, "installment_id": payment.installment_id, "amount_gbp": str(payment.amount_gbp)},
+        )
         return {
             "invoice_id": invoice_id,
             "plan_id": plan_id,
@@ -2831,6 +3295,13 @@ def create_app(
                     "expiry_date": offer.expiry_date.isoformat(),
                 },
             )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="RESOLUTION",
+            action="SETTLEMENT_OFFER_PROPOSED",
+            actor=Actor.CLIENT.value,
+            details={"offer_id": offer.offer_id, "offered_amount_gbp": str(offer.offered_amount_gbp)},
         )
         return {
             "invoice_id": invoice_id,
@@ -2871,6 +3342,13 @@ def create_app(
                     "finalized": finalized,
                 },
             )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="RESOLUTION",
+            action="SETTLEMENT_OFFER_ACCEPTED",
+            actor=Actor.CLIENT.value,
+            details={"offer_id": offer_id, "accepter_role": acceptance.accepter_role, "finalized": finalized},
         )
         return {
             "invoice_id": invoice_id,
@@ -2932,6 +3410,13 @@ def create_app(
                 },
             )
         )
+        _record_audit_trail(
+            invoice_id,
+            category="RESOLUTION",
+            action="DISPUTE_CARVE_OUT_CREATED",
+            actor=Actor.CLIENT.value,
+            details={"carve_out_id": carve_out.carve_out_id, "disputed_amount_gbp": str(carve_out.disputed_amount_gbp)},
+        )
         return {
             "invoice_id": invoice_id,
             "carve_out_id": carve_out.carve_out_id,
@@ -2988,6 +3473,13 @@ def create_app(
                 },
             )
         )
+        _record_audit_trail(
+            invoice_id,
+            category="RESOLUTION",
+            action="PROMISE_TO_PAY_ARTIFACT_GENERATED",
+            actor=Actor.SYSTEM.value,
+            details={"plan_id": payload.plan_id, "document_id": generated_artifact.document_id},
+        )
         ledger.append_event(
             invoice_id=invoice_id,
             actor=Actor.SYSTEM,
@@ -3035,6 +3527,13 @@ def create_app(
                     "file_hash": generated_artifact.file_hash,
                 },
             )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="RESOLUTION",
+            action="SETTLEMENT_AGREEMENT_ARTIFACT_GENERATED",
+            actor=Actor.SYSTEM.value,
+            details={"offer_id": payload.offer_id, "document_id": generated_artifact.document_id},
         )
         ledger.append_event(
             invoice_id=invoice_id,
@@ -3459,6 +3958,7 @@ def create_app(
             current_state=current_state,
             today=payload.today,
             state_entered_on=state_entered_on,
+            outstanding_amount=_effective_outstanding_amount(invoice),
             debtor_feedback=payload.debtor_feedback,
             system_flag=payload.system_flag,
             insolvency_flag=payload.insolvency_flag,
@@ -3478,6 +3978,20 @@ def create_app(
             on_date=payload.today,
             instructions=result.decision.instructions,
             wait_until=result.decision.wait_until,
+            outstanding_amount=_effective_outstanding_amount(invoice),
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="ESCALATION",
+            action="ESCALATION_DECISION",
+            actor=Actor.SYSTEM.value,
+            details={
+                "from_state": current_state.value,
+                "next_state": result.decision.next_state.value,
+                "outreach_frozen": result.decision.outreach_frozen,
+                "outstanding_amount_gbp": str(_effective_outstanding_amount(invoice)),
+                "viability_blocked": viability.blocked,
+            },
         )
         return {
             "invoice_id": invoice_id,
@@ -3696,7 +4210,8 @@ def create_app(
         pre_action_notice_paths = [
             artifact.file_path for artifact in artifacts if artifact.artifact_type == ArtifactType.PRE_ACTION_NOTICE
         ]
-        output_path = bundles_root / invoice_id / payload.output_filename
+        safe_output_filename = _validate_export_filename(payload.output_filename, field_name="output_filename")
+        output_path = bundles_root / invoice_id / safe_output_filename
         output_path.parent.mkdir(parents=True, exist_ok=True)
         generated_path = runner.compile_evidence_bundle(
             invoice=invoice,
@@ -3726,6 +4241,19 @@ def create_app(
             evidence_artifact_inventory=artifact_inventory,
             compliance_snapshot=compliance_snapshot,
             event_chain_attestation=event_chain_attestation,
+            outstanding_amount_gbp=_effective_outstanding_amount(invoice),
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="EXPORT",
+            action="EVIDENCE_BUNDLE_GENERATED",
+            actor=Actor.CLIENT.value,
+            details={
+                "bundle_path": generated_path,
+                "outstanding_amount_gbp": str(_effective_outstanding_amount(invoice)),
+                "communications_count": len(payload.communications),
+                "formal_notices_count": len(payload.formal_notices),
+            },
         )
         return {"invoice_id": invoice_id, "bundle_path": generated_path}
 
@@ -3734,15 +4262,30 @@ def create_app(
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
-        output_path = bundles_root / invoice_id / payload.output_filename
+        safe_output_filename = _validate_export_filename(payload.output_filename, field_name="output_filename")
+        output_path = bundles_root / invoice_id / safe_output_filename
         if payload.output_format == "pdf":
             manifest = manifest_exporter.export_invoice_manifest_pdf(invoice_id=invoice_id, output_path=str(output_path))
         else:
             manifest = manifest_exporter.export_invoice_manifest(invoice_id=invoice_id, output_path=str(output_path))
+        _record_audit_trail(
+            invoice_id,
+            category="EXPORT",
+            action="LEDGER_MANIFEST_GENERATED",
+            actor=Actor.CLIENT.value,
+            details={
+                "manifest_path": str(output_path),
+                "manifest_format": payload.output_format,
+                "outstanding_balance_gbp": manifest["outstanding_balance_gbp"],
+                "events_count": manifest["events_count"],
+            },
+        )
         return {
             "invoice_id": invoice_id,
             "manifest_path": str(output_path),
             "manifest_format": payload.output_format,
+            "principal_amount_gbp": manifest["principal_amount_gbp"],
+            "outstanding_balance_gbp": manifest["outstanding_balance_gbp"],
             "chain_valid": manifest["chain_valid"],
             "root_hash": manifest["root_hash"],
             "events_count": manifest["events_count"],
@@ -3754,12 +4297,24 @@ def create_app(
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
-        manifest_path = bundles_root / invoice_id / payload.output_filename
+        safe_output_filename = _validate_export_filename(payload.output_filename, field_name="output_filename")
+        manifest_path = bundles_root / invoice_id / safe_output_filename
         if not manifest_path.exists():
             raise HTTPException(status_code=404, detail="Manifest file not found.")
         verification = manifest_exporter.verify_invoice_manifest(
             invoice_id=invoice_id,
             manifest_path=str(manifest_path),
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="EXPORT",
+            action="LEDGER_MANIFEST_VERIFIED",
+            actor=Actor.CLIENT.value,
+            details={
+                "manifest_path": str(manifest_path),
+                "signature_valid": verification["signature_valid"],
+                "overall_valid": verification["overall_valid"],
+            },
         )
         return {"invoice_id": invoice_id, "manifest_path": str(manifest_path), **verification}
 
@@ -3774,6 +4329,7 @@ def create_app(
             is_commercial_transaction=payload.is_commercial_transaction,
             contractual_rate=payload.contractual_rate,
             base_rate_override=payload.base_rate_override,
+            outstanding_amount=_effective_outstanding_amount(invoice),
         )
         breakdown = None
         if result.breakdown is not None:

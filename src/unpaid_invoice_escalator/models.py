@@ -226,6 +226,17 @@ class ComplianceLedgerEntry:
 
 
 @dataclass(frozen=True)
+class AuditTrailEntry:
+    entry_id: str
+    invoice_id: str
+    timestamp: datetime
+    category: str
+    action: str
+    actor: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class DebtorVerificationCase:
     case_id: str
     invoice_id: str

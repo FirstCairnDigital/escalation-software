@@ -8,8 +8,11 @@ import unittest
 
 from unpaid_invoice_escalator.models import (
     Actor,
+    AuditTrailEntry,
     BankDetailVerificationState,
     ClientFeeAction,
+    DebtorLedgerEntry,
+    DebtorLedgerEntryType,
     CommunicationDeliveryEvent,
     CommunicationDeliveryState,
     CommunicationRecord,
@@ -54,7 +57,75 @@ class TestSQLiteStore(unittest.TestCase):
             loaded = store.get_invoice(invoice.invoice_id)
             self.assertIsNotNone(loaded)
             self.assertEqual(loaded.invoice_id, invoice.invoice_id)
+            self.assertEqual(store.debtor_ledger_balance_for_invoice(invoice.invoice_id), Decimal("999.99"))
+            self.assertEqual(store.debtor_ledger_entries_for_invoice(invoice.invoice_id)[0].entry_type, DebtorLedgerEntryType.ORIGINAL_PRINCIPAL)
             self.assertTrue(store.verify_chain(invoice.invoice_id))
+
+    def test_invoice_balance_reaches_zero_after_full_payment(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "escalator-settled.db")
+            store = SQLiteStore(db_path)
+            invoice = Invoice(
+                invoice_id="inv-db-settled",
+                currency="GBP",
+                principal_amount=Decimal("250"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            store.append_debtor_ledger_entry(
+                DebtorLedgerEntry(
+                    entry_id="payment-1",
+                    invoice_id=invoice.invoice_id,
+                    timestamp=datetime.now(timezone.utc),
+                    entry_type=DebtorLedgerEntryType.PAYMENT_RECEIVED,
+                    amount_gbp=Decimal("-250"),
+                    description="Paid in full",
+                )
+            )
+            self.assertEqual(store.debtor_ledger_balance_for_invoice(invoice.invoice_id), Decimal("0.00"))
+
+    def test_audit_trail_entries_are_persisted_and_append_only(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "escalator-audit.db")
+            store = SQLiteStore(db_path)
+            invoice = Invoice(
+                invoice_id="inv-db-audit",
+                currency="GBP",
+                principal_amount=Decimal("300"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            store.append_audit_trail_entry(
+                AuditTrailEntry(
+                    entry_id="audit-1",
+                    invoice_id=invoice.invoice_id,
+                    timestamp=datetime.now(timezone.utc),
+                    category="COMPLIANCE",
+                    action="CASE_HEALTH_CHECK_RECORDED",
+                    actor="SYSTEM",
+                    details={"case_confidence": "READY"},
+                )
+            )
+            entries = store.audit_trail_entries_for_invoice(invoice.invoice_id)
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].action, "CASE_HEALTH_CHECK_RECORDED")
+
+            conn = sqlite3.connect(db_path)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("UPDATE audit_trail_entries SET action = 'ALTERED'")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM audit_trail_entries")
+                conn.rollback()
+            finally:
+                conn.close()
 
     def test_append_only_triggers_block_update_and_delete(self) -> None:
         with TemporaryDirectory() as tmp_dir:

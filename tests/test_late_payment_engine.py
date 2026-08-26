@@ -32,6 +32,29 @@ class TestLatePaymentEngine(unittest.TestCase):
         self.assertEqual(events[-1].event_type, "LATE_PAYMENT_CALCULATION")
         self.assertEqual(events[-1].data_payload["rule_version"], result.rule_version)
 
+    def test_eligible_calculation_uses_outstanding_amount(self) -> None:
+        ledger = InvoiceLedger()
+        engine = LatePaymentEngine(ledger=ledger)
+        invoice = Invoice(
+            invoice_id="inv-late-3",
+            currency="GBP",
+            principal_amount=Decimal("2000"),
+            issue_date=date(2026, 1, 1),
+            due_date=date(2026, 1, 31),
+            jurisdiction=Jurisdiction.ENGLAND_WALES,
+            debtor_type=DebtorType.LIMITED,
+        )
+        result = engine.calculate(
+            invoice=invoice,
+            as_of_date=date(2026, 2, 10),
+            is_commercial_transaction=True,
+            base_rate_override=Decimal("0.05"),
+            outstanding_amount=Decimal("500"),
+        )
+        self.assertTrue(result.eligible)
+        self.assertIsNotNone(result.breakdown)
+        self.assertEqual(result.breakdown.fixed_compensation, Decimal("40"))
+
     def test_ineligible_non_commercial(self) -> None:
         ledger = InvoiceLedger()
         engine = LatePaymentEngine(ledger=ledger)
@@ -55,4 +78,3 @@ class TestLatePaymentEngine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

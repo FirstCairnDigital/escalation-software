@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 import re
 
 from unpaid_invoice_escalator.models import Invoice, InvoiceState
@@ -68,6 +69,7 @@ class CommunicationSeverityEngine:
         on_date: date,
         instructions: str,
         wait_until: date | None,
+        outstanding_amount: Decimal | None = None,
     ) -> CommunicationPreview:
         level = self._STATE_TO_LEVEL.get(state, 3)
         pack = self._rule_pack_loader.load_for(invoice.jurisdiction, on_date)
@@ -78,7 +80,7 @@ class CommunicationSeverityEngine:
         message = template.format(
             invoice_id=invoice.invoice_id,
             due_date=invoice.due_date.isoformat(),
-            principal_amount=str(invoice.principal_amount),
+            principal_amount=str(invoice.principal_amount if outstanding_amount is None else outstanding_amount),
             instructions=instructions,
             wait_until=wait_until.isoformat() if wait_until else "n/a",
         )

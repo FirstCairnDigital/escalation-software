@@ -89,7 +89,11 @@ class LedgerManifestExporter:
         }
 
     def _build_manifest(self, *, invoice_id: str) -> dict[str, Any]:
+        invoice = self._store.get_invoice(invoice_id)
+        if invoice is None:
+            raise ValueError("Invoice not found.")
         events = self._store.events_for_invoice(invoice_id)
+        outstanding_balance_gbp = self._store.debtor_ledger_balance_for_invoice(invoice_id)
         nodes: list[dict[str, Any]] = []
         previous_hash = "GENESIS"
         for idx, event in enumerate(events, start=1):
@@ -126,6 +130,8 @@ class LedgerManifestExporter:
         manifest_core: dict[str, Any] = {
             "manifest_version": "1.0",
             "invoice_id": invoice_id,
+            "principal_amount_gbp": str(invoice.principal_amount),
+            "outstanding_balance_gbp": str(outstanding_balance_gbp),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "events_count": len(events),
             "chain_valid": all(node["node_valid"] for node in nodes),
@@ -155,6 +161,8 @@ class LedgerManifestExporter:
             f"Invoice ID: {manifest['invoice_id']}",
             f"Generated At: {manifest['generated_at']}",
             f"Manifest Version: {manifest['manifest_version']}",
+            f"Original Principal: GBP {manifest['principal_amount_gbp']}",
+            f"Current Outstanding Balance: GBP {manifest['outstanding_balance_gbp']}",
             f"Events Count: {manifest['events_count']}",
             f"Chain Valid: {manifest['chain_valid']}",
             f"Root Hash: {manifest['root_hash']}",

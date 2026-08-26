@@ -18,7 +18,26 @@ class TestApi(unittest.TestCase):
             client = TestClient(app)
             home_resp = client.get("/")
             self.assertEqual(home_resp.status_code, 200)
-            self.assertIn("P26003 Commercial Invoice Recovery Assistant", home_resp.text)
+            self.assertIn("Engine Dashboard", home_resp.text)
+            dashboard_page = client.get("/ui/dashboard")
+            self.assertEqual(dashboard_page.status_code, 200)
+            cases_page = client.get("/ui/cases")
+            self.assertEqual(cases_page.status_code, 200)
+            self.assertIn("Five-ledger snapshot", cases_page.text)
+            self.assertIn("Latest case activity", cases_page.text)
+            self.assertEqual(client.get("/ui/debtors").status_code, 200)
+            self.assertEqual(client.get("/ui/creditors").status_code, 200)
+            self.assertEqual(client.get("/ui/disputes").status_code, 200)
+            operations_page = client.get("/ui/operations")
+            self.assertEqual(operations_page.status_code, 200)
+            self.assertIn("Recent communication activity", operations_page.text)
+            self.assertIn("Payment plan actions", operations_page.text)
+            self.assertIn("Settlement actions", operations_page.text)
+            self.assertEqual(client.get("/ui/compliance").status_code, 200)
+            reports_page = client.get("/ui/reports")
+            self.assertEqual(reports_page.status_code, 200)
+            self.assertIn("Environment checks", reports_page.text)
+            self.assertIn("Policy controls", reports_page.text)
 
             create_resp = client.post(
                 "/invoices",
@@ -33,6 +52,13 @@ class TestApi(unittest.TestCase):
                 },
             )
             self.assertEqual(create_resp.status_code, 200)
+            dashboard_resp = client.get("/dashboard")
+            self.assertEqual(dashboard_resp.status_code, 200)
+            self.assertEqual(dashboard_resp.json()["metrics"]["active_cases"], 1)
+            self.assertEqual(dashboard_resp.json()["cases"][0]["invoice_id"], "inv-api-1")
+            invoice_resp = client.get("/invoices/inv-api-1")
+            self.assertEqual(invoice_resp.status_code, 200)
+            self.assertEqual(invoice_resp.json()["outstanding_balance_gbp"], "2800.00")
             case_health_resp = client.post(
                 "/invoices/inv-api-1/case-health-check",
                 json={
@@ -194,6 +220,7 @@ class TestApi(unittest.TestCase):
 
             five_ledger_resp = client.get("/invoices/inv-api-1/five-ledger-summary")
             self.assertEqual(five_ledger_resp.status_code, 200)
+            self.assertEqual(five_ledger_resp.json()["outstanding_balance_gbp"], "2800.00")
             self.assertGreaterEqual(five_ledger_resp.json()["compliance_ledger_events_count"], 4)
 
             fee_action_resp = client.post(
@@ -253,10 +280,13 @@ class TestApi(unittest.TestCase):
 
             debtor_ledger_resp = client.get("/invoices/inv-api-1/debtor-ledger")
             self.assertEqual(debtor_ledger_resp.status_code, 200)
-            self.assertEqual(debtor_ledger_resp.json()["balance_gbp"], "12.50")
+            self.assertEqual(debtor_ledger_resp.json()["balance_gbp"], "2812.50")
             client_ledger_resp = client.get("/invoices/inv-api-1/client-fee-ledger")
             self.assertEqual(client_ledger_resp.status_code, 200)
             self.assertEqual(client_ledger_resp.json()["balance_gbp"], "11.94")
+            updated_invoice_resp = client.get("/invoices/inv-api-1")
+            self.assertEqual(updated_invoice_resp.status_code, 200)
+            self.assertEqual(updated_invoice_resp.json()["outstanding_balance_gbp"], "2812.50")
 
             hygiene_resp = client.post(
                 "/invoices/inv-api-1/pre-overdue-hygiene",
@@ -322,6 +352,7 @@ class TestApi(unittest.TestCase):
             workspace_resp = client.get("/ui/invoices/inv-api-1")
             self.assertEqual(workspace_resp.status_code, 200)
             self.assertIn("Invoice Workspace", workspace_resp.text)
+            self.assertIn("Outstanding Balance", workspace_resp.text)
             rule_resp = client.get("/rule-packs/NORTHERN_IRELAND/active?on_date=2026-02-01")
             self.assertEqual(rule_resp.status_code, 200)
             self.assertEqual(rule_resp.json()["rule_id"], "ni-commercial-invoice-recovery")
@@ -388,6 +419,7 @@ class TestApi(unittest.TestCase):
             self.assertEqual(manifest_resp.status_code, 200)
             body = manifest_resp.json()
             self.assertEqual(body["manifest_format"], "json")
+            self.assertEqual(body["outstanding_balance_gbp"], "2812.50")
             self.assertTrue(body["chain_valid"])
             manifest_path = Path(body["manifest_path"])
             self.assertTrue(manifest_path.exists())
@@ -401,6 +433,12 @@ class TestApi(unittest.TestCase):
             self.assertTrue(verify_body["signature_valid"])
             self.assertTrue(verify_body["core_matches_current_ledger"])
             self.assertTrue(verify_body["overall_valid"])
+
+            audit_trail_resp = client.get("/invoices/inv-api-1/audit-trail")
+            self.assertEqual(audit_trail_resp.status_code, 200)
+            audit_trail_body = audit_trail_resp.json()
+            self.assertGreaterEqual(audit_trail_body["count"], 3)
+            self.assertIn("EXPORT", {item["category"] for item in audit_trail_body["entries"]})
 
             manifest_pdf_resp = client.post(
                 "/invoices/inv-api-1/ledger-manifests",
@@ -1178,12 +1216,13 @@ class TestApi(unittest.TestCase):
             self.assertEqual(create_resp.status_code, 200)
             client.post(
                 "/invoices/inv-api-lock/debtor-ledger/entries",
-                json={"entry_type": "ORIGINAL_PRINCIPAL", "amount_gbp": "250", "description": "Principal"},
-            )
-            client.post(
-                "/invoices/inv-api-lock/debtor-ledger/entries",
                 json={"entry_type": "PAYMENT_RECEIVED", "amount_gbp": "-250", "description": "Paid in full"},
             )
+            preview_resp = client.get(
+                "/invoices/inv-api-lock/communication-preview?state=OVERDUE_CHASER&on_date=2026-02-01"
+            )
+            self.assertEqual(preview_resp.status_code, 200)
+            self.assertIn("£0.00", preview_resp.json()["message"])
             comm_resp = client.post(
                 "/invoices/inv-api-lock/communications",
                 json={
@@ -1218,6 +1257,123 @@ class TestApi(unittest.TestCase):
                 },
             )
             self.assertEqual(automated_comm.status_code, 409)
+
+    def test_late_payment_calculation_uses_current_balance(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-late-payment.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-late",
+                    "currency": "GBP",
+                    "principal_amount": "2000",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+            client.post(
+                "/invoices/inv-api-late/debtor-ledger/entries",
+                json={"entry_type": "PAYMENT_RECEIVED", "amount_gbp": "-1500", "description": "Partial payment"},
+            )
+            calc_resp = client.post(
+                "/invoices/inv-api-late/late-payment-calculations",
+                json={
+                    "as_of_date": "2026-02-10",
+                    "is_commercial_transaction": True,
+                    "base_rate_override": "0.05",
+                },
+            )
+            self.assertEqual(calc_resp.status_code, 200)
+            self.assertEqual(calc_resp.json()["breakdown"]["fixed_compensation"], "40")
+
+    def test_escalation_uses_current_balance_for_jurisdiction_limit(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-jurisdiction-balance.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-jur-balance",
+                    "currency": "GBP",
+                    "principal_amount": "6500",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "SCOTLAND",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+            client.post(
+                "/invoices/inv-api-jur-balance/case-health-check",
+                json={
+                    "user_id": "USER-204",
+                    "correct_customer_legal_entity": True,
+                    "description_of_goods_or_services": True,
+                    "invoice_number_and_date_verified": True,
+                    "amount_matches_contract_or_quote": True,
+                    "correct_billing_address": True,
+                    "vat_numbers_checked": True,
+                    "purchase_order_supplied_if_required": True,
+                    "payment_terms_and_due_date_established": True,
+                    "delivery_or_acceptance_proof_attached": True,
+                    "no_unresolved_credit_notes": True,
+                    "direct_payments_checked": True,
+                    "no_known_dispute": True,
+                    "creditor_authority_verified": True,
+                    "limitation_period_checked": True,
+                    "debtor_contact_details_verified": True,
+                    "court_handoff_boundary_acknowledged": True,
+                },
+            )
+            client.post(
+                "/invoices/inv-api-jur-balance/legal-safety-gate/confirm",
+                json={
+                    "user_id": "USER-204",
+                    "amount_claimed_gbp": "6500",
+                    "payments_recorded_gbp": "0",
+                    "authorised_to_act": True,
+                    "info_accurate": True,
+                    "invoice_unpaid": True,
+                    "payments_recorded_complete": True,
+                    "genuine_supporting_docs": True,
+                    "no_unresolved_dispute": True,
+                    "commercial_not_excluded": True,
+                },
+            )
+            client.post(
+                "/invoices/inv-api-jur-balance/discrepancy-check",
+                json={
+                    "claim_amount": "6500",
+                    "evidence_document_amount": "6500",
+                    "principal": "6500",
+                    "payments_recorded": "0",
+                    "outstanding_entered": "6500",
+                },
+            )
+            client.post(
+                "/invoices/inv-api-jur-balance/debtor-ledger/entries",
+                json={
+                    "entry_type": "PAYMENT_RECEIVED",
+                    "amount_gbp": "-2600",
+                    "description": "Partial payment",
+                },
+            )
+            escalate_resp = client.post(
+                "/invoices/inv-api-jur-balance/escalate",
+                json={"today": "2026-02-01", "current_state": "ISSUED"},
+            )
+            self.assertEqual(escalate_resp.status_code, 200)
+            self.assertEqual(escalate_resp.json()["next_state"], "FRIENDLY_REMINDER")
 
     def test_upload_rejection_quarantine_and_metrics(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -1672,6 +1828,52 @@ class TestApi(unittest.TestCase):
             self.assertIn(b"Evidence Artifact Inventory:", bundle_bytes)
             self.assertIn(b"Compliance Snapshot:", bundle_bytes)
             self.assertIn(b"Event Chain Attestation:", bundle_bytes)
+
+    def test_public_verification_pages_and_bundle_download(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-public.db")
+            app = create_app(db_path=db_path, artifacts_dir=str(Path(tmp_dir) / "artifacts"), bundles_dir=str(Path(tmp_dir) / "bundles"))
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-public-portal",
+                    "currency": "GBP",
+                    "principal_amount": "1500",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            register_resp = client.post(
+                "/invoices/inv-public-portal/debtor-verification/register",
+                json={"creditor_name": "First Cairn Digital Client Ltd", "invoice_reference": "INV-PORTAL-1"},
+            )
+            self.assertEqual(register_resp.status_code, 200)
+            case_id = register_resp.json()["case_id"]
+            code = register_resp.json()["verification_code"]
+
+            verify_html = client.get(f"/verify?case={case_id}&code={code}", headers={"Accept": "text/html"})
+            self.assertEqual(verify_html.status_code, 200)
+            self.assertIn("First Cairn Digital case verification", verify_html.text)
+            self.assertIn("genuine", verify_html.text.lower())
+
+            portal_html = client.get(f"/portal?case={case_id}&code={code}", headers={"Accept": "text/html"})
+            self.assertEqual(portal_html.status_code, 200)
+            self.assertIn("Debtor verification portal", portal_html.text)
+            self.assertIn("Source of data", portal_html.text)
+
+            bundle_resp = client.get(
+                "/invoices/inv-public-portal/evidence-bundle",
+                params={"output_filename": "portal_bundle.pdf"},
+            )
+            self.assertEqual(bundle_resp.status_code, 200)
+            self.assertEqual(bundle_resp.headers["content-type"].split(";", 1)[0], "application/pdf")
+            self.assertGreater(len(bundle_resp.content), 200)
 
     def test_health_and_production_readiness_aliases(self) -> None:
         with TemporaryDirectory() as tmp_dir:

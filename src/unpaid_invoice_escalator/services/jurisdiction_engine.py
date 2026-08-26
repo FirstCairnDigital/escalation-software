@@ -21,6 +21,7 @@ class EscalationContext:
     current_state: InvoiceState
     today: date
     state_entered_on: date | None = None
+    outstanding_amount: Decimal | None = None
     debtor_feedback: str | None = None
     system_flag: str | None = None
     insolvency_flag: bool = False
@@ -114,9 +115,10 @@ class JurisdictionEngine:
         return None
 
     def _scotland(self, invoice: Invoice, context: EscalationContext, pack: RulePack) -> EngineDecision:
+        outstanding = self._effective_outstanding_amount(invoice, context)
         automation_limit = Decimal(str(pack.fcd_automation_limit))
         enforcement_note = str(pack.workflow["enforcement_note"])
-        if invoice.principal_amount > automation_limit:
+        if outstanding > automation_limit:
             return EngineDecision(
                 next_state=InvoiceState.CLIENT_HANDOFF,
                 outreach_frozen=True,
@@ -150,23 +152,28 @@ class JurisdictionEngine:
                 wait_days=wait_days,
                 start_state=InvoiceState.PRE_ACTION_PROTOCOL,
                 entry_documents=tuple(pack.workflow["sole_trader_documents"]),
-                handoff_documents=self._handoff_documents(invoice, pack),
-                handoff_instructions=self._handoff_instructions(invoice, pack, "Money Claim Online / County Court"),
-            )
+                    handoff_documents=self._handoff_documents(invoice, context, pack),
+                    handoff_instructions=self._handoff_instructions(
+                        invoice, context, pack, "Money Claim Online / County Court"
+                    ),
+                )
 
         wait_days = int(pack.workflow["corporate_wait_days"])
         return self._corporate_lba_flow(
             context=context,
             wait_days=wait_days,
             entry_documents=tuple(pack.workflow["corporate_documents"]),
-            handoff_documents=self._handoff_documents(invoice, pack),
-            handoff_instructions=self._handoff_instructions(invoice, pack, "Money Claim Online / County Court"),
+            handoff_documents=self._handoff_documents(invoice, context, pack),
+            handoff_instructions=self._handoff_instructions(
+                invoice, context, pack, "Money Claim Online / County Court"
+            ),
         )
 
     def _northern_ireland(self, invoice: Invoice, context: EscalationContext, pack: RulePack) -> EngineDecision:
+        outstanding = self._effective_outstanding_amount(invoice, context)
         automation_limit = Decimal(str(pack.fcd_automation_limit))
         enforcement_note = str(pack.workflow["enforcement_note"])
-        if invoice.principal_amount > automation_limit:
+        if outstanding > automation_limit:
             return EngineDecision(
                 next_state=InvoiceState.CLIENT_HANDOFF,
                 outreach_frozen=True,
@@ -270,19 +277,27 @@ class JurisdictionEngine:
             documents_to_generate=handoff_documents,
         )
 
-    def _handoff_documents(self, invoice: Invoice, pack: RulePack) -> tuple[str, ...]:
-        if invoice.principal_amount > Decimal(str(pack.fcd_automation_limit)):
+    def _handoff_documents(self, invoice: Invoice, context: EscalationContext, pack: RulePack) -> tuple[str, ...]:
+        if self._effective_outstanding_amount(invoice, context) > Decimal(str(pack.fcd_automation_limit)):
             return tuple(pack.workflow["over_limit_pack"])
         return tuple(pack.workflow["small_claims_pack"])
 
-    def _handoff_instructions(self, invoice: Invoice, pack: RulePack, filing_label: str) -> str:
+    def _handoff_instructions(
+        self, invoice: Invoice, context: EscalationContext, pack: RulePack, filing_label: str
+    ) -> str:
         enforcement_note = str(pack.workflow["enforcement_note"])
-        if invoice.principal_amount > Decimal(str(pack.fcd_automation_limit)):
+        if self._effective_outstanding_amount(invoice, context) > Decimal(str(pack.fcd_automation_limit)):
             return (
                 "This case has reached the FCD automated workflow limit. Download your evidence pack for independent "
                 f"filing or legal review. Enforcement reference: {enforcement_note}."
             )
         return f"Pre-action timeline complete. Prepare {filing_label} Evidence Pack. Enforcement reference: {enforcement_note}."
+
+    @staticmethod
+    def _effective_outstanding_amount(invoice: Invoice, context: EscalationContext) -> Decimal:
+            if context.outstanding_amount is not None:
+                return context.outstanding_amount
+            return invoice.principal_amount
 
     @staticmethod
     def _advance_non_terminal(current: InvoiceState) -> InvoiceState:

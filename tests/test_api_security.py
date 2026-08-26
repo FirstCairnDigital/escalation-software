@@ -160,6 +160,72 @@ class TestApiSecurity(unittest.TestCase):
             metrics_resp = client.get("/metrics", headers={"x-api-key": "admin-key"})
             self.assertEqual(metrics_resp.status_code, 200)
 
+    def test_export_filename_traversal_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api.db")
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                bundles_dir=str(Path(tmp_dir) / "bundles"),
+                auth_enabled=True,
+                api_keys={"operator-key": "operator", "admin-key": "admin"},
+                rate_limit_per_minute=100,
+                manifest_signing_key="production-signing-key",
+                manifest_key_id="fcd-kms-key-1",
+            )
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                headers={"x-api-key": "operator-key"},
+                json={
+                    "invoice_id": "inv-sec-path",
+                    "currency": "GBP",
+                    "principal_amount": "100",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-02",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            manifest_resp = client.post(
+                "/invoices/inv-sec-path/ledger-manifests",
+                headers={"x-api-key": "operator-key"},
+                json={"output_filename": "..\\evil.json"},
+            )
+            self.assertEqual(manifest_resp.status_code, 400)
+            self.assertIn("simple filename", manifest_resp.json()["detail"])
+
+            absolute_manifest_resp = client.post(
+                "/invoices/inv-sec-path/ledger-manifests",
+                headers={"x-api-key": "operator-key"},
+                json={"output_filename": "C:\\evil.json"},
+            )
+            self.assertEqual(absolute_manifest_resp.status_code, 400)
+
+            bundle_resp = client.post(
+                "/invoices/inv-sec-path/evidence-bundles",
+                headers={"x-api-key": "operator-key"},
+                json={
+                    "communications": ["Reminder"],
+                    "formal_notices": ["Letter"],
+                    "output_filename": "..\\evil.pdf",
+                },
+            )
+            self.assertEqual(bundle_resp.status_code, 400)
+
+            absolute_bundle_resp = client.post(
+                "/invoices/inv-sec-path/evidence-bundles",
+                headers={"x-api-key": "operator-key"},
+                json={
+                    "communications": ["Reminder"],
+                    "formal_notices": ["Letter"],
+                    "output_filename": "C:\\evil.pdf",
+                },
+            )
+            self.assertEqual(absolute_bundle_resp.status_code, 400)
+
     def test_readiness_and_startup_validation_endpoint(self) -> None:
         tmp_dir = mkdtemp()
         try:

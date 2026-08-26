@@ -43,7 +43,24 @@ class ViabilityProportionalityCalculator:
         normalized_status = company_status.strip().upper() if company_status.strip() else "UNKNOWN"
         outstanding = self._store.debtor_ledger_balance_for_invoice(invoice.invoice_id)
         if outstanding <= Decimal("0.00"):
-            outstanding = invoice.principal_amount
+            blocked = normalized_status in {"INSOLVENT", "DISSOLVED", "IN_ADMINISTRATION", "CEASED"}
+            return ViabilityAssessment(
+                company_status=normalized_status,
+                outstanding_amount_gbp=Decimal("0.00"),
+                projected_fcd_action_fee_gbp=Decimal("0.00"),
+                projected_court_fee_gbp=Decimal("0.00"),
+                estimated_time_cost_gbp=Decimal("0.00"),
+                projected_total_cost_gbp=Decimal("0.00"),
+                cost_ratio=Decimal("0.00"),
+                disproportionate=False,
+                notice=None,
+                recommendation=(
+                    "Entity appears financially distressed. Transition to CLIENT_HANDOFF for specialist review."
+                    if blocked
+                    else "No outstanding balance available for escalation."
+                ),
+                blocked=blocked,
+            )
         schedule = self._load_pricing_schedule_resolved(on_date)
         action_fee = schedule.action_fees.get(projected_action, Decimal("0.00")).quantize(
             TWOPLACES, rounding=ROUND_HALF_UP

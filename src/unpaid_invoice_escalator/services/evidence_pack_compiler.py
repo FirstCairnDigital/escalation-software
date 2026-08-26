@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 from unpaid_invoice_escalator.models import Invoice, Jurisdiction, LedgerEvent
@@ -25,6 +26,7 @@ class EvidenceBundleInput:
     evidence_artifact_inventory: tuple[str, ...] = ()
     compliance_snapshot: tuple[str, ...] = ()
     event_chain_attestation: tuple[str, ...] = ()
+    outstanding_amount_gbp: Decimal | None = None
 
 
 class EvidencePackCompiler:
@@ -50,7 +52,8 @@ class EvidencePackCompiler:
             f"Invoice ID: {invoice.invoice_id}",
             f"Jurisdiction: {invoice.jurisdiction.value}",
             f"Debtor Type: {invoice.debtor_type.value}",
-            f"Principal: {invoice.currency} {invoice.principal_amount}",
+            f"Original Principal: {invoice.currency} {invoice.principal_amount}",
+            f"Current Outstanding Balance: {invoice.currency} {bundle.outstanding_amount_gbp if bundle.outstanding_amount_gbp is not None else invoice.principal_amount}",
             f"Issue Date: {invoice.issue_date.isoformat()}",
             f"Due Date: {invoice.due_date.isoformat()}",
             f"Filing Portal: {filing_portal}",

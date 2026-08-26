@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Iterable
 
 from unpaid_invoice_escalator.models import Actor, EngineDecision, Invoice, InvoiceState
@@ -39,6 +40,7 @@ class EscalationRunner:
         current_state: InvoiceState,
         today: date,
         state_entered_on: date | None = None,
+        outstanding_amount: Decimal | None = None,
         debtor_feedback: str | None = None,
         system_flag: str | None = None,
         insolvency_flag: bool = False,
@@ -53,6 +55,7 @@ class EscalationRunner:
                 current_state=current_state,
                 today=today,
                 state_entered_on=state_entered_on,
+                outstanding_amount=outstanding_amount,
                 debtor_feedback=debtor_feedback,
                 system_flag=system_flag,
                 insolvency_flag=insolvency_flag,
@@ -104,6 +107,7 @@ class EscalationRunner:
         evidence_artifact_inventory: Iterable[str] = (),
         compliance_snapshot: Iterable[str] = (),
         event_chain_attestation: Iterable[str] = (),
+        outstanding_amount_gbp: Decimal | None = None,
     ) -> str:
         bundle = EvidenceBundleInput(
             invoice=invoice,
@@ -121,6 +125,7 @@ class EscalationRunner:
             evidence_artifact_inventory=tuple(evidence_artifact_inventory),
             compliance_snapshot=tuple(compliance_snapshot),
             event_chain_attestation=tuple(event_chain_attestation),
+            outstanding_amount_gbp=outstanding_amount_gbp,
         )
         generated_path = self._evidence_pack_compiler.compile_bundle(bundle, output_path)
         self._ledger.append_event(

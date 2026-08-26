@@ -43,6 +43,7 @@ class LatePaymentEngine:
         is_commercial_transaction: bool,
         contractual_rate: Decimal | None = None,
         base_rate_override: Decimal | None = None,
+        outstanding_amount: Decimal | None = None,
     ) -> LatePaymentCalculationResult:
         pack = self._rule_pack_loader.load_for(invoice.jurisdiction, as_of_date)
         overdue_days = max((as_of_date - invoice.due_date).days, 0)
@@ -90,8 +91,9 @@ class LatePaymentEngine:
             return result
 
         base_rate = base_rate_override if base_rate_override is not None else self._base_rate_provider.rate_for(invoice.due_date)
+        principal = invoice.principal_amount if outstanding_amount is None else outstanding_amount
         breakdown = UKLatePaymentCalculator.calculate(
-            principal=invoice.principal_amount,
+            principal=principal,
             base_rate=base_rate,
             overdue_days=overdue_days,
             contractual_rate=contractual_rate,
@@ -146,4 +148,3 @@ class LatePaymentEngine:
             data_payload=payload,
             timestamp=now,
         )
-

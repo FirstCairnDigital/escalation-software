@@ -75,8 +75,15 @@ Notes:
 - `FCD_DATA_RETENTION_DAYS` sets minimum case age before controlled evidence-file disposal is permitted.
 
 ### Web Interface
-- Open `http://127.0.0.1:8000/` for the in-app operations UI.
-- Open `http://127.0.0.1:8000/ui/invoices/{invoice_id}` for a tabbed invoice workspace.
+- Open `http://127.0.0.1:8000/` for the overview dashboard.
+- Open `http://127.0.0.1:8000/ui/cases` for the dedicated case board.
+- Open `http://127.0.0.1:8000/ui/debtors` for debtor-oriented segmentation and portal review.
+- Open `http://127.0.0.1:8000/ui/creditors` for creditor-facing exposure and formal-stage review.
+- Open `http://127.0.0.1:8000/ui/disputes` for restricted/disputed case review.
+- Open `http://127.0.0.1:8000/ui/operations` for intake and quick actions.
+- Open `http://127.0.0.1:8000/ui/compliance` for audit and compliance review.
+- Open `http://127.0.0.1:8000/ui/reports` for operational reporting cards and queue summaries.
+- Open `http://127.0.0.1:8000/ui/invoices/{invoice_id}` for a focused invoice workspace.
 
 ## Run the CLI
 
@@ -105,7 +112,15 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `GET /deployment/startup-config-validation/report` (admin role when auth enabled)
 - `GET /deployment/runbook` (admin role when auth enabled)
 - `GET /` (Web UI)
-- `GET /ui/invoices/{invoice_id}` (Tabbed invoice workspace)
+- `GET /ui/dashboard`
+- `GET /ui/cases`
+- `GET /ui/debtors`
+- `GET /ui/creditors`
+- `GET /ui/disputes`
+- `GET /ui/operations`
+- `GET /ui/compliance`
+- `GET /ui/reports`
+- `GET /ui/invoices/{invoice_id}` (Focused invoice workspace)
 - `GET /rule-packs/{jurisdiction}/active?on_date=YYYY-MM-DD`
 - `POST /invoices`
 - `GET /invoices/{invoice_id}`

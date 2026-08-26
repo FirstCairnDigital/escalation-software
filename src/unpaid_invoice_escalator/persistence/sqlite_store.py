@@ -18,6 +18,7 @@ from unpaid_invoice_escalator.models import (
     CommunicationDeliveryEvent,
     CommunicationDeliveryState,
     CommunicationRecord,
+    AuditTrailEntry,
     ComplianceLedgerEntry,
     ConfirmationOfPayeeResult,
     DebtorLedgerEntry,
@@ -184,6 +185,20 @@ class SQLiteStore:
                     invoice_id TEXT NOT NULL,
                     timestamp TEXT NOT NULL,
                     event_type TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_trail_entries (
+                    entry_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    actor TEXT NOT NULL,
                     details_json TEXT NOT NULL,
                     FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
                 )
@@ -397,6 +412,12 @@ class SQLiteStore:
             )
             conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_audit_trail_invoice_time
+                ON audit_trail_entries(invoice_id, timestamp)
+                """
+            )
+            conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_artifacts_invoice
                 ON evidence_artifacts(invoice_id)
                 """
@@ -589,6 +610,24 @@ class SQLiteStore:
             )
             conn.execute(
                 """
+                CREATE TRIGGER IF NOT EXISTS trg_audit_trail_entries_no_update
+                BEFORE UPDATE ON audit_trail_entries
+                BEGIN
+                    SELECT RAISE(ABORT, 'audit_trail_entries is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_audit_trail_entries_no_delete
+                BEFORE DELETE ON audit_trail_entries
+                BEGIN
+                    SELECT RAISE(ABORT, 'audit_trail_entries is append-only');
+                END;
+                """
+            )
+            conn.execute(
+                """
                 CREATE TRIGGER IF NOT EXISTS trg_debtor_verification_no_update
                 BEFORE UPDATE ON debtor_verification_cases
                 BEGIN
@@ -690,6 +729,24 @@ class SQLiteStore:
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
+            conn.execute(
+                """
+                INSERT INTO debtor_ledger_entries (
+                    entry_id, invoice_id, timestamp, entry_type, amount_gbp, description,
+                    recovery_cost_category, linked_client_fee_entry_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"{invoice.invoice_id}-principal",
+                    invoice.invoice_id,
+                    datetime.now(timezone.utc).isoformat(),
+                    DebtorLedgerEntryType.ORIGINAL_PRINCIPAL.value,
+                    str(invoice.principal_amount),
+                    "Original invoice principal recorded at invoice creation.",
+                    None,
+                    None,
+                ),
+            )
             conn.commit()
 
     def get_invoice(self, invoice_id: str) -> Invoice | None:
@@ -712,6 +769,29 @@ class SQLiteStore:
             due_date=date.fromisoformat(row["due_date"]),
             jurisdiction=Jurisdiction(row["jurisdiction"]),
             debtor_type=DebtorType(row["debtor_type"]),
+        )
+
+    def list_invoices(self) -> tuple[dict[str, Any], ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT invoice_id, currency, principal_amount, issue_date, due_date, jurisdiction, debtor_type, created_at
+                FROM invoices
+                ORDER BY created_at DESC, invoice_id ASC
+                """
+            ).fetchall()
+        return tuple(
+            {
+                "invoice_id": row["invoice_id"],
+                "currency": row["currency"],
+                "principal_amount": Decimal(row["principal_amount"]),
+                "issue_date": date.fromisoformat(row["issue_date"]),
+                "due_date": date.fromisoformat(row["due_date"]),
+                "jurisdiction": Jurisdiction(row["jurisdiction"]),
+                "debtor_type": DebtorType(row["debtor_type"]),
+                "created_at": datetime.fromisoformat(row["created_at"]),
+            }
+            for row in rows
         )
 
     def append_ledger_event(self, event: LedgerEvent) -> None:
@@ -1069,6 +1149,26 @@ class SQLiteStore:
             )
             conn.commit()
 
+    def append_audit_trail_entry(self, entry: AuditTrailEntry) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_trail_entries (
+                    entry_id, invoice_id, timestamp, category, action, actor, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry.entry_id,
+                    entry.invoice_id,
+                    entry.timestamp.isoformat(),
+                    entry.category,
+                    entry.action,
+                    entry.actor,
+                    json.dumps(entry.details, sort_keys=True, separators=(",", ":"), default=str),
+                ),
+            )
+            conn.commit()
+
     def compliance_entries_for_invoice(self, invoice_id: str) -> tuple[ComplianceLedgerEntry, ...]:
         with self._connection() as conn:
             rows = conn.execute(
@@ -1086,6 +1186,30 @@ class SQLiteStore:
                 invoice_id=row["invoice_id"],
                 timestamp=datetime.fromisoformat(row["timestamp"]),
                 event_type=row["event_type"],
+                details=json.loads(row["details_json"]),
+            )
+            for row in rows
+        )
+
+    def audit_trail_entries_for_invoice(self, invoice_id: str) -> tuple[AuditTrailEntry, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT entry_id, invoice_id, timestamp, category, action, actor, details_json
+                FROM audit_trail_entries
+                WHERE invoice_id = ?
+                ORDER BY timestamp ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            AuditTrailEntry(
+                entry_id=row["entry_id"],
+                invoice_id=row["invoice_id"],
+                timestamp=datetime.fromisoformat(row["timestamp"]),
+                category=row["category"],
+                action=row["action"],
+                actor=row["actor"],
                 details=json.loads(row["details_json"]),
             )
             for row in rows
