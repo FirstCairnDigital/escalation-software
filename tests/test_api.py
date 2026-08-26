@@ -2125,17 +2125,40 @@ class TestApi(unittest.TestCase):
             self.assertIn("genuine", verify_html.text.lower())
             self.assertIn(f"/portal?case={case_id}&code={code}", verify_html.text)
 
+            bank_update_resp = client.post(
+                "/invoices/inv-public-portal/settlement-bank-details",
+                json={
+                    "updated_by": "USER-1",
+                    "account_holder_name": "First Cairn Digital Client Ltd",
+                    "sort_code": "12-34-56",
+                    "account_number": "12345678",
+                    "expected_payee_name": "First Cairn Digital Client Ltd",
+                    "dual_control_approved_by": "ADMIN-1",
+                    "dual_control_approval_reference": "APPROVAL-REF-2",
+                },
+            )
+            self.assertEqual(bank_update_resp.status_code, 200)
+
             portal_html = client.get(f"/portal?case={case_id}&code={code}", headers={"Accept": "text/html"})
             self.assertEqual(portal_html.status_code, 200)
             self.assertIn("Debtor verification portal", portal_html.text)
             self.assertIn("Source of data", portal_html.text)
             self.assertIn("Case status", portal_html.text)
             self.assertIn("Recent recorded portal activity", portal_html.text)
+            self.assertIn("/portal/actions/confirm-payment-date", portal_html.text)
+            self.assertIn("Business Debtline", portal_html.text)
+            self.assertIn(f"/portal/payment-link?case={case_id}&amp;code={code}", portal_html.text)
 
             portal_json = client.get(f"/portal?case={case_id}&code={code}")
             self.assertEqual(portal_json.status_code, 200)
             self.assertEqual(portal_json.json()["outstanding_balance_gbp"], "1500.00")
             self.assertIn("DEBTOR_VERIFICATION_REGISTERED", [item["event_type"] for item in portal_json.json()["recent_activity"]])
+            self.assertTrue(portal_json.json()["settlement_destination_available"])
+
+            payment_link_resp = client.get(f"/portal/payment-link?case={case_id}&code={code}", headers={"Accept": "text/html"})
+            self.assertEqual(payment_link_resp.status_code, 200)
+            self.assertIn("Verified settlement destination", payment_link_resp.text)
+            self.assertIn("does not take payment", payment_link_resp.text)
 
             bundle_resp = client.get(
                 "/invoices/inv-public-portal/evidence-bundle",
@@ -2234,6 +2257,163 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(humane_release_resp.status_code, 200)
             self.assertFalse(humane_release_resp.json()["governance"]["restricted"])
+
+    def test_company_status_pause_and_restricted_note_workflows(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-phase-f.db")
+            app = create_app(db_path=db_path, artifacts_dir=str(Path(tmp_dir) / "artifacts"), bundles_dir=str(Path(tmp_dir) / "bundles"))
+            client = TestClient(app)
+
+            client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-phase-f",
+                    "currency": "GBP",
+                    "principal_amount": "4800",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            client.post(
+                "/invoices/inv-phase-f/case-health-check",
+                json={
+                    "user_id": "USER-9",
+                    "correct_customer_legal_entity": True,
+                    "description_of_goods_or_services": True,
+                    "invoice_number_and_date_verified": True,
+                    "amount_matches_contract_or_quote": True,
+                    "correct_billing_address": True,
+                    "vat_numbers_checked": True,
+                    "purchase_order_supplied_if_required": True,
+                    "payment_terms_and_due_date_established": True,
+                    "delivery_or_acceptance_proof_attached": True,
+                    "no_unresolved_credit_notes": True,
+                    "direct_payments_checked": True,
+                    "no_known_dispute": True,
+                    "creditor_authority_verified": True,
+                    "limitation_period_checked": True,
+                    "debtor_contact_details_verified": True,
+                    "court_handoff_boundary_acknowledged": True,
+                },
+            )
+
+            company_status_resp = client.post(
+                "/invoices/inv-phase-f/company-status-checks",
+                json={
+                    "checked_by": "USER-9",
+                    "company_status": "INSOLVENT",
+                    "source": "COMPANIES_HOUSE",
+                    "company_number": "12345678",
+                    "evidence_summary": "Company register shows insolvency marker.",
+                    "official_register_url": "https://find-and-update.company-information.service.gov.uk/company/12345678",
+                },
+            )
+            self.assertEqual(company_status_resp.status_code, 200)
+            check_id = company_status_resp.json()["check_id"]
+
+            company_status_list = client.get("/invoices/inv-phase-f/company-status-checks")
+            self.assertEqual(company_status_list.status_code, 200)
+            self.assertEqual(company_status_list.json()["latest"]["company_status"], "INSOLVENT")
+
+            viability_resp = client.post(
+                "/invoices/inv-phase-f/viability-proportionality-assessments",
+                json={"on_date": "2026-02-05"},
+            )
+            self.assertEqual(viability_resp.status_code, 200)
+            self.assertEqual(viability_resp.json()["company_status"], "INSOLVENT")
+            self.assertEqual(viability_resp.json()["company_status_source"], "persisted_check")
+            self.assertTrue(viability_resp.json()["blocked"])
+
+            insolvency_open_resp = client.post(
+                "/invoices/inv-phase-f/insolvency-reviews/open",
+                json={
+                    "opened_by": "USER-9",
+                    "source": "COMPANIES_HOUSE",
+                    "reason": "Register indicates insolvency review is required.",
+                    "company_status_check_id": check_id,
+                },
+            )
+            self.assertEqual(insolvency_open_resp.status_code, 200)
+            self.assertTrue(insolvency_open_resp.json()["governance"]["handoff_required"])
+            self.assertIn("INSOLVENCY_REVIEW", insolvency_open_resp.json()["governance"]["restriction_codes"])
+
+            blocked_insolvency_escalate = client.post(
+                "/invoices/inv-phase-f/escalate",
+                json={"today": "2026-02-06", "current_state": "CLIENT_HANDOFF"},
+            )
+            self.assertEqual(blocked_insolvency_escalate.status_code, 409)
+
+            insolvency_release_resp = client.post(
+                "/invoices/inv-phase-f/insolvency-reviews/release",
+                json={
+                    "released_by": "USER-9",
+                    "release_reason": "False positive resolved.",
+                    "resume_state": "OVERDUE_CHASER",
+                },
+            )
+            self.assertEqual(insolvency_release_resp.status_code, 200)
+            self.assertFalse(insolvency_release_resp.json()["governance"]["handoff_required"])
+
+            breathing_open_resp = client.post(
+                "/invoices/inv-phase-f/breathing-space/open",
+                json={
+                    "opened_by": "USER-9",
+                    "source": "DEBT_ADVICE_PROVIDER",
+                    "reason": "Protected breathing space period active.",
+                    "reference": "BS-REF-1",
+                    "start_date": "2026-02-07",
+                    "expected_end_date": "2026-03-07",
+                },
+            )
+            self.assertEqual(breathing_open_resp.status_code, 200)
+            self.assertIn("BREATHING_SPACE", breathing_open_resp.json()["governance"]["restriction_codes"])
+
+            blocked_breathing_escalate = client.post(
+                "/invoices/inv-phase-f/escalate",
+                json={"today": "2026-02-10", "current_state": "BREATHING_SPACE_PAUSE"},
+            )
+            self.assertEqual(blocked_breathing_escalate.status_code, 409)
+
+            breathing_release_resp = client.post(
+                "/invoices/inv-phase-f/breathing-space/release",
+                json={
+                    "released_by": "USER-9",
+                    "release_reason": "Protected period ended.",
+                    "resume_state": "OVERDUE_CHASER",
+                },
+            )
+            self.assertEqual(breathing_release_resp.status_code, 200)
+            self.assertNotIn("BREATHING_SPACE", breathing_release_resp.json()["governance"]["restriction_codes"])
+
+            humane_open_resp = client.post(
+                "/invoices/inv-phase-f/humane-pauses/open",
+                json={
+                    "opened_by": "USER-9",
+                    "concern_type": "VULNERABILITY_NOTICE",
+                    "summary": "Store a summary only in the workflow ledger.",
+                    "notes": "Operator summary for workflow.",
+                    "sensitive_details_present": True,
+                    "sensitive_details": "Detailed sensitive welfare information.",
+                },
+            )
+            self.assertEqual(humane_open_resp.status_code, 200)
+            self.assertIsNotNone(humane_open_resp.json()["restricted_note_id"])
+
+            restricted_notes_resp = client.get("/invoices/inv-phase-f/restricted-notes", params={"viewer_id": "USER-9"})
+            self.assertEqual(restricted_notes_resp.status_code, 200)
+            self.assertEqual(restricted_notes_resp.json()["count"], 1)
+            self.assertEqual(restricted_notes_resp.json()["notes"][0]["related_event_type"], "HUMANE_PAUSE_OPENED")
+
+            governance_resp = client.get("/invoices/inv-phase-f/governance-summary")
+            self.assertEqual(governance_resp.status_code, 200)
+            self.assertEqual(governance_resp.json()["restricted_note_count"], 1)
+            self.assertNotIn("Detailed sensitive welfare information.", str(governance_resp.json()["humane_pause"]["opened"]))
+
+            audit_resp = client.get("/invoices/inv-phase-f/audit-trail")
+            self.assertEqual(audit_resp.status_code, 200)
+            self.assertIn("RESTRICTED_CASE_NOTES_ACCESSED", [entry["action"] for entry in audit_resp.json()["entries"]])
 
     def test_health_and_production_readiness_aliases(self) -> None:
         with TemporaryDirectory() as tmp_dir:

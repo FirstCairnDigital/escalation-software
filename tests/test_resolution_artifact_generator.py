@@ -99,6 +99,41 @@ class TestResolutionArtifactGenerator(unittest.TestCase):
             )
             self.assertTrue(Path(settlement_path).exists())
 
+    def test_generated_artifacts_paginate_when_needed(self) -> None:
+        generator = ResolutionArtifactGenerator()
+        now = datetime.now(timezone.utc)
+        with TemporaryDirectory() as tmp_dir:
+            plan = PaymentPlanAgreement(
+                plan_id="plan-pages",
+                invoice_id="inv-pages",
+                created_at=now,
+                proposed_by="USER-1",
+                installment_amount_gbp=Decimal("10"),
+                installment_count=70,
+                first_due_date=date(2026, 2, 1),
+                frequency_days=7,
+            )
+            installments = tuple(
+                PaymentPlanInstallment(
+                    installment_id=f"i{index}",
+                    plan_id=plan.plan_id,
+                    invoice_id=plan.invoice_id,
+                    due_date=date(2026, 2, 1),
+                    amount_gbp=Decimal("10"),
+                    sequence_number=index,
+                )
+                for index in range(1, 71)
+            )
+            promise_path = Path(
+                generator.generate_promise_to_pay(
+                    agreement=plan,
+                    installments=installments,
+                    payments=(),
+                    output_path=str(Path(tmp_dir) / "promise-pages.pdf"),
+                )
+            )
+            self.assertGreaterEqual(promise_path.read_bytes().count(b"/Type /Page "), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

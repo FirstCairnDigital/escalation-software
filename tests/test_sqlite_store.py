@@ -12,6 +12,7 @@ from unpaid_invoice_escalator.models import (
     AuditTrailEntry,
     BankDetailVerificationState,
     ClientFeeAction,
+    CompanyStatusCheck,
     DebtorLedgerEntry,
     DebtorLedgerEntryType,
     CommunicationDeliveryEvent,
@@ -31,6 +32,7 @@ from unpaid_invoice_escalator.models import (
     ReportedPaymentDecision,
     ReportedPaymentEvidenceLink,
     ReportedPaymentStatus,
+    RestrictedCaseNote,
     SettlementBankDetailRecord,
     SettlementOffer,
     SettlementOfferFinalization,
@@ -707,6 +709,63 @@ class TestSQLiteStore(unittest.TestCase):
                 conn.rollback()
                 with self.assertRaises(sqlite3.DatabaseError):
                     conn.execute("DELETE FROM compliance_ledger_entries")
+                conn.rollback()
+            finally:
+                conn.close()
+
+    def test_company_status_checks_and_restricted_notes_are_append_only(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "escalator-sensitive.db")
+            store = SQLiteStore(db_path)
+            invoice = Invoice(
+                invoice_id="inv-db-sensitive",
+                currency="GBP",
+                principal_amount=Decimal("900"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            checked_at = datetime.now(timezone.utc)
+            store.append_company_status_check(
+                CompanyStatusCheck(
+                    check_id="status-1",
+                    invoice_id=invoice.invoice_id,
+                    checked_at=checked_at,
+                    checked_by="USER-1",
+                    company_status="INSOLVENT",
+                    source="COMPANIES_HOUSE",
+                    evidence_summary="Insolvency status confirmed.",
+                    company_number="12345678",
+                    restrictions_recommended=("INSOLVENCY_REVIEW",),
+                )
+            )
+            store.append_restricted_case_note(
+                RestrictedCaseNote(
+                    note_id="note-1",
+                    invoice_id=invoice.invoice_id,
+                    created_at=checked_at,
+                    created_by="USER-1",
+                    note_category="VULNERABILITY_NOTICE",
+                    summary="Summary only",
+                    sensitive_details="Sensitive welfare detail",
+                    related_event_type="HUMANE_PAUSE_OPENED",
+                )
+            )
+
+            latest_check = store.latest_company_status_check_for_invoice(invoice.invoice_id)
+            self.assertIsNotNone(latest_check)
+            self.assertEqual(latest_check.company_status, "INSOLVENT")
+            self.assertEqual(len(store.restricted_case_notes_for_invoice(invoice.invoice_id)), 1)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("UPDATE company_status_checks SET company_status = 'ACTIVE'")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM restricted_case_notes")
                 conn.rollback()
             finally:
                 conn.close()

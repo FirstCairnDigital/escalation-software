@@ -293,6 +293,8 @@ class TestApiSecurity(unittest.TestCase):
                 self.assertEqual(verify_resp.status_code, 404)
                 portal_resp = client.get("/portal?case=FCD-R-2026-000001&code=ABCDEFGH")
                 self.assertEqual(portal_resp.status_code, 404)
+                payment_link_resp = client.get("/portal/payment-link?case=FCD-R-2026-000001&code=ABCDEFGH")
+                self.assertEqual(payment_link_resp.status_code, 404)
 
     def test_readiness_fails_with_invalid_upload_limit(self) -> None:
         tmp_dir = mkdtemp()

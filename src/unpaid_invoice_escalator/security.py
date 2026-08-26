@@ -54,7 +54,7 @@ class ApiSecurityController:
         self._active_alerts: set[str] = set()
 
     def is_public_path(self, path: str) -> bool:
-        return path in ("/health", "/ready", "/verify", "/portal") or path.startswith("/portal/actions/")
+        return path in ("/health", "/ready", "/verify", "/portal", "/portal/payment-link") or path.startswith("/portal/actions/")
 
     def _required_role(self, *, method: str, path: str) -> str:
         if path == "/metrics" or path.startswith("/deployment/"):

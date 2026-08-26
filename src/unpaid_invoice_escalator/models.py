@@ -434,3 +434,32 @@ class SettlementBankDetailRecord:
     expected_payee_name: str | None = None
     dual_control_approved_by: str | None = None
     mfa_reauthenticated: bool = False
+
+
+@dataclass(frozen=True)
+class CompanyStatusCheck:
+    check_id: str
+    invoice_id: str
+    checked_at: datetime
+    checked_by: str
+    company_status: str
+    source: str
+    evidence_summary: str
+    company_number: str | None = None
+    official_register_url: str | None = None
+    review_due_date: date | None = None
+    notes: str = ""
+    restrictions_recommended: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RestrictedCaseNote:
+    note_id: str
+    invoice_id: str
+    created_at: datetime
+    created_by: str
+    note_category: str
+    summary: str
+    sensitive_details: str
+    related_event_type: str | None = None
+    access_scope: str = "RESTRICTED"

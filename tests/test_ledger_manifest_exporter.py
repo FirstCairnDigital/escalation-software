@@ -85,6 +85,34 @@ class TestLedgerManifestExporter(unittest.TestCase):
             self.assertEqual(verification["signature_key_id"], "legacy-2026q2")
             self.assertEqual(verification["verified_with_key_id"], "legacy-2026q2")
 
+    def test_manifest_pdf_paginates_for_long_event_chains(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "manifest-pages.db")
+            store = SQLiteStore(db_path)
+            ledger = SQLiteInvoiceLedger(store)
+            exporter = LedgerManifestExporter(store=store, signing_key="unit-test-key", key_id="unit-test")
+            invoice = Invoice(
+                invoice_id="inv-man-pages",
+                currency="GBP",
+                principal_amount=Decimal("1200"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            for index in range(90):
+                ledger.append_event(
+                    invoice_id=invoice.invoice_id,
+                    actor=Actor.SYSTEM,
+                    event_type=f"EVENT_{index}",
+                    data_payload={"index": index},
+                )
+
+            pdf_path = Path(tmp_dir) / "manifest.pdf"
+            exporter.export_invoice_manifest_pdf(invoice_id=invoice.invoice_id, output_path=str(pdf_path))
+            self.assertGreaterEqual(pdf_path.read_bytes().count(b"/Type /Page "), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

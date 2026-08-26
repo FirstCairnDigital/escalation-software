@@ -20,6 +20,7 @@ from unpaid_invoice_escalator.models import (
     CommunicationRecord,
     AuditTrailEntry,
     ComplianceLedgerEntry,
+    CompanyStatusCheck,
     ConfirmationOfPayeeResult,
     DebtorLedgerEntry,
     DebtorLedgerEntryType,
@@ -42,6 +43,7 @@ from unpaid_invoice_escalator.models import (
     ReportedPaymentDecision,
     ReportedPaymentEvidenceLink,
     ReportedPaymentStatus,
+    RestrictedCaseNote,
     SettlementBankDetailRecord,
     SettlementAcceptance,
     SettlementOfferFinalization,
@@ -485,6 +487,41 @@ class SQLiteStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS company_status_checks (
+                    check_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    checked_at TEXT NOT NULL,
+                    checked_by TEXT NOT NULL,
+                    company_status TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    evidence_summary TEXT NOT NULL,
+                    company_number TEXT,
+                    official_register_url TEXT,
+                    review_due_date TEXT,
+                    notes TEXT NOT NULL DEFAULT '',
+                    restrictions_recommended_json TEXT NOT NULL DEFAULT '[]',
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS restricted_case_notes (
+                    note_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    note_category TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    sensitive_details TEXT NOT NULL,
+                    related_event_type TEXT,
+                    access_scope TEXT NOT NULL DEFAULT 'RESTRICTED',
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
             hygiene_columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(pre_overdue_hygiene_records)").fetchall()
@@ -581,6 +618,18 @@ class SQLiteStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_bank_details_invoice_time
                 ON settlement_bank_detail_records(invoice_id, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_company_status_checks_invoice_time
+                ON company_status_checks(invoice_id, checked_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_restricted_case_notes_invoice_time
+                ON restricted_case_notes(invoice_id, created_at)
                 """
             )
             conn.execute(
@@ -854,6 +903,8 @@ class SQLiteStore:
                 "settlement_offer_finalizations",
                 "dispute_carve_outs",
                 "settlement_bank_detail_records",
+                "company_status_checks",
+                "restricted_case_notes",
             ):
                 conn.execute(
                     f"""
@@ -2252,3 +2303,146 @@ class SQLiteStore:
         if not records:
             return None
         return records[-1]
+
+    def append_company_status_check(self, check: CompanyStatusCheck) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO company_status_checks (
+                    check_id, invoice_id, checked_at, checked_by, company_status, source,
+                    evidence_summary, company_number, official_register_url, review_due_date,
+                    notes, restrictions_recommended_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    check.check_id,
+                    check.invoice_id,
+                    check.checked_at.isoformat(),
+                    check.checked_by,
+                    check.company_status,
+                    check.source,
+                    check.evidence_summary,
+                    check.company_number,
+                    check.official_register_url,
+                    None if check.review_due_date is None else check.review_due_date.isoformat(),
+                    check.notes,
+                    json.dumps(list(check.restrictions_recommended), separators=(",", ":")),
+                ),
+            )
+            conn.commit()
+
+    def company_status_checks_for_invoice(self, invoice_id: str) -> tuple[CompanyStatusCheck, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT check_id, invoice_id, checked_at, checked_by, company_status, source,
+                       evidence_summary, company_number, official_register_url, review_due_date,
+                       notes, restrictions_recommended_json
+                FROM company_status_checks
+                WHERE invoice_id = ?
+                ORDER BY checked_at ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            CompanyStatusCheck(
+                check_id=row["check_id"],
+                invoice_id=row["invoice_id"],
+                checked_at=datetime.fromisoformat(row["checked_at"]),
+                checked_by=row["checked_by"],
+                company_status=row["company_status"],
+                source=row["source"],
+                evidence_summary=row["evidence_summary"],
+                company_number=row["company_number"],
+                official_register_url=row["official_register_url"],
+                review_due_date=None if row["review_due_date"] is None else date.fromisoformat(row["review_due_date"]),
+                notes=row["notes"],
+                restrictions_recommended=tuple(json.loads(row["restrictions_recommended_json"])),
+            )
+            for row in rows
+        )
+
+    def latest_company_status_check_for_invoice(self, invoice_id: str) -> CompanyStatusCheck | None:
+        checks = self.company_status_checks_for_invoice(invoice_id)
+        if not checks:
+            return None
+        return checks[-1]
+
+    def company_status_check_by_id(self, check_id: str) -> CompanyStatusCheck | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT check_id, invoice_id, checked_at, checked_by, company_status, source,
+                       evidence_summary, company_number, official_register_url, review_due_date,
+                       notes, restrictions_recommended_json
+                FROM company_status_checks
+                WHERE check_id = ?
+                """,
+                (check_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return CompanyStatusCheck(
+            check_id=row["check_id"],
+            invoice_id=row["invoice_id"],
+            checked_at=datetime.fromisoformat(row["checked_at"]),
+            checked_by=row["checked_by"],
+            company_status=row["company_status"],
+            source=row["source"],
+            evidence_summary=row["evidence_summary"],
+            company_number=row["company_number"],
+            official_register_url=row["official_register_url"],
+            review_due_date=None if row["review_due_date"] is None else date.fromisoformat(row["review_due_date"]),
+            notes=row["notes"],
+            restrictions_recommended=tuple(json.loads(row["restrictions_recommended_json"])),
+        )
+
+    def append_restricted_case_note(self, note: RestrictedCaseNote) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO restricted_case_notes (
+                    note_id, invoice_id, created_at, created_by, note_category, summary,
+                    sensitive_details, related_event_type, access_scope
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    note.note_id,
+                    note.invoice_id,
+                    note.created_at.isoformat(),
+                    note.created_by,
+                    note.note_category,
+                    note.summary,
+                    note.sensitive_details,
+                    note.related_event_type,
+                    note.access_scope,
+                ),
+            )
+            conn.commit()
+
+    def restricted_case_notes_for_invoice(self, invoice_id: str) -> tuple[RestrictedCaseNote, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT note_id, invoice_id, created_at, created_by, note_category, summary,
+                       sensitive_details, related_event_type, access_scope
+                FROM restricted_case_notes
+                WHERE invoice_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            RestrictedCaseNote(
+                note_id=row["note_id"],
+                invoice_id=row["invoice_id"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                created_by=row["created_by"],
+                note_category=row["note_category"],
+                summary=row["summary"],
+                sensitive_details=row["sensitive_details"],
+                related_event_type=row["related_event_type"],
+                access_scope=row["access_scope"],
+            )
+            for row in rows
+        )
