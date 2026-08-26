@@ -1985,7 +1985,7 @@ def render_operations_html() -> str:
           <div class="panel-header">
             <div>
               <h3>Payment plan actions</h3>
-              <div class="panel-subtle">Formalise a promise-to-pay schedule and optionally record instalment receipts.</div>
+              <div class="panel-subtle">Formalise a promise-to-pay schedule and report instalment payments for creditor verification.</div>
             </div>
           </div>
           <div class="form-grid">
@@ -2064,6 +2064,36 @@ def render_operations_html() -> str:
           </div>
         </div>
         <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h3>Reported payment review</h3>
+              <div class="panel-subtle">Review debtor-reported payments, request evidence, or confirm matched funds without dropping into raw endpoints.</div>
+            </div>
+          </div>
+          <div class="form-grid">
+            <label class="field">Reported payment<select id="reported-payment-id"></select></label>
+            <label class="field">Creditor user<input id="reported-payment-creditor-user" value="USER-1" /></label>
+            <label class="field">Confirmed amount<input id="reported-payment-confirmed-amount" value="" placeholder="Leave blank to use reported amount" /></label>
+            <label class="field">Reject reason<input id="reported-payment-reject-reason" value="Unable to match to bank statement" /></label>
+            <label class="field" style="grid-column: 1 / -1;">Notes<textarea id="reported-payment-notes">Matched to bank statement.</textarea></label>
+          </div>
+          <div class="inline-actions" style="margin-top: 14px;">
+            <button id="confirm-reported-payment" type="button">Confirm payment</button>
+            <button id="reported-payment-needs-evidence" class="secondary-button" type="button">Request evidence</button>
+            <button id="reject-reported-payment" class="ghost-button" type="button">Reject report</button>
+          </div>
+          <div id="reported-payment-result" class="status-line" style="margin-top: 12px;"></div>
+          <div style="margin-top: 14px;">
+            <h3 style="margin:0 0 10px;">Reported payment queue</h3>
+            <div id="reported-payment-history" class="action-list">
+              <div class="empty-state">No reported payments awaiting review.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="cards-1" style="margin-top: 22px;">
+        <div class="panel">
           <div class="panel-header"><h3>Evidence and guardrails</h3></div>
           <div class="action-list">
             <div class="action-item"><strong>Upload artifacts</strong><span class="list-meta">Contracts, invoices, proof-of-supply, or correspondence.</span></div>
@@ -2124,13 +2154,21 @@ def render_operations_html() -> str:
   function syncPaymentSelectors(plans) {
     const planSelect = document.getElementById("plan-payment-plan-id");
     const installmentSelect = document.getElementById("plan-payment-installment-id");
+    const previousPlanId = planSelect.value;
+    const previousInstallmentId = installmentSelect.value;
     planSelect.innerHTML = plans.length
       ? plans.map((plan) => `<option value="${fcdUi.escape(plan.plan_id)}">${fcdUi.escape(`${plan.plan_id} | ${plan.status}`)}</option>`).join("")
       : "";
+    if (previousPlanId && plans.some((plan) => plan.plan_id === previousPlanId)) {
+      planSelect.value = previousPlanId;
+    }
     const selectedPlan = plans.find((plan) => plan.plan_id === planSelect.value) || plans[0] || null;
     installmentSelect.innerHTML = selectedPlan
       ? (selectedPlan.installments || []).map((item) => `<option value="${fcdUi.escape(item.installment_id)}">${fcdUi.escape(`#${item.sequence_number} | ${item.due_date} | ${item.amount_gbp}`)}</option>`).join("")
       : "";
+    if (selectedPlan && previousInstallmentId && (selectedPlan.installments || []).some((item) => item.installment_id === previousInstallmentId)) {
+      installmentSelect.value = previousInstallmentId;
+    }
     if (selectedPlan && selectedPlan.installment_amount_gbp) {
       document.getElementById("plan-payment-amount").value = selectedPlan.installment_amount_gbp;
     }
@@ -2138,21 +2176,61 @@ def render_operations_html() -> str:
 
   function syncOfferSelectors(offers) {
     const offerSelect = document.getElementById("offer-accept-id");
+    const previousOfferId = offerSelect.value;
     offerSelect.innerHTML = offers.length
       ? offers.map((offer) => `<option value="${fcdUi.escape(offer.offer_id)}">${fcdUi.escape(`${offer.offer_id} | ${offer.status} | ${offer.offered_amount_gbp}`)}</option>`).join("")
       : "";
+    if (previousOfferId && offers.some((offer) => offer.offer_id === previousOfferId)) {
+      offerSelect.value = previousOfferId;
+    }
+  }
+
+  function describeReportedPayment(report) {
+    const linked = report.settlement_offer_id
+      ? ` | settlement ${report.settlement_offer_id}`
+      : report.plan_id
+        ? ` | plan ${report.plan_id}`
+        : "";
+    const when = report.payment_date || String(report.reported_at || "").slice(0, 10);
+    return `${report.status} | ${report.amount_gbp} | ${when}${linked}`;
+  }
+
+  function syncReportedPaymentSelectors(reports) {
+    const reportSelect = document.getElementById("reported-payment-id");
+    const previousValue = reportSelect.value;
+    reportSelect.innerHTML = reports.length
+      ? reports.map((report) => `<option value="${fcdUi.escape(report.report_id)}">${fcdUi.escape(`${report.report_id} | ${describeReportedPayment(report)}`)}</option>`).join("")
+      : "";
+    if (previousValue && reports.some((report) => report.report_id === previousValue)) {
+      reportSelect.value = previousValue;
+    }
+    const selected = reports.find((report) => report.report_id === reportSelect.value) || reports[0] || null;
+    document.getElementById("reported-payment-confirmed-amount").value = selected ? selected.amount_gbp : "";
+  }
+
+  function renderReportedPaymentQueue(reports) {
+    document.getElementById("reported-payment-history").innerHTML = reports.length
+      ? reports.slice().reverse().slice(0, 5).map((report) => `
+          <div class="action-item">
+            <strong>${fcdUi.escape(report.report_id)}</strong>
+            <span class="list-meta">${fcdUi.escape(describeReportedPayment(report))}</span>
+          </div>
+        `).join("")
+      : '<div class="empty-state">No reported payments awaiting review.</div>';
   }
 
   async function refreshResolutionPanels() {
     const invoiceId = currentInvoiceId();
     if (!invoiceId) return;
     try {
-      const [plansPayload, offersPayload] = await Promise.all([
+      const [plansPayload, offersPayload, reportsPayload] = await Promise.all([
         fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/resolution/payment-plans`),
-        fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/resolution/settlement-offers`)
+        fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/resolution/settlement-offers`),
+        fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/reported-payments`)
       ]);
       const plans = plansPayload.plans || [];
       const offers = offersPayload.offers || [];
+      const reports = reportsPayload.reports || [];
       document.getElementById("payment-plan-history").innerHTML = plans.length
         ? plans.slice().reverse().slice(0, 3).map((plan) => `
           <div class="action-item">
@@ -2165,15 +2243,18 @@ def render_operations_html() -> str:
         ? offers.slice().reverse().slice(0, 3).map((offer) => `
           <div class="action-item">
             <strong>${fcdUi.escape(offer.offer_id)}</strong>
-            <span class="list-meta">${fcdUi.escape(`${offer.status} | ${offer.offered_amount_gbp} | expires ${offer.expiry_date}`)}</span>
+            <span class="list-meta">${fcdUi.escape(`${offer.status} | offer ${offer.offered_amount_gbp} | confirmed ${offer.confirmed_payment_total_gbp} | remaining ${offer.remaining_payment_gbp}`)}</span>
           </div>
         `).join("")
         : '<div class="empty-state">No settlement offers recorded yet.</div>';
       syncPaymentSelectors(plans);
       syncOfferSelectors(offers);
+      syncReportedPaymentSelectors(reports);
+      renderReportedPaymentQueue(reports);
     } catch (error) {
       document.getElementById("payment-plan-history").innerHTML = `<div class="empty-state">${fcdUi.escape(error.message)}</div>`;
       document.getElementById("settlement-offer-history").innerHTML = `<div class="empty-state">${fcdUi.escape(error.message)}</div>`;
+      document.getElementById("reported-payment-history").innerHTML = `<div class="empty-state">${fcdUi.escape(error.message)}</div>`;
     }
   }
 
@@ -2288,6 +2369,101 @@ def render_operations_html() -> str:
     }
   }
 
+  function currentReportedPaymentId() {
+    return document.getElementById("reported-payment-id").value;
+  }
+
+  async function confirmReportedPayment() {
+    const invoiceId = currentInvoiceId();
+    const reportId = currentReportedPaymentId();
+    if (!reportId) {
+      document.getElementById("reported-payment-result").textContent = "A reported payment is required.";
+      return;
+    }
+    fcdUi.setStatus("operations-status", "Confirming reported payment...");
+    try {
+      const amount = document.getElementById("reported-payment-confirmed-amount").value.trim();
+      const payload = {
+        creditor_user_id: document.getElementById("reported-payment-creditor-user").value,
+        notes: document.getElementById("reported-payment-notes").value
+      };
+      if (amount) {
+        payload.confirmed_amount_gbp = amount;
+      }
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/reported-payments/${encodeURIComponent(reportId)}/confirm`, "POST", payload);
+      document.getElementById("reported-payment-result").innerHTML = `
+        <div class="kv-list">
+          <div class="kv-row"><label>Report</label><div>${fcdUi.escape(result.report_id)}</div></div>
+          <div class="kv-row"><label>Status</label><div>${fcdUi.escape(result.status)}</div></div>
+          <div class="kv-row"><label>Confirmed amount</label><div>${fcdUi.escape(result.confirmed_amount_gbp)}</div></div>
+          <div class="kv-row"><label>Outstanding</label><div>${fcdUi.escape(result.outstanding_balance_gbp)}</div></div>
+          <div class="kv-row"><label>Settlement status</label><div>${fcdUi.escape(result.settlement_offer_status || "N/A")}</div></div>
+        </div>
+      `;
+      await refreshResolutionPanels();
+      fcdUi.setStatus("operations-status", `Reported payment confirmed for ${result.invoice_id}`);
+    } catch (error) {
+      document.getElementById("reported-payment-result").textContent = error.message;
+      fcdUi.setStatus("operations-status", error.message);
+    }
+  }
+
+  async function markReportedPaymentNeedsEvidence() {
+    const invoiceId = currentInvoiceId();
+    const reportId = currentReportedPaymentId();
+    if (!reportId) {
+      document.getElementById("reported-payment-result").textContent = "A reported payment is required.";
+      return;
+    }
+    fcdUi.setStatus("operations-status", "Requesting payment evidence...");
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/reported-payments/${encodeURIComponent(reportId)}/needs-evidence`, "POST", {
+        creditor_user_id: document.getElementById("reported-payment-creditor-user").value,
+        notes: document.getElementById("reported-payment-notes").value
+      });
+      document.getElementById("reported-payment-result").innerHTML = `
+        <div class="kv-list">
+          <div class="kv-row"><label>Report</label><div>${fcdUi.escape(result.report_id)}</div></div>
+          <div class="kv-row"><label>Status</label><div>${fcdUi.escape(result.status)}</div></div>
+        </div>
+      `;
+      await refreshResolutionPanels();
+      fcdUi.setStatus("operations-status", `Evidence requested for ${result.report_id}`);
+    } catch (error) {
+      document.getElementById("reported-payment-result").textContent = error.message;
+      fcdUi.setStatus("operations-status", error.message);
+    }
+  }
+
+  async function rejectReportedPayment() {
+    const invoiceId = currentInvoiceId();
+    const reportId = currentReportedPaymentId();
+    if (!reportId) {
+      document.getElementById("reported-payment-result").textContent = "A reported payment is required.";
+      return;
+    }
+    fcdUi.setStatus("operations-status", "Rejecting reported payment...");
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/reported-payments/${encodeURIComponent(reportId)}/reject`, "POST", {
+        creditor_user_id: document.getElementById("reported-payment-creditor-user").value,
+        reason: document.getElementById("reported-payment-reject-reason").value,
+        notes: document.getElementById("reported-payment-notes").value
+      });
+      document.getElementById("reported-payment-result").innerHTML = `
+        <div class="kv-list">
+          <div class="kv-row"><label>Report</label><div>${fcdUi.escape(result.report_id)}</div></div>
+          <div class="kv-row"><label>Status</label><div>${fcdUi.escape(result.status)}</div></div>
+          <div class="kv-row"><label>Requires gate re-evaluation</label><div>${fcdUi.escape(String(result.requires_gate_re_evaluation))}</div></div>
+        </div>
+      `;
+      await refreshResolutionPanels();
+      fcdUi.setStatus("operations-status", `Reported payment rejected for ${result.invoice_id}`);
+    } catch (error) {
+      document.getElementById("reported-payment-result").textContent = error.message;
+      fcdUi.setStatus("operations-status", error.message);
+    }
+  }
+
   async function createCase() {
     fcdUi.setStatus("operations-status", "Creating invoice...");
     try {
@@ -2349,7 +2525,11 @@ def render_operations_html() -> str:
   document.getElementById("record-plan-payment").addEventListener("click", recordPlanPayment);
   document.getElementById("create-settlement-offer").addEventListener("click", createSettlementOffer);
   document.getElementById("accept-settlement-offer").addEventListener("click", acceptSettlementOffer);
+  document.getElementById("confirm-reported-payment").addEventListener("click", confirmReportedPayment);
+  document.getElementById("reported-payment-needs-evidence").addEventListener("click", markReportedPaymentNeedsEvidence);
+  document.getElementById("reject-reported-payment").addEventListener("click", rejectReportedPayment);
   document.getElementById("plan-payment-plan-id").addEventListener("change", refreshResolutionPanels);
+  document.getElementById("reported-payment-id").addEventListener("change", refreshResolutionPanels);
   document.getElementById("invoice-id").addEventListener("input", syncActionInvoiceId);
   window.addEventListener("load", syncActionInvoiceId);
 </script>
@@ -2765,6 +2945,33 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
             </div>
             <div id="workspace-acceptance-result" class="status-line" style="margin-top: 12px;"></div>
           </div>
+          <div style="margin-top: 18px;">
+            <h3 style="margin:0 0 10px;">Settlement progress</h3>
+            <div id="workspace-settlement-progress" class="action-list">
+              <div class="empty-state">No settlement offers recorded yet.</div>
+            </div>
+          </div>
+          <div style="margin-top: 18px;">
+            <h3 style="margin:0 0 10px;">Reported payment review</h3>
+            <div class="form-grid">
+              <label class="field">Reported payment<select id="workspace-reported-payment-id"></select></label>
+              <label class="field">Creditor user<input id="workspace-reported-payment-creditor-user" value="USER-1" /></label>
+              <label class="field">Confirmed amount<input id="workspace-reported-payment-confirmed-amount" value="" placeholder="Leave blank to use reported amount" /></label>
+              <label class="field">Reject reason<input id="workspace-reported-payment-reject-reason" value="Unable to match to bank statement" /></label>
+              <label class="field" style="grid-column: 1 / -1;">Notes<textarea id="workspace-reported-payment-notes">Matched to bank statement.</textarea></label>
+            </div>
+            <div class="inline-actions" style="margin-top: 14px;">
+              <button id="workspace-confirm-reported-payment" type="button">Confirm payment</button>
+              <button id="workspace-reported-payment-needs-evidence" class="secondary-button" type="button">Request evidence</button>
+              <button id="workspace-reject-reported-payment" class="ghost-button" type="button">Reject report</button>
+            </div>
+            <div id="workspace-reported-payment-result" class="status-line" style="margin-top: 12px;"></div>
+            <div style="margin-top: 14px;">
+              <div id="workspace-reported-payment-history" class="action-list">
+                <div class="empty-state">No reported payments awaiting review.</div>
+              </div>
+            </div>
+          </div>
           <div style="margin-top: 14px;">
             <h3 style="margin:0 0 10px;">Resolution history</h3>
             <div id="workspace-resolution-history" class="action-list">
@@ -2806,7 +3013,14 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
     script = """
 <script>
   const workspaceInvoiceId = "__INVOICE_ID__";
-  const workspaceState = { plans: [], offers: [], artifacts: [] };
+  const workspaceState = { plans: [], offers: [], reports: [], artifacts: [] };
+
+  function displayWorkflowLabel(label) {
+    const mapping = {
+      PAYMENT_PLAN_PAYMENT_RECORDED: "PAYMENT_PLAN_PAYMENT_RECORDED (legacy pre-verification record)"
+    };
+    return mapping[label] || label;
+  }
 
   function renderWorkspaceMetrics(detail) {
     const cards = [
@@ -2851,12 +3065,62 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
   function syncWorkspaceSelectors() {
     const planSelect = document.getElementById("workspace-plan-id");
     const offerSelect = document.getElementById("workspace-offer-id");
+    const reportSelect = document.getElementById("workspace-reported-payment-id");
+    const previousPlanId = planSelect.value;
+    const previousOfferId = offerSelect.value;
+    const previousReportId = reportSelect.value;
     planSelect.innerHTML = workspaceState.plans.length
       ? workspaceState.plans.map((plan) => `<option value="${fcdUi.escape(plan.plan_id)}">${fcdUi.escape(`${plan.plan_id} | ${plan.status} | ${plan.remaining_amount_gbp}`)}</option>`).join("")
       : "";
     offerSelect.innerHTML = workspaceState.offers.length
       ? workspaceState.offers.map((offer) => `<option value="${fcdUi.escape(offer.offer_id)}">${fcdUi.escape(`${offer.offer_id} | ${offer.status} | ${offer.offered_amount_gbp}`)}</option>`).join("")
       : "";
+    reportSelect.innerHTML = workspaceState.reports.length
+      ? workspaceState.reports.map((report) => `<option value="${fcdUi.escape(report.report_id)}">${fcdUi.escape(`${report.report_id} | ${report.status} | ${report.amount_gbp}`)}</option>`).join("")
+      : "";
+    if (previousPlanId && workspaceState.plans.some((plan) => plan.plan_id === previousPlanId)) {
+      planSelect.value = previousPlanId;
+    }
+    if (previousOfferId && workspaceState.offers.some((offer) => offer.offer_id === previousOfferId)) {
+      offerSelect.value = previousOfferId;
+    }
+    if (previousReportId && workspaceState.reports.some((report) => report.report_id === previousReportId)) {
+      reportSelect.value = previousReportId;
+    }
+    const selectedReport = workspaceState.reports.find((report) => report.report_id === reportSelect.value) || workspaceState.reports[0] || null;
+    document.getElementById("workspace-reported-payment-confirmed-amount").value = selectedReport ? selectedReport.amount_gbp : "";
+  }
+
+  function renderWorkspaceSettlementProgress() {
+    document.getElementById("workspace-settlement-progress").innerHTML = workspaceState.offers.length
+      ? workspaceState.offers.slice().reverse().slice(0, 4).map((offer) => `
+          <div class="action-item">
+            <strong>${fcdUi.escape(offer.offer_id)}</strong>
+            <span class="list-meta">${fcdUi.escape(`${offer.status} | offer ${offer.offered_amount_gbp} | confirmed ${offer.confirmed_payment_total_gbp} | remaining ${offer.remaining_payment_gbp}`)}</span>
+          </div>
+        `).join("")
+      : '<div class="empty-state">No settlement offers recorded yet.</div>';
+  }
+
+  function describeWorkspaceReportedPayment(report) {
+    const linked = report.settlement_offer_id
+      ? ` | settlement ${report.settlement_offer_id}`
+      : report.plan_id
+        ? ` | plan ${report.plan_id}`
+        : "";
+    const when = report.payment_date || String(report.reported_at || "").slice(0, 10);
+    return `${report.status} | ${report.amount_gbp} | ${when}${linked}`;
+  }
+
+  function renderWorkspaceReportedPayments() {
+    document.getElementById("workspace-reported-payment-history").innerHTML = workspaceState.reports.length
+      ? workspaceState.reports.slice().reverse().slice(0, 6).map((report) => `
+          <div class="action-item">
+            <strong>${fcdUi.escape(report.report_id)}</strong>
+            <span class="list-meta">${fcdUi.escape(describeWorkspaceReportedPayment(report))}</span>
+          </div>
+        `).join("")
+      : '<div class="empty-state">No reported payments awaiting review.</div>';
   }
 
   function renderWorkspaceResolutionHistory() {
@@ -2867,7 +3131,11 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
       })),
       ...workspaceState.offers.map((offer) => ({
         label: `Offer ${offer.offer_id}`,
-        meta: `${offer.status} | ${offer.offered_amount_gbp} | expires ${offer.expiry_date}`
+        meta: `${offer.status} | offer ${offer.offered_amount_gbp} | confirmed ${offer.confirmed_payment_total_gbp} | remaining ${offer.remaining_payment_gbp}`
+      })),
+      ...workspaceState.reports.map((report) => ({
+        label: `Reported payment ${report.report_id}`,
+        meta: describeWorkspaceReportedPayment(report)
       }))
     ];
     document.getElementById("workspace-resolution-history").innerHTML = rows.length
@@ -2978,6 +3246,88 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
     }
   }
 
+  async function confirmWorkspaceReportedPayment() {
+    const reportId = document.getElementById("workspace-reported-payment-id").value;
+    if (!reportId) {
+      document.getElementById("workspace-reported-payment-result").textContent = "A reported payment is required.";
+      return;
+    }
+    document.getElementById("workspace-reported-payment-result").textContent = "Confirming reported payment...";
+    try {
+      const amount = document.getElementById("workspace-reported-payment-confirmed-amount").value.trim();
+      const payload = {
+        creditor_user_id: document.getElementById("workspace-reported-payment-creditor-user").value,
+        notes: document.getElementById("workspace-reported-payment-notes").value
+      };
+      if (amount) {
+        payload.confirmed_amount_gbp = amount;
+      }
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/reported-payments/${encodeURIComponent(reportId)}/confirm`, "POST", payload);
+      document.getElementById("workspace-reported-payment-result").innerHTML = `
+        <div class="kv-list">
+          <div class="kv-row"><label>Report</label><div>${fcdUi.escape(result.report_id)}</div></div>
+          <div class="kv-row"><label>Status</label><div>${fcdUi.escape(result.status)}</div></div>
+          <div class="kv-row"><label>Confirmed amount</label><div>${fcdUi.escape(result.confirmed_amount_gbp)}</div></div>
+          <div class="kv-row"><label>Outstanding</label><div>${fcdUi.escape(result.outstanding_balance_gbp)}</div></div>
+          <div class="kv-row"><label>Settlement status</label><div>${fcdUi.escape(result.settlement_offer_status || "N/A")}</div></div>
+        </div>
+      `;
+      await loadWorkspace();
+    } catch (error) {
+      document.getElementById("workspace-reported-payment-result").textContent = error.message;
+    }
+  }
+
+  async function markWorkspaceReportedPaymentNeedsEvidence() {
+    const reportId = document.getElementById("workspace-reported-payment-id").value;
+    if (!reportId) {
+      document.getElementById("workspace-reported-payment-result").textContent = "A reported payment is required.";
+      return;
+    }
+    document.getElementById("workspace-reported-payment-result").textContent = "Requesting payment evidence...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/reported-payments/${encodeURIComponent(reportId)}/needs-evidence`, "POST", {
+        creditor_user_id: document.getElementById("workspace-reported-payment-creditor-user").value,
+        notes: document.getElementById("workspace-reported-payment-notes").value
+      });
+      document.getElementById("workspace-reported-payment-result").innerHTML = `
+        <div class="kv-list">
+          <div class="kv-row"><label>Report</label><div>${fcdUi.escape(result.report_id)}</div></div>
+          <div class="kv-row"><label>Status</label><div>${fcdUi.escape(result.status)}</div></div>
+        </div>
+      `;
+      await loadWorkspace();
+    } catch (error) {
+      document.getElementById("workspace-reported-payment-result").textContent = error.message;
+    }
+  }
+
+  async function rejectWorkspaceReportedPayment() {
+    const reportId = document.getElementById("workspace-reported-payment-id").value;
+    if (!reportId) {
+      document.getElementById("workspace-reported-payment-result").textContent = "A reported payment is required.";
+      return;
+    }
+    document.getElementById("workspace-reported-payment-result").textContent = "Rejecting reported payment...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/reported-payments/${encodeURIComponent(reportId)}/reject`, "POST", {
+        creditor_user_id: document.getElementById("workspace-reported-payment-creditor-user").value,
+        reason: document.getElementById("workspace-reported-payment-reject-reason").value,
+        notes: document.getElementById("workspace-reported-payment-notes").value
+      });
+      document.getElementById("workspace-reported-payment-result").innerHTML = `
+        <div class="kv-list">
+          <div class="kv-row"><label>Report</label><div>${fcdUi.escape(result.report_id)}</div></div>
+          <div class="kv-row"><label>Status</label><div>${fcdUi.escape(result.status)}</div></div>
+          <div class="kv-row"><label>Requires gate re-evaluation</label><div>${fcdUi.escape(String(result.requires_gate_re_evaluation))}</div></div>
+        </div>
+      `;
+      await loadWorkspace();
+    } catch (error) {
+      document.getElementById("workspace-reported-payment-result").textContent = error.message;
+    }
+  }
+
   async function generateManifest() {
     document.getElementById("workspace-manifest-result").textContent = "Generating ledger manifest...";
     try {
@@ -3019,22 +3369,26 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
   }
 
   async function loadWorkspace() {
-    const [detail, communications, compliance, audit, plansPayload, offersPayload, artifactsPayload] = await Promise.all([
+    const [detail, communications, compliance, audit, plansPayload, offersPayload, reportsPayload, artifactsPayload] = await Promise.all([
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/communications`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/compliance-ledger`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/audit-trail`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/resolution/payment-plans`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/resolution/settlement-offers`),
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/reported-payments`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/evidence-artifacts`)
     ]);
     workspaceState.plans = plansPayload.plans || [];
     workspaceState.offers = offersPayload.offers || [];
+    workspaceState.reports = reportsPayload.reports || [];
     workspaceState.artifacts = artifactsPayload.artifacts || [];
     renderWorkspaceMetrics(detail);
     renderWorkspaceSummary(detail);
     syncWorkspaceSelectors();
     syncManifestFilename();
+    renderWorkspaceSettlementProgress();
+    renderWorkspaceReportedPayments();
     renderWorkspaceResolutionHistory();
     renderWorkspaceExportInventory();
     renderLogList("workspace-communications", communications.communications || [], (entry) => `
@@ -3045,19 +3399,19 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
     `);
     renderLogList("workspace-compliance", compliance.entries || [], (entry) => `
       <div class="log-item">
-        <strong>${fcdUi.escape(entry.event_type)}</strong>
+        <strong>${fcdUi.escape(displayWorkflowLabel(entry.event_type))}</strong>
         <span class="list-meta">${fcdUi.escape(entry.timestamp)}</span>
       </div>
     `);
     renderLogList("workspace-audit", audit.entries || [], (entry) => `
       <div class="log-item">
-        <strong>${fcdUi.escape(entry.action)}</strong>
+        <strong>${fcdUi.escape(displayWorkflowLabel(entry.action))}</strong>
         <span class="list-meta">${fcdUi.escape(entry.category)} | ${fcdUi.escape(entry.timestamp)}</span>
       </div>
     `);
     const merged = [
-      ...(audit.entries || []).map((entry) => ({ label: entry.action, when: entry.timestamp, type: "Audit" })),
-      ...(compliance.entries || []).map((entry) => ({ label: entry.event_type, when: entry.timestamp, type: "Compliance" }))
+      ...(audit.entries || []).map((entry) => ({ label: displayWorkflowLabel(entry.action), when: entry.timestamp, type: "Audit" })),
+      ...(compliance.entries || []).map((entry) => ({ label: displayWorkflowLabel(entry.event_type), when: entry.timestamp, type: "Compliance" }))
     ].sort((left, right) => String(right.when).localeCompare(String(left.when)));
     renderLogList("workspace-activity", merged.slice(0, 10), (entry) => `
       <div class="log-item">
@@ -3070,8 +3424,12 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
   document.getElementById("generate-promise-artifact").addEventListener("click", generatePromiseArtifact);
   document.getElementById("generate-settlement-artifact").addEventListener("click", generateSettlementArtifact);
   document.getElementById("workspace-accept-settlement").addEventListener("click", acceptWorkspaceSettlement);
+  document.getElementById("workspace-confirm-reported-payment").addEventListener("click", confirmWorkspaceReportedPayment);
+  document.getElementById("workspace-reported-payment-needs-evidence").addEventListener("click", markWorkspaceReportedPaymentNeedsEvidence);
+  document.getElementById("workspace-reject-reported-payment").addEventListener("click", rejectWorkspaceReportedPayment);
   document.getElementById("generate-manifest").addEventListener("click", generateManifest);
   document.getElementById("verify-manifest").addEventListener("click", verifyManifest);
+  document.getElementById("workspace-reported-payment-id").addEventListener("change", loadWorkspace);
   document.getElementById("workspace-manifest-format").addEventListener("change", syncManifestFilename);
   window.addEventListener("load", loadWorkspace);
 </script>

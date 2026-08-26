@@ -258,6 +258,24 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 - Data-retention disposal is blocked when a case-level retention legal hold is open; holds are opened/released via dedicated endpoints with immutable audit entries.
 - Evidence bundle generation can include resolution artifacts via `include_resolution_artifacts=true`.
 
+## SQLite Upgrade / Rollout Notes
+- [sqlite_store.py](C:/Dev/P26003-escalation-software.worktrees/code-inspection-report/src/unpaid_invoice_escalator/persistence/sqlite_store.py) remains the schema authority and automatically creates the new payment-verification and settlement-finalization tables on startup.
+- Existing SQLite databases are upgraded in place by adding any missing resolution columns, including:
+  - `reported_payments.plan_id`
+  - `reported_payments.installment_id`
+  - `reported_payments.settlement_offer_id`
+  - `payment_plan_agreements.proposer_role`
+  - `payment_plan_agreements.parent_plan_id`
+  - `payment_plan_agreements.version_number`
+  - `payment_plan_payments.reported_payment_id`
+- Historical records are not rewritten. Legacy events remain visible as historical artifacts and should be reviewed in context during rollout validation.
+- Recommended rollout check:
+  1. start the app against a copy of the target SQLite database
+  2. confirm `/health` and `/ready`
+  3. open [ui.py](C:/Dev/P26003-escalation-software.worktrees/code-inspection-report/src/unpaid_invoice_escalator/ui.py) operations/workspace pages
+  4. verify reported-payment review and settlement-progress controls render
+  5. verify one non-production payment-verification flow before promoting the upgraded database
+
 ## Viability & Proportionality
 - Viability assessments combine projected FCD action fee, projected court fee, and estimated time-cost against current outstanding amount.
 - Escalation calls include `viability_assessment` and block when the supplied company status indicates financial distress (`INSOLVENT`, `DISSOLVED`, `IN_ADMINISTRATION`, `CEASED`).

@@ -348,6 +348,88 @@ class TestSQLiteStore(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_init_schema_upgrades_legacy_resolution_tables(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "legacy-resolution.db")
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE reported_payments (
+                        report_id TEXT PRIMARY KEY,
+                        invoice_id TEXT NOT NULL,
+                        case_id TEXT NOT NULL,
+                        debtor_identifier TEXT NOT NULL,
+                        reported_at TEXT NOT NULL,
+                        amount_gbp TEXT NOT NULL,
+                        payment_reference TEXT NOT NULL DEFAULT '',
+                        payment_date TEXT,
+                        details TEXT NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE payment_plan_agreements (
+                        plan_id TEXT PRIMARY KEY,
+                        invoice_id TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        proposed_by TEXT NOT NULL,
+                        installment_amount_gbp TEXT NOT NULL,
+                        installment_count INTEGER NOT NULL,
+                        first_due_date TEXT NOT NULL,
+                        frequency_days INTEGER NOT NULL,
+                        notes TEXT NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE payment_plan_payments (
+                        payment_id TEXT PRIMARY KEY,
+                        plan_id TEXT NOT NULL,
+                        installment_id TEXT NOT NULL,
+                        invoice_id TEXT NOT NULL,
+                        paid_at TEXT NOT NULL,
+                        amount_gbp TEXT NOT NULL,
+                        recorded_by TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO reported_payments (
+                        report_id, invoice_id, case_id, debtor_identifier, reported_at, amount_gbp, payment_reference, payment_date, details
+                    ) VALUES ('legacy-report', 'inv-legacy', 'FCD-R-LEGACY', 'legacy@example.com', '2026-02-10T10:00:00+00:00', '100.00', 'LEG-1', '2026-02-10', 'legacy row')
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            store = SQLiteStore(db_path)
+            upgraded_report = store.reported_payment_by_id("legacy-report")
+            self.assertIsNotNone(upgraded_report)
+            self.assertIsNone(upgraded_report.settlement_offer_id)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                reported_columns = {row[1] for row in conn.execute("PRAGMA table_info(reported_payments)").fetchall()}
+                plan_columns = {row[1] for row in conn.execute("PRAGMA table_info(payment_plan_agreements)").fetchall()}
+                payment_columns = {row[1] for row in conn.execute("PRAGMA table_info(payment_plan_payments)").fetchall()}
+                tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+            finally:
+                conn.close()
+
+            self.assertIn("settlement_offer_id", reported_columns)
+            self.assertIn("plan_id", reported_columns)
+            self.assertIn("installment_id", reported_columns)
+            self.assertIn("proposer_role", plan_columns)
+            self.assertIn("parent_plan_id", plan_columns)
+            self.assertIn("version_number", plan_columns)
+            self.assertIn("reported_payment_id", payment_columns)
+            self.assertIn("settlement_offer_finalizations", tables)
+
     def test_payment_plan_tables_are_append_only(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "escalator.db")
