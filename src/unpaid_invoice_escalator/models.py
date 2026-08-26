@@ -29,6 +29,7 @@ class Actor(str, Enum):
 class ArtifactType(str, Enum):
     CONTRACT = "CONTRACT"
     PROOF_OF_DELIVERY = "PROOF_OF_DELIVERY"
+    PAYMENT_EVIDENCE = "PAYMENT_EVIDENCE"
     PRE_ACTION_NOTICE = "PRE_ACTION_NOTICE"
     PROMISE_TO_PAY = "PROMISE_TO_PAY"
     FULL_AND_FINAL_SETTLEMENT = "FULL_AND_FINAL_SETTLEMENT"
@@ -246,6 +247,61 @@ class DebtorVerificationCase:
     created_at: datetime
 
 
+class ReportedPaymentStatus(str, Enum):
+    PAYMENT_VERIFICATION_PENDING = "PAYMENT_VERIFICATION_PENDING"
+    NEEDS_EVIDENCE = "NEEDS_EVIDENCE"
+    PAYMENT_CONFIRMED_BY_CREDITOR = "PAYMENT_CONFIRMED_BY_CREDITOR"
+    PAYMENT_NOT_VERIFIED = "PAYMENT_NOT_VERIFIED"
+
+
+@dataclass(frozen=True)
+class ReportedPayment:
+    report_id: str
+    invoice_id: str
+    case_id: str
+    debtor_identifier: str
+    reported_at: datetime
+    amount_gbp: Decimal
+    payment_reference: str = ""
+    payment_date: date | None = None
+    details: str = ""
+    plan_id: str | None = None
+    installment_id: str | None = None
+    settlement_offer_id: str | None = None
+
+
+class PaymentPlanDecisionStatus(str, Enum):
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    WITHDRAWN = "WITHDRAWN"
+    EXPIRED = "EXPIRED"
+    ACTIVATED = "ACTIVATED"
+
+
+@dataclass(frozen=True)
+class ReportedPaymentDecision:
+    decision_id: str
+    report_id: str
+    invoice_id: str
+    decided_at: datetime
+    decided_by: str
+    status: ReportedPaymentStatus
+    reason: str = ""
+    notes: str = ""
+    confirmed_amount_gbp: Decimal | None = None
+    linked_debtor_entry_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ReportedPaymentEvidenceLink:
+    link_id: str
+    report_id: str
+    invoice_id: str
+    document_id: str
+    linked_at: datetime
+    linked_by: str
+
+
 @dataclass(frozen=True)
 class PaymentPlanAgreement:
     plan_id: str
@@ -257,6 +313,9 @@ class PaymentPlanAgreement:
     first_due_date: date
     frequency_days: int
     notes: str = ""
+    proposer_role: str = "CREDITOR"
+    parent_plan_id: str | None = None
+    version_number: int = 1
 
 
 @dataclass(frozen=True)
@@ -278,6 +337,19 @@ class PaymentPlanPayment:
     paid_at: datetime
     amount_gbp: Decimal
     recorded_by: str
+    reported_payment_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PaymentPlanDecision:
+    decision_id: str
+    plan_id: str
+    invoice_id: str
+    decided_at: datetime
+    decided_by: str
+    actor_role: str
+    status: PaymentPlanDecisionStatus
+    notes: str = ""
 
 
 @dataclass(frozen=True)
@@ -299,6 +371,19 @@ class SettlementAcceptance:
     accepted_at: datetime
     accepted_by: str
     accepter_role: str
+
+
+@dataclass(frozen=True)
+class SettlementOfferFinalization:
+    finalization_id: str
+    offer_id: str
+    invoice_id: str
+    finalized_at: datetime
+    finalized_by: str
+    triggering_report_id: str | None
+    confirmed_payment_total_gbp: Decimal
+    outstanding_before_gbp: Decimal
+    settlement_discount_applied_gbp: Decimal
 
 
 @dataclass(frozen=True)

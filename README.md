@@ -243,15 +243,16 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
   - `upload_rejections_by_reason`
 
 ## Resolution & Settlement Controls
-- Payment plans are append-only records with generated installment schedules and immutable payment records.
-- While a payment plan is `ACTIVE`, escalation is blocked and chasers remain paused.
-- If a plan defaults, escalation resumes from `OVERDUE_CHASER` (Level 2 equivalent flow).
-- Settlement offers are finalized only after both debtor and creditor accept.
+- Payment plans are append-only proposal records with generated installment schedules, append-only decision history, and immutable confirmed-payment records.
+- Payment-plan proposals remain `PROPOSED` until the counterparty accepts; only then does the plan become `ACTIVE` and pause chasers.
+- Installment payments are reported for creditor verification first; debtor assertions do not post directly to the debtor ledger.
+- While a payment plan is `ACTIVE`, escalation is blocked and chasers remain paused; if it later defaults, escalation is re-evaluated from the live workflow state rather than forcing a hard-coded resume state.
+- Settlement offers move to `AWAITING_PAYMENT` after bilateral acceptance and only become `FINALIZED` after linked payment is creditor-confirmed.
 - Promise-to-Pay and Full & Final Settlement artifacts can be generated as tamper-evident PDF records.
 - Dispute carve-outs isolate disputed amounts from the immediately pursued undisputed balance.
 - Debtor portal verification view returns neutral resolution options and independent advice links messaging.
 - Debtor portal actions are executable workflows for dispute intake, questions, promised payment-date confirmations, data accuracy challenges, payment plan proposals, settlement offers, and payment reporting.
-- Escalation is blocked while an open debtor dispute exists or while a confirmed debtor payment date remains in the future.
+- Escalation is blocked while an open debtor dispute exists, while a creditor-confirmation payment check remains open, while a confirmed debtor payment date remains in the future, or while a bilaterally accepted settlement is still awaiting payment.
 - Settlement bank detail updates require MFA re-authentication or dual-control approval and are CoP-scored (`EXACT_MATCH`, `CLOSE_MATCH`, `NO_MATCH`).
 - Debtor portal hides settlement destination and payment links when CoP state is `COP_UNVERIFIED` or `COP_FAILED`.
 - Data-retention disposal is blocked when a case-level retention legal hold is open; holds are opened/released via dedicated endpoints with immutable audit entries.

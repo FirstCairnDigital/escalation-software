@@ -30,6 +30,10 @@ from unpaid_invoice_escalator.models import (
     InvoiceState,
     Jurisdiction,
     LegalHoldType,
+    ReportedPayment,
+    ReportedPaymentDecision,
+    ReportedPaymentEvidenceLink,
+    ReportedPaymentStatus,
     RecoveryCostCategory,
     RetentionVariant,
     SettlementBankDetailRecord,
@@ -254,6 +258,38 @@ class PaymentPlanPaymentRequest(BaseModel):
     recorded_by: str
 
 
+class PaymentPlanAcceptRequest(BaseModel):
+    accepted_by: str
+    accepter_role: Literal["DEBTOR", "CREDITOR"]
+
+
+class PaymentPlanRejectRequest(BaseModel):
+    rejected_by: str
+    rejecter_role: Literal["DEBTOR", "CREDITOR"]
+    notes: str = ""
+
+
+class PaymentPlanWithdrawRequest(BaseModel):
+    withdrawn_by: str
+    withdrawer_role: Literal["DEBTOR", "CREDITOR"]
+    notes: str = ""
+
+
+class PaymentPlanExpireRequest(BaseModel):
+    expired_by: str = "SYSTEM"
+    notes: str = ""
+
+
+class PaymentPlanCounterOfferRequest(BaseModel):
+    proposed_by: str
+    proposer_role: Literal["DEBTOR", "CREDITOR"]
+    installment_amount_gbp: Decimal
+    installment_count: int
+    first_due_date: date
+    frequency_days: int = 30
+    notes: str = ""
+
+
 class SettlementOfferRequest(BaseModel):
     offered_by: str
     offered_amount_gbp: Decimal
@@ -343,6 +379,26 @@ class PortalPaymentReportedActionRequest(BaseModel):
     debtor_identifier: str
     amount_gbp: Decimal
     payment_reference: str = ""
+    payment_date: date | None = None
+    details: str = ""
+    settlement_offer_id: str | None = None
+
+
+class ReportedPaymentConfirmRequest(BaseModel):
+    creditor_user_id: str
+    confirmed_amount_gbp: Decimal | None = None
+    notes: str = ""
+
+
+class ReportedPaymentRejectRequest(BaseModel):
+    creditor_user_id: str
+    reason: str
+    notes: str = ""
+
+
+class ReportedPaymentNeedsEvidenceRequest(BaseModel):
+    creditor_user_id: str
+    notes: str
 
 
 class PortalDisputeActionRequest(BaseModel):
@@ -840,16 +896,26 @@ def create_app(
             "trg_audit_trail_entries_no_delete",
             "trg_debtor_verification_no_update",
             "trg_debtor_verification_no_delete",
+            "trg_reported_payments_no_update",
+            "trg_reported_payments_no_delete",
+            "trg_reported_payment_decisions_no_update",
+            "trg_reported_payment_decisions_no_delete",
+            "trg_reported_payment_evidence_links_no_update",
+            "trg_reported_payment_evidence_links_no_delete",
             "trg_payment_plan_agreements_no_update",
             "trg_payment_plan_agreements_no_delete",
             "trg_payment_plan_installments_no_update",
             "trg_payment_plan_installments_no_delete",
             "trg_payment_plan_payments_no_update",
             "trg_payment_plan_payments_no_delete",
+            "trg_payment_plan_decisions_no_update",
+            "trg_payment_plan_decisions_no_delete",
             "trg_settlement_offers_no_update",
             "trg_settlement_offers_no_delete",
             "trg_settlement_acceptances_no_update",
             "trg_settlement_acceptances_no_delete",
+            "trg_settlement_offer_finalizations_no_update",
+            "trg_settlement_offer_finalizations_no_delete",
             "trg_dispute_carve_outs_no_update",
             "trg_dispute_carve_outs_no_delete",
             "trg_settlement_bank_detail_records_no_update",
@@ -1016,6 +1082,22 @@ def create_app(
                 return plan.plan_id, status.status
         return None, None
 
+    def _awaiting_settlement_offer(invoice_id: str, as_of_date: date) -> tuple[str | None, dict[str, object] | None]:
+        offers = store.settlement_offers_for_invoice(invoice_id)
+        for offer in reversed(offers):
+            status = resolution_engine.settlement_offer_status(offer_id=offer.offer_id, as_of_date=as_of_date)
+            if status.status == "AWAITING_PAYMENT":
+                return (
+                    offer.offer_id,
+                    {
+                        "status": status.status,
+                        "accepted_roles": list(status.accepted_roles),
+                        "confirmed_payment_total_gbp": str(status.confirmed_payment_total_gbp),
+                        "remaining_payment_gbp": str(status.remaining_payment_gbp),
+                    },
+                )
+        return None, None
+
     def _has_unresolved_delivery_failure(invoice_id: str) -> bool:
         failed_states = {
             CommunicationDeliveryState.BOUNCED,
@@ -1046,6 +1128,57 @@ def create_app(
         if verification_case is None:
             raise HTTPException(status_code=404, detail="Verification case record not found.")
         return verification_case, result
+
+    def _current_reported_payment_status(report_id: str) -> ReportedPaymentStatus:
+        decisions = store.reported_payment_decisions_for_report(report_id)
+        if not decisions:
+            return ReportedPaymentStatus.PAYMENT_VERIFICATION_PENDING
+        return decisions[-1].status
+
+    def _payment_verification_pending_is_open(invoice_id: str) -> bool:
+        blocking_statuses = {
+            ReportedPaymentStatus.PAYMENT_VERIFICATION_PENDING,
+            ReportedPaymentStatus.NEEDS_EVIDENCE,
+        }
+        for report in reversed(store.reported_payments_for_invoice(invoice_id)):
+            if _current_reported_payment_status(report.report_id) in blocking_statuses:
+                return True
+        return False
+
+    def _reported_payment_detail(report: ReportedPayment) -> dict[str, object]:
+        decisions = store.reported_payment_decisions_for_report(report.report_id)
+        evidence_links = store.reported_payment_evidence_links_for_report(report.report_id)
+        return {
+            "report_id": report.report_id,
+            "invoice_id": report.invoice_id,
+            "case_id": report.case_id,
+            "debtor_identifier": report.debtor_identifier,
+            "reported_at": report.reported_at.isoformat(),
+            "amount_gbp": str(report.amount_gbp),
+            "payment_reference": report.payment_reference,
+            "payment_date": None if report.payment_date is None else report.payment_date.isoformat(),
+            "details": report.details,
+            "plan_id": report.plan_id,
+            "installment_id": report.installment_id,
+            "settlement_offer_id": report.settlement_offer_id,
+            "status": _current_reported_payment_status(report.report_id).value,
+            "evidence_document_ids": [link.document_id for link in evidence_links],
+            "decisions": [
+                {
+                    "decision_id": decision.decision_id,
+                    "decided_at": decision.decided_at.isoformat(),
+                    "decided_by": decision.decided_by,
+                    "status": decision.status.value,
+                    "reason": decision.reason,
+                    "notes": decision.notes,
+                    "confirmed_amount_gbp": (
+                        None if decision.confirmed_amount_gbp is None else str(decision.confirmed_amount_gbp)
+                    ),
+                    "linked_debtor_entry_id": decision.linked_debtor_entry_id,
+                }
+                for decision in decisions
+            ],
+        }
 
     def _open_data_accuracy_challenge(
         *,
@@ -1123,6 +1256,155 @@ def create_app(
                 },
             )
         return cancelled_communications
+
+    def _pause_pending_automated_communications_for_reported_payment(
+        *,
+        invoice_id: str,
+        report_id: str,
+    ) -> list[str]:
+        cancelled_communications: list[str] = []
+        for snapshot in communication_delivery_tracker.snapshots_for_invoice(invoice_id):
+            if not snapshot.communication.automated:
+                continue
+            if snapshot.latest_state not in {CommunicationDeliveryState.CREATED, CommunicationDeliveryState.QUEUED}:
+                continue
+            try:
+                communication_delivery_tracker.record_delivery_event(
+                    invoice_id=invoice_id,
+                    communication_id=snapshot.communication.communication_id,
+                    next_state=CommunicationDeliveryState.CANCELLED,
+                    note="Cancelled automatically while creditor verifies debtor-reported payment.",
+                )
+                cancelled_communications.append(snapshot.communication.communication_id)
+            except ValueError:
+                continue
+        if cancelled_communications:
+            now = datetime.now(timezone.utc)
+            details = {
+                "report_id": report_id,
+                "cancelled_communication_ids": cancelled_communications,
+            }
+            store.append_compliance_entry(
+                ComplianceLedgerEntry(
+                    entry_id=str(uuid4()),
+                    invoice_id=invoice_id,
+                    timestamp=now,
+                    event_type="PENDING_COMMUNICATIONS_CANCELLED_ON_PAYMENT_VERIFICATION_PENDING",
+                    details=details,
+                )
+            )
+            ledger.append_event(
+                invoice_id=invoice_id,
+                actor=Actor.SYSTEM,
+                event_type="PENDING_COMMUNICATIONS_CANCELLED_ON_PAYMENT_VERIFICATION_PENDING",
+                timestamp=now,
+                data_payload=details,
+            )
+        return cancelled_communications
+
+    async def _store_uploaded_artifact(
+        *,
+        invoice_id: str,
+        user_id: str,
+        artifact_type: ArtifactType,
+        file: UploadFile,
+    ) -> EvidenceArtifact:
+        invoice_dir = artifacts_root / invoice_id
+        invoice_dir.mkdir(parents=True, exist_ok=True)
+        original_filename = Path(file.filename or "").name
+        content = await file.read()
+
+        def quarantine_and_raise(*, status_code: int, reason: str) -> None:
+            quarantine_id = str(uuid4())
+            quarantine_invoice_dir = quarantine_root / invoice_id
+            quarantine_invoice_dir.mkdir(parents=True, exist_ok=True)
+            fallback_name = "unknown.bin" if not original_filename else original_filename
+            quarantine_name = f"{quarantine_id}_{Path(fallback_name).name}"
+            quarantine_path = quarantine_invoice_dir / quarantine_name
+            metadata_path = quarantine_invoice_dir / f"{quarantine_id}.json"
+            try:
+                quarantine_path.write_bytes(content)
+                metadata_path.write_text(
+                    json.dumps(
+                        {
+                            "quarantine_id": quarantine_id,
+                            "invoice_id": invoice_id,
+                            "reason": reason,
+                            "filename": fallback_name,
+                            "content_type": (file.content_type or "").strip(),
+                            "size_bytes": len(content),
+                        },
+                        ensure_ascii=True,
+                    ),
+                    encoding="utf-8",
+                )
+                ledger.append_event(
+                    invoice_id=invoice_id,
+                    actor=Actor.SYSTEM,
+                    event_type="EVIDENCE_UPLOAD_QUARANTINED",
+                    data_payload={
+                        "quarantine_id": quarantine_id,
+                        "reason": reason,
+                        "filename": fallback_name,
+                        "content_type": (file.content_type or "").strip(),
+                        "size_bytes": len(content),
+                        "quarantine_path": str(quarantine_path),
+                    },
+                )
+                security.record_upload_rejection(reason=reason, quarantined=True)
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=f"{reason} Quarantine reference: {quarantine_id}",
+                )
+            except OSError as exc:
+                security.record_upload_rejection(reason=reason, quarantined=False)
+                ledger.append_event(
+                    invoice_id=invoice_id,
+                    actor=Actor.SYSTEM,
+                    event_type="EVIDENCE_UPLOAD_REJECTED",
+                    data_payload={
+                        "reason": reason,
+                        "filename": fallback_name,
+                        "content_type": (file.content_type or "").strip(),
+                        "size_bytes": len(content),
+                        "quarantine_error": str(exc),
+                    },
+                )
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=f"{reason} Upload rejected and quarantine storage failed.",
+                )
+
+        if not original_filename or not SAFE_UPLOAD_FILENAME_RE.match(original_filename):
+            quarantine_and_raise(status_code=400, reason="Filename violates upload naming policy.")
+
+        extension = Path(original_filename).suffix.lower()
+        if extension not in allowed_upload_extension_set:
+            quarantine_and_raise(
+                status_code=415,
+                reason=("Unsupported file extension. Allowed extensions: " + ", ".join(effective_allowed_upload_extensions)),
+            )
+
+        if len(content) > effective_max_upload_bytes:
+            quarantine_and_raise(
+                status_code=413,
+                reason=f"Uploaded file exceeds max allowed size ({effective_max_upload_bytes} bytes).",
+            )
+        content_type = (file.content_type or "").strip().lower()
+        if content_type not in allowed_upload_content_type_set:
+            quarantine_and_raise(
+                status_code=415,
+                reason=("Unsupported file content type. Allowed types: " + ", ".join(effective_allowed_upload_content_types)),
+            )
+        output_name = f"{uuid4()}_{original_filename}"
+        output_path = invoice_dir / output_name
+        output_path.write_bytes(content)
+        return ledger.record_evidence_artifact(
+            invoice_id=invoice_id,
+            file_path=str(output_path),
+            user_id=user_id,
+            artifact_type=artifact_type,
+        )
 
     def _record_audit_trail(invoice_id: str, *, category: str, action: str, actor: str, details: dict[str, object]) -> None:
         store.append_audit_trail_entry(
@@ -1437,6 +1719,7 @@ def create_app(
             plan, installments = resolution_engine.propose_payment_plan(
                 invoice_id=verification_case.invoice_id,
                 proposed_by=f"DEBTOR_PORTAL:{payload.debtor_identifier}",
+                proposer_role="DEBTOR",
                 installment_amount_gbp=payload.installment_amount_gbp,
                 installment_count=payload.installment_count,
                 first_due_date=payload.first_due_date,
@@ -1458,6 +1741,8 @@ def create_app(
                     "installment_amount_gbp": str(plan.installment_amount_gbp),
                     "installment_count": plan.installment_count,
                     "first_due_date": plan.first_due_date.isoformat(),
+                    "proposer_role": plan.proposer_role,
+                    "version_number": plan.version_number,
                 },
             )
         )
@@ -1472,7 +1757,8 @@ def create_app(
             "invoice_id": verification_case.invoice_id,
             "case_id": verification_case.case_id,
             "plan_id": plan.plan_id,
-            "status": "ACTIVE",
+            "version_number": plan.version_number,
+            "status": "PROPOSED",
             "installments": [
                 {
                     "installment_id": item.installment_id,
@@ -1482,6 +1768,7 @@ def create_app(
                 }
                 for item in installments
             ],
+            "chasers_paused": False,
         }
 
     @app.post("/portal/actions/settlement-offers")
@@ -1532,31 +1819,67 @@ def create_app(
     def portal_confirm_paid(payload: PortalPaymentReportedActionRequest) -> dict[str, object]:
         verification_case, _ = _resolve_verified_portal_case(case=payload.case, code=payload.code)
         amount = abs(payload.amount_gbp)
-        entry = dual_ledger_engine.add_debtor_entry(
-            invoice_id=verification_case.invoice_id,
-            entry_type=DebtorLedgerEntryType.PAYMENT_RECEIVED,
-            amount_gbp=-amount,
-            description=(
-                "Debtor self-reported payment via portal."
-                + (f" Reference: {payload.payment_reference}" if payload.payment_reference else "")
-            ),
-        )
-        cancelled = _cancel_pending_automated_communications(
-            invoice_id=verification_case.invoice_id,
-            trigger_entry_type=DebtorLedgerEntryType.PAYMENT_RECEIVED,
-        )
+        settlement_offer_id = None if payload.settlement_offer_id is None else payload.settlement_offer_id.strip()
+        if settlement_offer_id:
+            offer = store.settlement_offer_by_id(settlement_offer_id)
+            if offer is None or offer.invoice_id != verification_case.invoice_id:
+                raise HTTPException(status_code=404, detail="Settlement offer not found for portal payment report.")
+            offer_status = resolution_engine.settlement_offer_status(
+                offer_id=settlement_offer_id,
+                as_of_date=payload.payment_date or date.today(),
+            )
+            if offer_status.status != "AWAITING_PAYMENT":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Settlement payment can only be reported against a bilaterally accepted offer awaiting payment.",
+                )
         now = datetime.now(timezone.utc)
+        report = ReportedPayment(
+            report_id=str(uuid4()),
+            invoice_id=verification_case.invoice_id,
+            case_id=verification_case.case_id,
+            debtor_identifier=payload.debtor_identifier,
+            reported_at=now,
+            amount_gbp=amount,
+            payment_reference=payload.payment_reference,
+            payment_date=payload.payment_date,
+            details=payload.details,
+            settlement_offer_id=settlement_offer_id,
+        )
+        store.append_reported_payment(report)
+        cancelled = _pause_pending_automated_communications_for_reported_payment(
+            invoice_id=verification_case.invoice_id,
+            report_id=report.report_id,
+        )
         store.append_compliance_entry(
             ComplianceLedgerEntry(
                 entry_id=str(uuid4()),
                 invoice_id=verification_case.invoice_id,
                 timestamp=now,
-                event_type="PORTAL_PAYMENT_REPORTED",
+                event_type="DEBTOR_PAYMENT_REPORTED",
                 details={
+                    "report_id": report.report_id,
+                    "case_id": verification_case.case_id,
                     "debtor_identifier": payload.debtor_identifier,
-                    "entry_id": entry.entry_id,
                     "amount_gbp": str(amount),
                     "payment_reference": payload.payment_reference,
+                    "payment_date": None if payload.payment_date is None else payload.payment_date.isoformat(),
+                    "details": payload.details,
+                    "settlement_offer_id": settlement_offer_id,
+                    "cancelled_communication_ids": cancelled,
+                },
+            )
+        )
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=verification_case.invoice_id,
+                timestamp=now,
+                event_type="PAYMENT_VERIFICATION_PENDING",
+                details={
+                    "report_id": report.report_id,
+                    "case_id": verification_case.case_id,
+                    "status": ReportedPaymentStatus.PAYMENT_VERIFICATION_PENDING.value,
                     "cancelled_communication_ids": cancelled,
                 },
             )
@@ -1564,52 +1887,147 @@ def create_app(
         _record_audit_trail(
             verification_case.invoice_id,
             category="PAYMENT",
-            action="PORTAL_PAYMENT_REPORTED",
+            action="DEBTOR_PAYMENT_REPORTED",
             actor=Actor.DEBTOR.value,
-            details={"case_id": verification_case.case_id, "entry_id": entry.entry_id, "amount_gbp": str(amount)},
+            details={
+                "case_id": verification_case.case_id,
+                "report_id": report.report_id,
+                "amount_gbp": str(amount),
+                "settlement_offer_id": settlement_offer_id,
+            },
         )
-        if _portal_payment_date_pending(invoice_id=verification_case.invoice_id, as_of_date=date.today()):
+        ledger.append_event(
+            invoice_id=verification_case.invoice_id,
+            actor=Actor.DEBTOR,
+            event_type="DEBTOR_PAYMENT_REPORTED",
+            timestamp=now,
+            data_payload={
+                "report_id": report.report_id,
+                "amount_gbp": str(amount),
+                "payment_reference": payload.payment_reference,
+                "payment_date": None if payload.payment_date is None else payload.payment_date.isoformat(),
+                "settlement_offer_id": settlement_offer_id,
+                "cancelled_communication_ids": cancelled,
+            },
+        )
+        if settlement_offer_id:
             store.append_compliance_entry(
                 ComplianceLedgerEntry(
                     entry_id=str(uuid4()),
                     invoice_id=verification_case.invoice_id,
                     timestamp=now,
-                    event_type="PORTAL_PAYMENT_DATE_FULFILLED",
-                    details={"entry_id": entry.entry_id, "source": "PORTAL_CONFIRM_PAID"},
+                    event_type="SETTLEMENT_PAYMENT_REPORTED",
+                    details={
+                        "offer_id": settlement_offer_id,
+                        "report_id": report.report_id,
+                        "debtor_identifier": payload.debtor_identifier,
+                        "amount_gbp": str(amount),
+                    },
                 )
             )
             ledger.append_event(
                 invoice_id=verification_case.invoice_id,
                 actor=Actor.DEBTOR,
-                event_type="PORTAL_PAYMENT_DATE_FULFILLED",
+                event_type="SETTLEMENT_PAYMENT_REPORTED",
                 timestamp=now,
-                data_payload={"entry_id": entry.entry_id, "source": "PORTAL_CONFIRM_PAID"},
-            )
-            _record_audit_trail(
-                verification_case.invoice_id,
-                category="PAYMENT",
-                action="PORTAL_PAYMENT_DATE_FULFILLED",
-                actor=Actor.SYSTEM.value,
-                details={"entry_id": entry.entry_id, "source": "PORTAL_CONFIRM_PAID"},
+                data_payload={
+                    "offer_id": settlement_offer_id,
+                    "report_id": report.report_id,
+                    "amount_gbp": str(amount),
+                },
             )
         ledger.append_event(
             invoice_id=verification_case.invoice_id,
-            actor=Actor.DEBTOR,
-            event_type="PORTAL_PAYMENT_REPORTED",
+            actor=Actor.SYSTEM,
+            event_type="PAYMENT_VERIFICATION_PENDING",
             timestamp=now,
             data_payload={
-                "entry_id": entry.entry_id,
-                "amount_gbp": str(amount),
-                "payment_reference": payload.payment_reference,
-                "cancelled_communication_ids": cancelled,
+                "report_id": report.report_id,
+                "status": ReportedPaymentStatus.PAYMENT_VERIFICATION_PENDING.value,
             },
         )
         return {
             "invoice_id": verification_case.invoice_id,
             "case_id": verification_case.case_id,
-            "entry_id": entry.entry_id,
+            "report_id": report.report_id,
             "amount_gbp": str(amount),
+            "status": ReportedPaymentStatus.PAYMENT_VERIFICATION_PENDING.value,
+            "settlement_offer_id": settlement_offer_id,
+            "outstanding_balance_gbp": str(store.debtor_ledger_balance_for_invoice(verification_case.invoice_id)),
             "cancelled_pending_communication_ids": cancelled,
+        }
+
+    @app.post("/portal/actions/reported-payments/{report_id}/evidence")
+    async def portal_upload_reported_payment_evidence(
+        report_id: str,
+        case: str = Form(...),
+        code: str = Form(...),
+        debtor_identifier: str = Form(...),
+        file: UploadFile = File(...),
+    ) -> dict[str, object]:
+        verification_case, _ = _resolve_verified_portal_case(case=case, code=code)
+        report = store.reported_payment_by_id(report_id)
+        if report is None or report.invoice_id != verification_case.invoice_id:
+            raise HTTPException(status_code=404, detail="Reported payment not found.")
+        if report.debtor_identifier != debtor_identifier:
+            raise HTTPException(status_code=403, detail="Debtor identifier does not match the reported payment.")
+        if _current_reported_payment_status(report_id) not in {
+            ReportedPaymentStatus.PAYMENT_VERIFICATION_PENDING,
+            ReportedPaymentStatus.NEEDS_EVIDENCE,
+        }:
+            raise HTTPException(status_code=409, detail="Reported payment is no longer awaiting evidence.")
+        artifact = await _store_uploaded_artifact(
+            invoice_id=verification_case.invoice_id,
+            user_id=f"DEBTOR_PORTAL:{debtor_identifier}",
+            artifact_type=ArtifactType.PAYMENT_EVIDENCE,
+            file=file,
+        )
+        linked_at = datetime.now(timezone.utc)
+        store.append_reported_payment_evidence_link(
+            ReportedPaymentEvidenceLink(
+                link_id=str(uuid4()),
+                report_id=report_id,
+                invoice_id=verification_case.invoice_id,
+                document_id=artifact.document_id,
+                linked_at=linked_at,
+                linked_by=debtor_identifier,
+            )
+        )
+        details = {
+            "report_id": report_id,
+            "document_id": artifact.document_id,
+            "debtor_identifier": debtor_identifier,
+        }
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=verification_case.invoice_id,
+                timestamp=linked_at,
+                event_type="DEBTOR_PAYMENT_EVIDENCE_UPLOADED",
+                details=details,
+            )
+        )
+        _record_audit_trail(
+            verification_case.invoice_id,
+            category="PAYMENT",
+            action="DEBTOR_PAYMENT_EVIDENCE_UPLOADED",
+            actor=Actor.DEBTOR.value,
+            details=details,
+        )
+        ledger.append_event(
+            invoice_id=verification_case.invoice_id,
+            actor=Actor.DEBTOR,
+            event_type="DEBTOR_PAYMENT_EVIDENCE_UPLOADED",
+            timestamp=linked_at,
+            data_payload=details,
+        )
+        return {
+            "invoice_id": verification_case.invoice_id,
+            "case_id": verification_case.case_id,
+            "report_id": report_id,
+            "document_id": artifact.document_id,
+            "artifact_type": artifact.artifact_type.value,
+            "status": _current_reported_payment_status(report_id).value,
         }
 
     @app.post("/portal/actions/disputes")
@@ -3124,6 +3542,376 @@ def create_app(
             "missing_paths": missing_paths,
         }
 
+    @app.get("/invoices/{invoice_id}/reported-payments")
+    def list_reported_payments(invoice_id: str) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        reports = store.reported_payments_for_invoice(invoice_id)
+        return {
+            "invoice_id": invoice_id,
+            "count": len(reports),
+            "payment_verification_pending": _payment_verification_pending_is_open(invoice_id),
+            "reports": [_reported_payment_detail(report) for report in reports],
+        }
+
+    @app.post("/invoices/{invoice_id}/reported-payments/{report_id}/confirm")
+    def confirm_reported_payment(
+        invoice_id: str,
+        report_id: str,
+        payload: ReportedPaymentConfirmRequest,
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        report = store.reported_payment_by_id(report_id)
+        if report is None or report.invoice_id != invoice_id:
+            raise HTTPException(status_code=404, detail="Reported payment not found.")
+        current_status = _current_reported_payment_status(report_id)
+        if current_status in {
+            ReportedPaymentStatus.PAYMENT_CONFIRMED_BY_CREDITOR,
+            ReportedPaymentStatus.PAYMENT_NOT_VERIFIED,
+        }:
+            raise HTTPException(status_code=409, detail="Reported payment has already been decided.")
+        confirmed_amount = abs(payload.confirmed_amount_gbp if payload.confirmed_amount_gbp is not None else report.amount_gbp)
+        now = datetime.now(timezone.utc)
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.CLIENT,
+            event_type="PAYMENT_CONFIRMED_BY_CREDITOR",
+            timestamp=now,
+            data_payload={
+                "report_id": report_id,
+                "creditor_user_id": payload.creditor_user_id,
+                "confirmed_amount_gbp": str(confirmed_amount),
+                "notes": payload.notes,
+            },
+        )
+        entry = dual_ledger_engine.add_debtor_entry(
+            invoice_id=invoice_id,
+            entry_type=DebtorLedgerEntryType.PAYMENT_RECEIVED,
+            amount_gbp=-confirmed_amount,
+            description=(
+                f"Creditor confirmed debtor-reported payment {report_id}."
+                + (f" Reference: {report.payment_reference}" if report.payment_reference else "")
+            ),
+        )
+        store.append_reported_payment_decision(
+            ReportedPaymentDecision(
+                decision_id=str(uuid4()),
+                report_id=report_id,
+                invoice_id=invoice_id,
+                decided_at=now,
+                decided_by=payload.creditor_user_id,
+                status=ReportedPaymentStatus.PAYMENT_CONFIRMED_BY_CREDITOR,
+                notes=payload.notes,
+                confirmed_amount_gbp=confirmed_amount,
+                linked_debtor_entry_id=entry.entry_id,
+            )
+        )
+        plan_payment_id: str | None = None
+        settlement_finalization_id: str | None = None
+        settlement_status: str | None = None
+        if report.plan_id is not None and report.installment_id is not None:
+            try:
+                confirmed_plan_payment = resolution_engine.record_confirmed_installment_payment(
+                    invoice_id=invoice_id,
+                    plan_id=report.plan_id,
+                    installment_id=report.installment_id,
+                    amount_gbp=confirmed_amount,
+                    recorded_by=payload.creditor_user_id,
+                    reported_payment_id=report_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+            plan_payment_id = confirmed_plan_payment.payment_id
+            store.append_compliance_entry(
+                ComplianceLedgerEntry(
+                    entry_id=str(uuid4()),
+                    invoice_id=invoice_id,
+                    timestamp=confirmed_plan_payment.paid_at,
+                    event_type="PAYMENT_PLAN_PAYMENT_CONFIRMED",
+                    details={
+                        "plan_id": report.plan_id,
+                        "installment_id": report.installment_id,
+                        "payment_id": confirmed_plan_payment.payment_id,
+                        "report_id": report_id,
+                        "amount_gbp": str(confirmed_amount),
+                    },
+                )
+            )
+            _record_audit_trail(
+                invoice_id,
+                category="PAYMENT",
+                action="PAYMENT_PLAN_PAYMENT_CONFIRMED",
+                actor=Actor.CLIENT.value,
+                details={
+                    "plan_id": report.plan_id,
+                    "installment_id": report.installment_id,
+                    "payment_id": confirmed_plan_payment.payment_id,
+                    "report_id": report_id,
+                },
+            )
+        if report.settlement_offer_id is not None:
+            try:
+                settlement_finalization = resolution_engine.finalize_settlement_offer_if_paid(
+                    offer_id=report.settlement_offer_id,
+                    finalized_by=payload.creditor_user_id,
+                    triggering_report_id=report_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc))
+            settlement_status = resolution_engine.settlement_offer_status(
+                offer_id=report.settlement_offer_id,
+                as_of_date=date.today(),
+            ).status
+            if settlement_finalization is not None:
+                settlement_finalization_id = settlement_finalization.finalization_id
+                store.append_compliance_entry(
+                    ComplianceLedgerEntry(
+                        entry_id=str(uuid4()),
+                        invoice_id=invoice_id,
+                        timestamp=settlement_finalization.finalized_at,
+                        event_type="SETTLEMENT_OFFER_FINALIZED",
+                        details={
+                            "offer_id": report.settlement_offer_id,
+                            "finalization_id": settlement_finalization.finalization_id,
+                            "triggering_report_id": report_id,
+                            "finalized_by": payload.creditor_user_id,
+                            "confirmed_payment_total_gbp": str(
+                                settlement_finalization.confirmed_payment_total_gbp
+                            ),
+                            "outstanding_before_gbp": str(settlement_finalization.outstanding_before_gbp),
+                            "settlement_discount_applied_gbp": str(
+                                settlement_finalization.settlement_discount_applied_gbp
+                            ),
+                        },
+                    )
+                )
+                _record_audit_trail(
+                    invoice_id,
+                    category="RESOLUTION",
+                    action="SETTLEMENT_OFFER_FINALIZED",
+                    actor=Actor.SYSTEM.value,
+                    details={
+                        "offer_id": report.settlement_offer_id,
+                        "finalization_id": settlement_finalization.finalization_id,
+                        "triggering_report_id": report_id,
+                    },
+                )
+        cancelled = _cancel_pending_automated_communications(
+            invoice_id=invoice_id,
+            trigger_entry_type=DebtorLedgerEntryType.PAYMENT_RECEIVED,
+        )
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="PAYMENT_CONFIRMED_BY_CREDITOR",
+                details={
+                    "report_id": report_id,
+                    "creditor_user_id": payload.creditor_user_id,
+                    "confirmed_amount_gbp": str(confirmed_amount),
+                    "linked_debtor_entry_id": entry.entry_id,
+                    "plan_id": report.plan_id,
+                    "installment_id": report.installment_id,
+                    "settlement_offer_id": report.settlement_offer_id,
+                    "settlement_offer_finalization_id": settlement_finalization_id,
+                    "settlement_offer_status": settlement_status,
+                    "payment_plan_payment_id": plan_payment_id,
+                    "notes": payload.notes,
+                },
+            )
+        )
+        if report.payment_date is not None and _portal_payment_date_pending(invoice_id=invoice_id, as_of_date=report.payment_date):
+            store.append_compliance_entry(
+                ComplianceLedgerEntry(
+                    entry_id=str(uuid4()),
+                    invoice_id=invoice_id,
+                    timestamp=now,
+                    event_type="PORTAL_PAYMENT_DATE_FULFILLED",
+                    details={"entry_id": entry.entry_id, "source": "PAYMENT_CONFIRMED_BY_CREDITOR"},
+                )
+            )
+            ledger.append_event(
+                invoice_id=invoice_id,
+                actor=Actor.SYSTEM,
+                event_type="PORTAL_PAYMENT_DATE_FULFILLED",
+                timestamp=now,
+                data_payload={"entry_id": entry.entry_id, "source": "PAYMENT_CONFIRMED_BY_CREDITOR"},
+            )
+            _record_audit_trail(
+                invoice_id,
+                category="PAYMENT",
+                action="PORTAL_PAYMENT_DATE_FULFILLED",
+                actor=Actor.SYSTEM.value,
+                details={"entry_id": entry.entry_id, "source": "PAYMENT_CONFIRMED_BY_CREDITOR"},
+            )
+        _record_audit_trail(
+            invoice_id,
+            category="PAYMENT",
+            action="PAYMENT_CONFIRMED_BY_CREDITOR",
+            actor=Actor.CLIENT.value,
+            details={
+                "report_id": report_id,
+                "creditor_user_id": payload.creditor_user_id,
+                "linked_debtor_entry_id": entry.entry_id,
+                "plan_id": report.plan_id,
+                "installment_id": report.installment_id,
+                "settlement_offer_id": report.settlement_offer_id,
+                "settlement_offer_finalization_id": settlement_finalization_id,
+                "settlement_offer_status": settlement_status,
+                "payment_plan_payment_id": plan_payment_id,
+                "confirmed_amount_gbp": str(confirmed_amount),
+            },
+        )
+        balances = dual_ledger_engine.balances_for_invoice(invoice_id)
+        return {
+            "invoice_id": invoice_id,
+            "report_id": report_id,
+            "status": ReportedPaymentStatus.PAYMENT_CONFIRMED_BY_CREDITOR.value,
+            "debtor_ledger_entry_id": entry.entry_id,
+            "confirmed_amount_gbp": str(confirmed_amount),
+            "payment_plan_payment_id": plan_payment_id,
+            "settlement_offer_id": report.settlement_offer_id,
+            "settlement_offer_finalization_id": settlement_finalization_id,
+            "settlement_offer_status": settlement_status,
+            "outstanding_balance_gbp": str(balances.debtor_ledger_balance),
+            "cancelled_pending_communication_ids": cancelled,
+        }
+
+    @app.post("/invoices/{invoice_id}/reported-payments/{report_id}/reject")
+    def reject_reported_payment(
+        invoice_id: str,
+        report_id: str,
+        payload: ReportedPaymentRejectRequest,
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        report = store.reported_payment_by_id(report_id)
+        if report is None or report.invoice_id != invoice_id:
+            raise HTTPException(status_code=404, detail="Reported payment not found.")
+        current_status = _current_reported_payment_status(report_id)
+        if current_status in {
+            ReportedPaymentStatus.PAYMENT_CONFIRMED_BY_CREDITOR,
+            ReportedPaymentStatus.PAYMENT_NOT_VERIFIED,
+        }:
+            raise HTTPException(status_code=409, detail="Reported payment has already been decided.")
+        now = datetime.now(timezone.utc)
+        store.append_reported_payment_decision(
+            ReportedPaymentDecision(
+                decision_id=str(uuid4()),
+                report_id=report_id,
+                invoice_id=invoice_id,
+                decided_at=now,
+                decided_by=payload.creditor_user_id,
+                status=ReportedPaymentStatus.PAYMENT_NOT_VERIFIED,
+                reason=payload.reason,
+                notes=payload.notes,
+            )
+        )
+        details = {
+            "report_id": report_id,
+            "creditor_user_id": payload.creditor_user_id,
+            "reason": payload.reason,
+            "notes": payload.notes,
+            "requires_gate_re_evaluation": True,
+        }
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="PAYMENT_NOT_VERIFIED",
+                details=details,
+            )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="PAYMENT",
+            action="PAYMENT_NOT_VERIFIED",
+            actor=Actor.CLIENT.value,
+            details=details,
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.CLIENT,
+            event_type="PAYMENT_NOT_VERIFIED",
+            timestamp=now,
+            data_payload=details,
+        )
+        return {
+            "invoice_id": invoice_id,
+            "report_id": report_id,
+            "status": ReportedPaymentStatus.PAYMENT_NOT_VERIFIED.value,
+            "requires_gate_re_evaluation": True,
+        }
+
+    @app.post("/invoices/{invoice_id}/reported-payments/{report_id}/needs-evidence")
+    def mark_reported_payment_needs_evidence(
+        invoice_id: str,
+        report_id: str,
+        payload: ReportedPaymentNeedsEvidenceRequest,
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        report = store.reported_payment_by_id(report_id)
+        if report is None or report.invoice_id != invoice_id:
+            raise HTTPException(status_code=404, detail="Reported payment not found.")
+        if _current_reported_payment_status(report_id) in {
+            ReportedPaymentStatus.PAYMENT_CONFIRMED_BY_CREDITOR,
+            ReportedPaymentStatus.PAYMENT_NOT_VERIFIED,
+        }:
+            raise HTTPException(status_code=409, detail="Reported payment has already been decided.")
+        now = datetime.now(timezone.utc)
+        store.append_reported_payment_decision(
+            ReportedPaymentDecision(
+                decision_id=str(uuid4()),
+                report_id=report_id,
+                invoice_id=invoice_id,
+                decided_at=now,
+                decided_by=payload.creditor_user_id,
+                status=ReportedPaymentStatus.NEEDS_EVIDENCE,
+                notes=payload.notes,
+            )
+        )
+        details = {
+            "report_id": report_id,
+            "creditor_user_id": payload.creditor_user_id,
+            "notes": payload.notes,
+        }
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="PAYMENT_EVIDENCE_REQUESTED",
+                details=details,
+            )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="PAYMENT",
+            action="PAYMENT_EVIDENCE_REQUESTED",
+            actor=Actor.CLIENT.value,
+            details=details,
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.CLIENT,
+            event_type="PAYMENT_EVIDENCE_REQUESTED",
+            timestamp=now,
+            data_payload=details,
+        )
+        return {
+            "invoice_id": invoice_id,
+            "report_id": report_id,
+            "status": ReportedPaymentStatus.NEEDS_EVIDENCE.value,
+        }
+
     @app.post("/invoices/{invoice_id}/resolution/payment-plans")
     def propose_payment_plan(invoice_id: str, payload: PaymentPlanProposalRequest) -> dict[str, object]:
         invoice = store.get_invoice(invoice_id)
@@ -3133,6 +3921,7 @@ def create_app(
             plan, installments = resolution_engine.propose_payment_plan(
                 invoice_id=invoice_id,
                 proposed_by=payload.proposed_by,
+                proposer_role="CREDITOR",
                 installment_amount_gbp=payload.installment_amount_gbp,
                 installment_count=payload.installment_count,
                 first_due_date=payload.first_due_date,
@@ -3153,6 +3942,8 @@ def create_app(
                     "installment_amount_gbp": str(plan.installment_amount_gbp),
                     "installment_count": plan.installment_count,
                     "first_due_date": plan.first_due_date.isoformat(),
+                    "proposer_role": plan.proposer_role,
+                    "version_number": plan.version_number,
                 },
             )
         )
@@ -3166,6 +3957,7 @@ def create_app(
         return {
             "invoice_id": invoice_id,
             "plan_id": plan.plan_id,
+            "version_number": plan.version_number,
             "installment_count": len(installments),
             "installments": [
                 {
@@ -3176,8 +3968,8 @@ def create_app(
                 }
                 for item in installments
             ],
-            "status": "ACTIVE",
-            "chasers_paused": True,
+            "status": "PROPOSED",
+            "chasers_paused": False,
         }
 
     @app.get("/invoices/{invoice_id}/resolution/payment-plans")
@@ -3201,9 +3993,14 @@ def create_app(
                     "first_due_date": plan.first_due_date.isoformat(),
                     "frequency_days": plan.frequency_days,
                     "notes": plan.notes,
+                    "proposer_role": plan.proposer_role,
+                    "parent_plan_id": plan.parent_plan_id,
+                    "version_number": plan.version_number,
                     "status": status.status,
                     "remaining_amount_gbp": str(status.remaining_amount_gbp),
+                    "paid_amount_gbp": str(status.paid_amount_gbp),
                     "missed_installment_count": status.missed_installment_count,
+                    "status_history": list(status.status_history),
                     "installments": [
                         {
                             "installment_id": inst.installment_id,
@@ -3217,23 +4014,19 @@ def create_app(
             )
         return {"invoice_id": invoice_id, "as_of_date": target_date.isoformat(), "plans": result}
 
-    @app.post("/invoices/{invoice_id}/resolution/payment-plans/{plan_id}/payments")
-    def record_payment_plan_payment(
-        invoice_id: str, plan_id: str, payload: PaymentPlanPaymentRequest
-    ) -> dict[str, object]:
+    @app.post("/invoices/{invoice_id}/resolution/payment-plans/{plan_id}/accept")
+    def accept_payment_plan(invoice_id: str, plan_id: str, payload: PaymentPlanAcceptRequest) -> dict[str, object]:
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
-        installments = store.payment_plan_installments_for_plan(plan_id)
-        if not any(item.installment_id == payload.installment_id and item.invoice_id == invoice_id for item in installments):
-            raise HTTPException(status_code=404, detail="Installment not found for invoice payment plan.")
+        plan = store.payment_plan_agreement_by_id(plan_id)
+        if plan is None or plan.invoice_id != invoice_id:
+            raise HTTPException(status_code=404, detail="Payment plan not found.")
         try:
-            payment = resolution_engine.record_installment_payment(
-                invoice_id=invoice_id,
+            acceptance, activation = resolution_engine.accept_payment_plan(
                 plan_id=plan_id,
-                installment_id=payload.installment_id,
-                amount_gbp=payload.amount_gbp,
-                recorded_by=payload.recorded_by,
+                accepted_by=payload.accepted_by,
+                accepter_role=payload.accepter_role,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
@@ -3241,29 +4034,305 @@ def create_app(
             ComplianceLedgerEntry(
                 entry_id=str(uuid4()),
                 invoice_id=invoice_id,
-                timestamp=payment.paid_at,
-                event_type="PAYMENT_PLAN_PAYMENT_RECORDED",
+                timestamp=acceptance.decided_at,
+                event_type="PAYMENT_PLAN_ACCEPTED",
                 details={
-                    "plan_id": payment.plan_id,
-                    "installment_id": payment.installment_id,
-                    "amount_gbp": str(payment.amount_gbp),
-                    "recorded_by": payment.recorded_by,
+                    "plan_id": plan_id,
+                    "accepted_by": payload.accepted_by,
+                    "accepter_role": payload.accepter_role,
+                    "version_number": plan.version_number,
+                },
+            )
+        )
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=activation.decided_at,
+                event_type="PAYMENT_PLAN_ACTIVATED",
+                details={"plan_id": plan_id, "version_number": plan.version_number},
+            )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="RESOLUTION",
+            action="PAYMENT_PLAN_ACCEPTED",
+            actor=Actor.CLIENT.value if payload.accepter_role == "CREDITOR" else Actor.DEBTOR.value,
+            details={"plan_id": plan_id, "accepted_by": payload.accepted_by, "version_number": plan.version_number},
+        )
+        status = resolution_engine.payment_plan_status(plan_id=plan_id, as_of_date=date.today())
+        return {
+            "invoice_id": invoice_id,
+            "plan_id": plan_id,
+            "status": status.status,
+            "version_number": plan.version_number,
+            "status_history": list(status.status_history),
+            "chasers_paused": status.status == "ACTIVE",
+        }
+
+    @app.post("/invoices/{invoice_id}/resolution/payment-plans/{plan_id}/counter-offers")
+    def counter_offer_payment_plan(
+        invoice_id: str,
+        plan_id: str,
+        payload: PaymentPlanCounterOfferRequest,
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        parent_plan = store.payment_plan_agreement_by_id(plan_id)
+        if parent_plan is None or parent_plan.invoice_id != invoice_id:
+            raise HTTPException(status_code=404, detail="Payment plan not found.")
+        try:
+            counter_plan, installments = resolution_engine.propose_payment_plan(
+                invoice_id=invoice_id,
+                proposed_by=payload.proposed_by,
+                proposer_role=payload.proposer_role,
+                installment_amount_gbp=payload.installment_amount_gbp,
+                installment_count=payload.installment_count,
+                first_due_date=payload.first_due_date,
+                frequency_days=payload.frequency_days,
+                notes=payload.notes,
+                parent_plan_id=plan_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=counter_plan.created_at,
+                event_type="PAYMENT_PLAN_COUNTER_OFFERED",
+                details={
+                    "plan_id": counter_plan.plan_id,
+                    "parent_plan_id": plan_id,
+                    "proposed_by": counter_plan.proposed_by,
+                    "proposer_role": counter_plan.proposer_role,
+                    "version_number": counter_plan.version_number,
+                },
+            )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="RESOLUTION",
+            action="PAYMENT_PLAN_COUNTER_OFFERED",
+            actor=Actor.CLIENT.value if payload.proposer_role == "CREDITOR" else Actor.DEBTOR.value,
+            details={"plan_id": counter_plan.plan_id, "parent_plan_id": plan_id, "version_number": counter_plan.version_number},
+        )
+        return {
+            "invoice_id": invoice_id,
+            "plan_id": counter_plan.plan_id,
+            "parent_plan_id": plan_id,
+            "version_number": counter_plan.version_number,
+            "status": "COUNTER_OFFERED",
+            "installments": [
+                {
+                    "installment_id": item.installment_id,
+                    "sequence_number": item.sequence_number,
+                    "due_date": item.due_date.isoformat(),
+                    "amount_gbp": str(item.amount_gbp),
+                }
+                for item in installments
+            ],
+            "chasers_paused": False,
+        }
+
+    @app.post("/invoices/{invoice_id}/resolution/payment-plans/{plan_id}/reject")
+    def reject_payment_plan(invoice_id: str, plan_id: str, payload: PaymentPlanRejectRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        plan = store.payment_plan_agreement_by_id(plan_id)
+        if plan is None or plan.invoice_id != invoice_id:
+            raise HTTPException(status_code=404, detail="Payment plan not found.")
+        try:
+            decision = resolution_engine.reject_payment_plan(
+                plan_id=plan_id,
+                rejected_by=payload.rejected_by,
+                rejecter_role=payload.rejecter_role,
+                notes=payload.notes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=decision.decided_at,
+                event_type="PAYMENT_PLAN_REJECTED",
+                details={"plan_id": plan_id, "rejected_by": payload.rejected_by, "rejecter_role": payload.rejecter_role, "notes": payload.notes},
+            )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="RESOLUTION",
+            action="PAYMENT_PLAN_REJECTED",
+            actor=Actor.CLIENT.value if payload.rejecter_role == "CREDITOR" else Actor.DEBTOR.value,
+            details={"plan_id": plan_id, "rejected_by": payload.rejected_by},
+        )
+        status = resolution_engine.payment_plan_status(plan_id=plan_id, as_of_date=date.today())
+        return {"invoice_id": invoice_id, "plan_id": plan_id, "status": status.status, "status_history": list(status.status_history)}
+
+    @app.post("/invoices/{invoice_id}/resolution/payment-plans/{plan_id}/withdraw")
+    def withdraw_payment_plan(invoice_id: str, plan_id: str, payload: PaymentPlanWithdrawRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        plan = store.payment_plan_agreement_by_id(plan_id)
+        if plan is None or plan.invoice_id != invoice_id:
+            raise HTTPException(status_code=404, detail="Payment plan not found.")
+        try:
+            decision = resolution_engine.withdraw_payment_plan(
+                plan_id=plan_id,
+                withdrawn_by=payload.withdrawn_by,
+                withdrawer_role=payload.withdrawer_role,
+                notes=payload.notes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=decision.decided_at,
+                event_type="PAYMENT_PLAN_WITHDRAWN",
+                details={"plan_id": plan_id, "withdrawn_by": payload.withdrawn_by, "withdrawer_role": payload.withdrawer_role, "notes": payload.notes},
+            )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="RESOLUTION",
+            action="PAYMENT_PLAN_WITHDRAWN",
+            actor=Actor.CLIENT.value if payload.withdrawer_role == "CREDITOR" else Actor.DEBTOR.value,
+            details={"plan_id": plan_id, "withdrawn_by": payload.withdrawn_by},
+        )
+        status = resolution_engine.payment_plan_status(plan_id=plan_id, as_of_date=date.today())
+        return {"invoice_id": invoice_id, "plan_id": plan_id, "status": status.status, "status_history": list(status.status_history)}
+
+    @app.post("/invoices/{invoice_id}/resolution/payment-plans/{plan_id}/expire")
+    def expire_payment_plan(invoice_id: str, plan_id: str, payload: PaymentPlanExpireRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        plan = store.payment_plan_agreement_by_id(plan_id)
+        if plan is None or plan.invoice_id != invoice_id:
+            raise HTTPException(status_code=404, detail="Payment plan not found.")
+        try:
+            decision = resolution_engine.expire_payment_plan(
+                plan_id=plan_id,
+                expired_by=payload.expired_by,
+                notes=payload.notes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=decision.decided_at,
+                event_type="PAYMENT_PLAN_EXPIRED",
+                details={"plan_id": plan_id, "expired_by": payload.expired_by, "notes": payload.notes},
+            )
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="RESOLUTION",
+            action="PAYMENT_PLAN_EXPIRED",
+            actor=Actor.SYSTEM.value,
+            details={"plan_id": plan_id, "expired_by": payload.expired_by},
+        )
+        status = resolution_engine.payment_plan_status(plan_id=plan_id, as_of_date=date.today())
+        return {"invoice_id": invoice_id, "plan_id": plan_id, "status": status.status, "status_history": list(status.status_history)}
+
+    @app.post("/invoices/{invoice_id}/resolution/payment-plans/{plan_id}/payments")
+    def record_payment_plan_payment(
+        invoice_id: str, plan_id: str, payload: PaymentPlanPaymentRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        plan = store.payment_plan_agreement_by_id(plan_id)
+        if plan is None or plan.invoice_id != invoice_id:
+            raise HTTPException(status_code=404, detail="Payment plan not found.")
+        installments = store.payment_plan_installments_for_plan(plan_id)
+        if not any(item.installment_id == payload.installment_id and item.invoice_id == invoice_id for item in installments):
+            raise HTTPException(status_code=404, detail="Installment not found for invoice payment plan.")
+        plan_status = resolution_engine.payment_plan_status(plan_id=plan_id, as_of_date=date.today())
+        if plan_status.status not in {"ACTIVE", "DEFAULTED"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Installment payments can only be reported against an active or defaulted payment plan.",
+            )
+        amount = abs(payload.amount_gbp)
+        now = datetime.now(timezone.utc)
+        verification_case = store.debtor_verification_case_for_invoice(invoice_id)
+        report = ReportedPayment(
+            report_id=str(uuid4()),
+            invoice_id=invoice_id,
+            case_id=invoice_id if verification_case is None else verification_case.case_id,
+            debtor_identifier=payload.recorded_by,
+            reported_at=now,
+            amount_gbp=amount,
+            details=f"Payment plan installment reported for verification. Plan {plan_id}, installment {payload.installment_id}.",
+            plan_id=plan_id,
+            installment_id=payload.installment_id,
+        )
+        store.append_reported_payment(report)
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="PAYMENT_PLAN_PAYMENT_REPORTED",
+                details={
+                    "plan_id": plan_id,
+                    "installment_id": payload.installment_id,
+                    "report_id": report.report_id,
+                    "amount_gbp": str(amount),
+                    "recorded_by": payload.recorded_by,
+                },
+            )
+        )
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="PAYMENT_VERIFICATION_PENDING",
+                details={
+                    "report_id": report.report_id,
+                    "plan_id": plan_id,
+                    "installment_id": payload.installment_id,
+                    "status": ReportedPaymentStatus.PAYMENT_VERIFICATION_PENDING.value,
                 },
             )
         )
         _record_audit_trail(
             invoice_id,
             category="PAYMENT",
-            action="PAYMENT_PLAN_PAYMENT_RECORDED",
+            action="PAYMENT_PLAN_PAYMENT_REPORTED",
             actor=Actor.CLIENT.value,
-            details={"plan_id": payment.plan_id, "installment_id": payment.installment_id, "amount_gbp": str(payment.amount_gbp)},
+            details={"plan_id": plan_id, "installment_id": payload.installment_id, "report_id": report.report_id, "amount_gbp": str(amount)},
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.CLIENT,
+            event_type="PAYMENT_PLAN_PAYMENT_REPORTED",
+            timestamp=now,
+            data_payload={
+                "plan_id": plan_id,
+                "installment_id": payload.installment_id,
+                "report_id": report.report_id,
+                "amount_gbp": str(amount),
+                "recorded_by": payload.recorded_by,
+            },
         )
         return {
             "invoice_id": invoice_id,
             "plan_id": plan_id,
-            "payment_id": payment.payment_id,
-            "amount_gbp": str(payment.amount_gbp),
-            "recorded_at": payment.paid_at.isoformat(),
+            "report_id": report.report_id,
+            "amount_gbp": str(amount),
+            "recorded_at": now.isoformat(),
+            "status": ReportedPaymentStatus.PAYMENT_VERIFICATION_PENDING.value,
             "chasers_paused": True,
         }
 
@@ -3347,15 +4416,21 @@ def create_app(
             invoice_id,
             category="RESOLUTION",
             action="SETTLEMENT_OFFER_ACCEPTED",
-            actor=Actor.CLIENT.value,
+            actor=Actor.CLIENT.value if acceptance.accepter_role == "CREDITOR" else Actor.DEBTOR.value,
             details={"offer_id": offer_id, "accepter_role": acceptance.accepter_role, "finalized": finalized},
         )
+        offer_status = resolution_engine.settlement_offer_status(offer_id=offer_id, as_of_date=date.today())
         return {
             "invoice_id": invoice_id,
             "offer_id": offer_id,
             "acceptance_id": acceptance.acceptance_id,
             "accepter_role": acceptance.accepter_role,
             "finalized": finalized,
+            "status": offer_status.status,
+            "accepted_roles": list(offer_status.accepted_roles),
+            "confirmed_payment_total_gbp": str(offer_status.confirmed_payment_total_gbp),
+            "remaining_payment_gbp": str(offer_status.remaining_payment_gbp),
+            "chasers_paused": offer_status.status == "AWAITING_PAYMENT",
         }
 
     @app.get("/invoices/{invoice_id}/resolution/settlement-offers")
@@ -3366,8 +4441,7 @@ def create_app(
         offers = store.settlement_offers_for_invoice(invoice_id)
         rows: list[dict[str, object]] = []
         for offer in offers:
-            acceptances = store.settlement_acceptances_for_offer(offer.offer_id)
-            roles = {item.accepter_role for item in acceptances}
+            status = resolution_engine.settlement_offer_status(offer_id=offer.offer_id, as_of_date=date.today())
             rows.append(
                 {
                     "offer_id": offer.offer_id,
@@ -3376,8 +4450,11 @@ def create_app(
                     "offered_amount_gbp": str(offer.offered_amount_gbp),
                     "expiry_date": offer.expiry_date.isoformat(),
                     "notes": offer.notes,
-                    "accepted_roles": sorted(roles),
-                    "status": "FINALIZED" if roles == {"DEBTOR", "CREDITOR"} else "OPEN",
+                    "accepted_roles": list(status.accepted_roles),
+                    "status": status.status,
+                    "confirmed_payment_total_gbp": str(status.confirmed_payment_total_gbp),
+                    "remaining_payment_gbp": str(status.remaining_payment_gbp),
+                    "finalized_at": status.finalized_at,
                 }
             )
         return {"invoice_id": invoice_id, "offers": rows}
@@ -3851,6 +4928,11 @@ def create_app(
                 status_code=409,
                 detail="Escalation blocked while promised debtor payment date has not yet passed.",
             )
+        if _payment_verification_pending_is_open(invoice_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Escalation blocked while a debtor-reported payment is awaiting creditor verification.",
+            )
         if _has_unresolved_delivery_failure(invoice_id):
             raise HTTPException(
                 status_code=409,
@@ -3896,30 +4978,45 @@ def create_app(
                 detail=f"Escalation blocked: payment plan {active_plan_id} is active and chasers remain paused.",
             )
         if active_plan_status == "DEFAULTED":
-            forced_current_state = InvoiceState.OVERDUE_CHASER
             now = datetime.now(timezone.utc)
             store.append_compliance_entry(
                 ComplianceLedgerEntry(
                     entry_id=str(uuid4()),
                     invoice_id=invoice_id,
                     timestamp=now,
-                    event_type="PAYMENT_PLAN_DEFAULTED_RESUME",
-                    details={"plan_id": active_plan_id, "resume_state": InvoiceState.OVERDUE_CHASER.value},
+                    event_type="PAYMENT_PLAN_DEFAULTED_REEVALUATION",
+                    details={
+                        "plan_id": active_plan_id,
+                        "resume_state_reused": payload.current_state.value if payload.current_state is not None else None,
+                    },
                 )
             )
             ledger.append_event(
                 invoice_id=invoice_id,
                 actor=Actor.SYSTEM,
-                event_type="PAYMENT_PLAN_DEFAULTED_RESUME",
+                event_type="PAYMENT_PLAN_DEFAULTED_REEVALUATION",
                 timestamp=now,
-                data_payload={"plan_id": active_plan_id, "resume_state": InvoiceState.OVERDUE_CHASER.value},
+                data_payload={
+                    "plan_id": active_plan_id,
+                    "resume_state_reused": payload.current_state.value if payload.current_state is not None else None,
+                },
+            )
+
+        awaiting_settlement_offer_id, _ = _awaiting_settlement_offer(invoice_id, payload.today)
+        if awaiting_settlement_offer_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Escalation blocked: settlement offer {awaiting_settlement_offer_id} is awaiting payment "
+                    "and chasers remain paused."
+                ),
             )
 
         devils_advocate_result = devils_advocate_engine.evaluate(
             active_dispute=payload.debtor_feedback == "DISPUTE",
             payment_or_credit_discrepancy=_latest_discrepancy_invalid(invoice_id),
             delivery_evidence_unverified=payload.delivery_evidence_unverified,
-            settlement_pending_and_not_due=payload.settlement_pending_and_not_due,
+            settlement_pending_and_not_due=payload.settlement_pending_and_not_due or awaiting_settlement_offer_id is not None,
             data_accuracy_challenge_pending=_data_accuracy_challenge_is_open(invoice_id),
             insolvency_or_breathing_space_flag=(
                 payload.system_flag in {"BREATHING_SPACE", "INSOLVENCY"} or payload.insolvency_flag
@@ -4030,101 +5127,11 @@ def create_app(
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
-        invoice_dir = artifacts_root / invoice_id
-        invoice_dir.mkdir(parents=True, exist_ok=True)
-        original_filename = Path(file.filename or "").name
-        content = await file.read()
-
-        def quarantine_and_raise(*, status_code: int, reason: str) -> None:
-            quarantine_id = str(uuid4())
-            quarantine_invoice_dir = quarantine_root / invoice_id
-            quarantine_invoice_dir.mkdir(parents=True, exist_ok=True)
-            fallback_name = "unknown.bin" if not original_filename else original_filename
-            quarantine_name = f"{quarantine_id}_{Path(fallback_name).name}"
-            quarantine_path = quarantine_invoice_dir / quarantine_name
-            metadata_path = quarantine_invoice_dir / f"{quarantine_id}.json"
-            try:
-                quarantine_path.write_bytes(content)
-                metadata_path.write_text(
-                    json.dumps(
-                        {
-                            "quarantine_id": quarantine_id,
-                            "invoice_id": invoice_id,
-                            "reason": reason,
-                            "filename": fallback_name,
-                            "content_type": (file.content_type or "").strip(),
-                            "size_bytes": len(content),
-                        },
-                        ensure_ascii=True,
-                    ),
-                    encoding="utf-8",
-                )
-                ledger.append_event(
-                    invoice_id=invoice_id,
-                    actor=Actor.SYSTEM,
-                    event_type="EVIDENCE_UPLOAD_QUARANTINED",
-                    data_payload={
-                        "quarantine_id": quarantine_id,
-                        "reason": reason,
-                        "filename": fallback_name,
-                        "content_type": (file.content_type or "").strip(),
-                        "size_bytes": len(content),
-                        "quarantine_path": str(quarantine_path),
-                    },
-                )
-                security.record_upload_rejection(reason=reason, quarantined=True)
-                raise HTTPException(
-                    status_code=status_code,
-                    detail=f"{reason} Quarantine reference: {quarantine_id}",
-                )
-            except OSError as exc:
-                security.record_upload_rejection(reason=reason, quarantined=False)
-                ledger.append_event(
-                    invoice_id=invoice_id,
-                    actor=Actor.SYSTEM,
-                    event_type="EVIDENCE_UPLOAD_REJECTED",
-                    data_payload={
-                        "reason": reason,
-                        "filename": fallback_name,
-                        "content_type": (file.content_type or "").strip(),
-                        "size_bytes": len(content),
-                        "quarantine_error": str(exc),
-                    },
-                )
-                raise HTTPException(
-                    status_code=status_code,
-                    detail=f"{reason} Upload rejected and quarantine storage failed.",
-                )
-
-        if not original_filename or not SAFE_UPLOAD_FILENAME_RE.match(original_filename):
-            quarantine_and_raise(status_code=400, reason="Filename violates upload naming policy.")
-
-        extension = Path(original_filename).suffix.lower()
-        if extension not in allowed_upload_extension_set:
-            quarantine_and_raise(
-                status_code=415,
-                reason=("Unsupported file extension. Allowed extensions: " + ", ".join(effective_allowed_upload_extensions)),
-            )
-
-        if len(content) > effective_max_upload_bytes:
-            quarantine_and_raise(
-                status_code=413,
-                reason=f"Uploaded file exceeds max allowed size ({effective_max_upload_bytes} bytes).",
-            )
-        content_type = (file.content_type or "").strip().lower()
-        if content_type not in allowed_upload_content_type_set:
-            quarantine_and_raise(
-                status_code=415,
-                reason=("Unsupported file content type. Allowed types: " + ", ".join(effective_allowed_upload_content_types)),
-            )
-        output_name = f"{uuid4()}_{original_filename}"
-        output_path = invoice_dir / output_name
-        output_path.write_bytes(content)
-        artifact = ledger.record_evidence_artifact(
+        artifact = await _store_uploaded_artifact(
             invoice_id=invoice_id,
-            file_path=str(output_path),
             user_id=user_id,
             artifact_type=artifact_type,
+            file=file,
         )
         return {
             "invoice_id": artifact.invoice_id,

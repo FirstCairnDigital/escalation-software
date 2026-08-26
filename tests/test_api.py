@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -353,6 +354,9 @@ class TestApi(unittest.TestCase):
             self.assertEqual(workspace_resp.status_code, 200)
             self.assertIn("Invoice Workspace", workspace_resp.text)
             self.assertIn("Outstanding Balance", workspace_resp.text)
+            self.assertIn("Resolution artifacts", workspace_resp.text)
+            self.assertIn("Ledger manifest controls", workspace_resp.text)
+            self.assertIn("Settlement acceptance", workspace_resp.text)
             rule_resp = client.get("/rule-packs/NORTHERN_IRELAND/active?on_date=2026-02-01")
             self.assertEqual(rule_resp.status_code, 200)
             self.assertEqual(rule_resp.json()["rule_id"], "ni-commercial-invoice-recovery")
@@ -771,7 +775,8 @@ class TestApi(unittest.TestCase):
                 },
             )
             self.assertEqual(plan_resp.status_code, 200)
-            self.assertEqual(plan_resp.json()["status"], "ACTIVE")
+            self.assertEqual(plan_resp.json()["status"], "PROPOSED")
+            self.assertFalse(plan_resp.json()["chasers_paused"])
 
             offer_resp = client.post(
                 "/portal/actions/settlement-offers",
@@ -849,10 +854,48 @@ class TestApi(unittest.TestCase):
                     "debtor_identifier": "debtor-portal",
                     "amount_gbp": "250",
                     "payment_reference": "BANK-XYZ",
+                    "payment_date": "2026-02-11",
+                    "details": "Bank transfer reported by debtor.",
                 },
             )
             self.assertEqual(paid_resp.status_code, 200)
+            report_id = paid_resp.json()["report_id"]
+            self.assertEqual(paid_resp.json()["status"], "PAYMENT_VERIFICATION_PENDING")
+            self.assertEqual(paid_resp.json()["outstanding_balance_gbp"], "1200.00")
             self.assertEqual(len(paid_resp.json()["cancelled_pending_communication_ids"]), 1)
+            debtor_ledger_resp = client.get("/invoices/inv-api-portal/debtor-ledger")
+            self.assertEqual(debtor_ledger_resp.status_code, 200)
+            self.assertEqual(debtor_ledger_resp.json()["balance_gbp"], "1200.00")
+
+            payment_evidence_resp = client.post(
+                f"/portal/actions/reported-payments/{report_id}/evidence",
+                data={"case": case_id, "code": code, "debtor_identifier": "debtor-portal"},
+                files={"file": ("remittance.txt", b"proof of transfer", "text/plain")},
+            )
+            self.assertEqual(payment_evidence_resp.status_code, 200)
+            self.assertEqual(payment_evidence_resp.json()["artifact_type"], "PAYMENT_EVIDENCE")
+
+            list_reports_resp = client.get("/invoices/inv-api-portal/reported-payments")
+            self.assertEqual(list_reports_resp.status_code, 200)
+            self.assertEqual(list_reports_resp.json()["count"], 1)
+            self.assertTrue(list_reports_resp.json()["payment_verification_pending"])
+            self.assertEqual(list_reports_resp.json()["reports"][0]["status"], "PAYMENT_VERIFICATION_PENDING")
+            self.assertEqual(len(list_reports_resp.json()["reports"][0]["evidence_document_ids"]), 1)
+
+            needs_evidence_resp = client.post(
+                f"/invoices/inv-api-portal/reported-payments/{report_id}/needs-evidence",
+                json={"creditor_user_id": "USER-1", "notes": "Please confirm remittance advice."},
+            )
+            self.assertEqual(needs_evidence_resp.status_code, 200)
+            self.assertEqual(needs_evidence_resp.json()["status"], "NEEDS_EVIDENCE")
+
+            confirm_payment_resp = client.post(
+                f"/invoices/inv-api-portal/reported-payments/{report_id}/confirm",
+                json={"creditor_user_id": "USER-1", "notes": "Matched to bank statement."},
+            )
+            self.assertEqual(confirm_payment_resp.status_code, 200)
+            self.assertEqual(confirm_payment_resp.json()["status"], "PAYMENT_CONFIRMED_BY_CREDITOR")
+            self.assertEqual(confirm_payment_resp.json()["outstanding_balance_gbp"], "950.00")
 
             compliance_resp = client.get("/invoices/inv-api-portal/compliance-ledger")
             self.assertEqual(compliance_resp.status_code, 200)
@@ -862,7 +905,113 @@ class TestApi(unittest.TestCase):
             self.assertIn("SETTLEMENT_OFFER_PROPOSED", events)
             self.assertIn("PORTAL_QUESTION_SUBMITTED", events)
             self.assertIn("PORTAL_PAYMENT_DATE_CONFIRMED", events)
-            self.assertIn("PORTAL_PAYMENT_REPORTED", events)
+            self.assertIn("DEBTOR_PAYMENT_REPORTED", events)
+            self.assertIn("PAYMENT_VERIFICATION_PENDING", events)
+            self.assertIn("DEBTOR_PAYMENT_EVIDENCE_UPLOADED", events)
+            self.assertIn("PAYMENT_EVIDENCE_REQUESTED", events)
+            self.assertIn("PAYMENT_CONFIRMED_BY_CREDITOR", events)
+
+    def test_escalation_blocked_while_reported_payment_awaits_creditor_verification(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-payment-verification-gate.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-payment-gate",
+                    "currency": "GBP",
+                    "principal_amount": "700",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+            register_resp = client.post(
+                "/invoices/inv-api-payment-gate/debtor-verification/register",
+                json={"creditor_name": "Creditor Ltd", "invoice_reference": "INV-GATE-1"},
+            )
+            self.assertEqual(register_resp.status_code, 200)
+            case_id = register_resp.json()["case_id"]
+            code = register_resp.json()["verification_code"]
+            health_resp = client.post(
+                "/invoices/inv-api-payment-gate/case-health-check",
+                json={
+                    "user_id": "USER-1",
+                    "correct_customer_legal_entity": True,
+                    "description_of_goods_or_services": True,
+                    "invoice_number_and_date_verified": True,
+                    "amount_matches_contract_or_quote": True,
+                    "correct_billing_address": True,
+                    "vat_numbers_checked": True,
+                    "purchase_order_supplied_if_required": True,
+                    "payment_terms_and_due_date_established": True,
+                    "delivery_or_acceptance_proof_attached": True,
+                    "no_unresolved_credit_notes": True,
+                    "direct_payments_checked": True,
+                    "no_known_dispute": True,
+                    "creditor_authority_verified": True,
+                    "limitation_period_checked": True,
+                    "debtor_contact_details_verified": True,
+                    "court_handoff_boundary_acknowledged": True,
+                },
+            )
+            self.assertEqual(health_resp.status_code, 200)
+            discrepancy_resp = client.post(
+                "/invoices/inv-api-payment-gate/discrepancy-check",
+                json={
+                    "claim_amount": "700",
+                    "evidence_document_amount": "700",
+                    "principal": "700",
+                    "payments_recorded": "0",
+                    "outstanding_entered": "700",
+                },
+            )
+            self.assertEqual(discrepancy_resp.status_code, 200)
+            report_resp = client.post(
+                "/portal/actions/confirm-paid",
+                json={
+                    "case": case_id,
+                    "code": code,
+                    "debtor_identifier": "debtor-portal",
+                    "amount_gbp": "175",
+                    "payment_reference": "BANK-175",
+                },
+            )
+            self.assertEqual(report_resp.status_code, 200)
+            report_id = report_resp.json()["report_id"]
+
+            blocked_escalate_resp = client.post(
+                "/invoices/inv-api-payment-gate/escalate",
+                json={"today": "2026-02-01", "current_state": "OVERDUE_CHASER"},
+            )
+            self.assertEqual(blocked_escalate_resp.status_code, 409)
+            self.assertIn("awaiting creditor verification", blocked_escalate_resp.json()["detail"])
+
+            reject_resp = client.post(
+                f"/invoices/inv-api-payment-gate/reported-payments/{report_id}/reject",
+                json={
+                    "creditor_user_id": "USER-1",
+                    "reason": "No matching funds received.",
+                    "notes": "Checked current account ledger.",
+                },
+            )
+            self.assertEqual(reject_resp.status_code, 200)
+            self.assertTrue(reject_resp.json()["requires_gate_re_evaluation"])
+
+            debtor_ledger_resp = client.get("/invoices/inv-api-payment-gate/debtor-ledger")
+            self.assertEqual(debtor_ledger_resp.status_code, 200)
+            self.assertEqual(debtor_ledger_resp.json()["balance_gbp"], "700.00")
+
+            resumed_escalate_resp = client.post(
+                "/invoices/inv-api-payment-gate/escalate",
+                json={"today": "2026-02-01", "current_state": "OVERDUE_CHASER"},
+            )
+            self.assertEqual(resumed_escalate_resp.status_code, 200)
 
     def test_escalation_blocked_on_delivery_failure_until_requeued(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -1617,6 +1766,12 @@ class TestApi(unittest.TestCase):
                 },
             )
             self.assertEqual(create_resp.status_code, 200)
+            verification_resp = client.post(
+                "/invoices/inv-api-resolution/debtor-verification/register",
+                json={"creditor_name": "Creditor Ltd", "invoice_reference": "INV-RES"},
+            )
+            self.assertEqual(verification_resp.status_code, 200)
+            verification_case = verification_resp.json()
 
             health_resp = client.post(
                 "/invoices/inv-api-resolution/case-health-check",
@@ -1654,11 +1809,9 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(discrepancy_resp.status_code, 200)
 
-            debtor_resp = client.post(
-                "/invoices/inv-api-resolution/debtor-ledger/entries",
-                json={"entry_type": "ORIGINAL_PRINCIPAL", "amount_gbp": "1000", "description": "Initial principal"},
-            )
-            self.assertEqual(debtor_resp.status_code, 200)
+            first_due_date = date.today() + timedelta(days=5)
+            settlement_expiry_date = date.today() + timedelta(days=20)
+            settlement_payment_date = date.today()
 
             plan_resp = client.post(
                 "/invoices/inv-api-resolution/resolution/payment-plans",
@@ -1666,7 +1819,7 @@ class TestApi(unittest.TestCase):
                     "proposed_by": "USER-1",
                     "installment_amount_gbp": "200",
                     "installment_count": 3,
-                    "first_due_date": "2026-03-01",
+                    "first_due_date": first_due_date.isoformat(),
                     "frequency_days": 30,
                     "notes": "Plan terms",
                 },
@@ -1674,6 +1827,22 @@ class TestApi(unittest.TestCase):
             self.assertEqual(plan_resp.status_code, 200)
             plan_body = plan_resp.json()
             plan_id = plan_body["plan_id"]
+            self.assertEqual(plan_body["status"], "PROPOSED")
+            self.assertFalse(plan_body["chasers_paused"])
+
+            proposal_escalate_resp = client.post(
+                "/invoices/inv-api-resolution/escalate",
+                json={"today": "2026-02-15", "current_state": "OVERDUE_CHASER"},
+            )
+            self.assertEqual(proposal_escalate_resp.status_code, 200)
+
+            accept_plan_resp = client.post(
+                f"/invoices/inv-api-resolution/resolution/payment-plans/{plan_id}/accept",
+                json={"accepted_by": "Debtor Contact", "accepter_role": "DEBTOR"},
+            )
+            self.assertEqual(accept_plan_resp.status_code, 200)
+            self.assertEqual(accept_plan_resp.json()["status"], "ACTIVE")
+            self.assertTrue(accept_plan_resp.json()["chasers_paused"])
 
             blocked_escalate_resp = client.post(
                 "/invoices/inv-api-resolution/escalate",
@@ -1690,10 +1859,22 @@ class TestApi(unittest.TestCase):
                 },
             )
             self.assertEqual(pay_resp.status_code, 200)
+            report_id = pay_resp.json()["report_id"]
+            self.assertEqual(pay_resp.json()["status"], "PAYMENT_VERIFICATION_PENDING")
 
-            plans_list_resp = client.get("/invoices/inv-api-resolution/resolution/payment-plans?as_of_date=2026-08-01")
+            confirm_pay_resp = client.post(
+                f"/invoices/inv-api-resolution/reported-payments/{report_id}/confirm",
+                json={"creditor_user_id": "USER-1", "notes": "Cleared funds matched."},
+            )
+            self.assertEqual(confirm_pay_resp.status_code, 200)
+            self.assertIsNotNone(confirm_pay_resp.json()["payment_plan_payment_id"])
+
+            plans_list_resp = client.get(
+                f"/invoices/inv-api-resolution/resolution/payment-plans?as_of_date={(first_due_date + timedelta(days=95)).isoformat()}"
+            )
             self.assertEqual(plans_list_resp.status_code, 200)
             self.assertEqual(plans_list_resp.json()["plans"][0]["status"], "DEFAULTED")
+            self.assertEqual(plans_list_resp.json()["plans"][0]["paid_amount_gbp"], "200.00")
 
             promise_artifact_resp = client.post(
                 "/invoices/inv-api-resolution/resolution/artifacts/promise-to-pay",
@@ -1706,7 +1887,7 @@ class TestApi(unittest.TestCase):
 
             resumed_escalate_resp = client.post(
                 "/invoices/inv-api-resolution/escalate",
-                json={"today": "2026-08-01", "current_state": "FRIENDLY_REMINDER"},
+                json={"today": (first_due_date + timedelta(days=95)).isoformat(), "current_state": "FRIENDLY_REMINDER"},
             )
             self.assertEqual(resumed_escalate_resp.status_code, 200)
             self.assertEqual(resumed_escalate_resp.json()["next_state"], "FORMAL_NOTICE")
@@ -1716,7 +1897,7 @@ class TestApi(unittest.TestCase):
                 json={
                     "offered_by": "USER-1",
                     "offered_amount_gbp": "750",
-                    "expiry_date": "2026-09-15",
+                    "expiry_date": settlement_expiry_date.isoformat(),
                     "notes": "Full and final",
                 },
             )
@@ -1729,13 +1910,50 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(accept_debtor_resp.status_code, 200)
             self.assertFalse(accept_debtor_resp.json()["finalized"])
+            self.assertEqual(accept_debtor_resp.json()["status"], "OPEN")
 
             accept_creditor_resp = client.post(
                 f"/invoices/inv-api-resolution/resolution/settlement-offers/{offer_id}/accept",
                 json={"accepted_by": "Creditor User", "accepter_role": "CREDITOR"},
             )
             self.assertEqual(accept_creditor_resp.status_code, 200)
-            self.assertTrue(accept_creditor_resp.json()["finalized"])
+            self.assertFalse(accept_creditor_resp.json()["finalized"])
+            self.assertEqual(accept_creditor_resp.json()["status"], "AWAITING_PAYMENT")
+            self.assertTrue(accept_creditor_resp.json()["chasers_paused"])
+
+            blocked_settlement_escalate_resp = client.post(
+                "/invoices/inv-api-resolution/escalate",
+                json={"today": date.today().isoformat(), "current_state": "FORMAL_NOTICE"},
+            )
+            self.assertEqual(blocked_settlement_escalate_resp.status_code, 409)
+
+            settlement_payment_report_resp = client.post(
+                "/portal/actions/confirm-paid",
+                json={
+                    "case": verification_case["case_id"],
+                    "code": verification_case["verification_code"],
+                    "debtor_identifier": "debtor-resolution",
+                    "amount_gbp": "750",
+                    "payment_reference": "SETTLE-750",
+                    "payment_date": settlement_payment_date.isoformat(),
+                    "details": "Settlement payment sent.",
+                    "settlement_offer_id": offer_id,
+                },
+            )
+            self.assertEqual(settlement_payment_report_resp.status_code, 200)
+            settlement_report_id = settlement_payment_report_resp.json()["report_id"]
+            self.assertEqual(settlement_payment_report_resp.json()["status"], "PAYMENT_VERIFICATION_PENDING")
+            self.assertEqual(settlement_payment_report_resp.json()["settlement_offer_id"], offer_id)
+
+            settlement_confirm_resp = client.post(
+                f"/invoices/inv-api-resolution/reported-payments/{settlement_report_id}/confirm",
+                json={"creditor_user_id": "USER-1", "notes": "Settlement payment matched."},
+            )
+            self.assertEqual(settlement_confirm_resp.status_code, 200)
+            self.assertEqual(settlement_confirm_resp.json()["settlement_offer_id"], offer_id)
+            self.assertEqual(settlement_confirm_resp.json()["settlement_offer_status"], "FINALIZED")
+            self.assertIsNotNone(settlement_confirm_resp.json()["settlement_offer_finalization_id"])
+            self.assertEqual(settlement_confirm_resp.json()["outstanding_balance_gbp"], "0.00")
 
             settlement_artifact_resp = client.post(
                 "/invoices/inv-api-resolution/resolution/artifacts/settlement-agreement",
@@ -1760,6 +1978,8 @@ class TestApi(unittest.TestCase):
             offers_resp = client.get("/invoices/inv-api-resolution/resolution/settlement-offers")
             self.assertEqual(offers_resp.status_code, 200)
             self.assertEqual(offers_resp.json()["offers"][0]["status"], "FINALIZED")
+            self.assertEqual(offers_resp.json()["offers"][0]["confirmed_payment_total_gbp"], "750.00")
+            self.assertEqual(offers_resp.json()["offers"][0]["remaining_payment_gbp"], "0.00")
 
             carve_out_resp = client.post(
                 "/invoices/inv-api-resolution/resolution/dispute-carve-outs",
@@ -1769,12 +1989,11 @@ class TestApi(unittest.TestCase):
                     "created_by": "USER-1",
                 },
             )
-            self.assertEqual(carve_out_resp.status_code, 200)
-            self.assertEqual(carve_out_resp.json()["suggested_state"], "DISPUTE_REVIEW")
+            self.assertEqual(carve_out_resp.status_code, 400)
 
             carve_outs_resp = client.get("/invoices/inv-api-resolution/resolution/dispute-carve-outs")
             self.assertEqual(carve_outs_resp.status_code, 200)
-            self.assertEqual(len(carve_outs_resp.json()["carve_outs"]), 1)
+            self.assertEqual(len(carve_outs_resp.json()["carve_outs"]), 0)
 
             communication_resp = client.post(
                 "/invoices/inv-api-resolution/communications",
@@ -1786,13 +2005,7 @@ class TestApi(unittest.TestCase):
                     "automated": True,
                 },
             )
-            self.assertEqual(communication_resp.status_code, 200)
-            communication_id = communication_resp.json()["communication_id"]
-            queue_resp = client.post(
-                f"/invoices/inv-api-resolution/communications/{communication_id}/delivery-events",
-                json={"state": "QUEUED", "note": "Queued for delivery"},
-            )
-            self.assertEqual(queue_resp.status_code, 200)
+            self.assertEqual(communication_resp.status_code, 409)
 
             open_challenge_resp = client.post(
                 "/invoices/inv-api-resolution/debtor-actions/data-accuracy-challenge",
@@ -1828,6 +2041,45 @@ class TestApi(unittest.TestCase):
             self.assertIn(b"Evidence Artifact Inventory:", bundle_bytes)
             self.assertIn(b"Compliance Snapshot:", bundle_bytes)
             self.assertIn(b"Event Chain Attestation:", bundle_bytes)
+
+    def test_dispute_carve_out_endpoint_on_positive_outstanding_balance(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-carve-out.db")
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                bundles_dir=str(Path(tmp_dir) / "bundles"),
+            )
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-carve-out",
+                    "currency": "GBP",
+                    "principal_amount": "1000",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            carve_out_resp = client.post(
+                "/invoices/inv-api-carve-out/resolution/dispute-carve-outs",
+                json={
+                    "disputed_amount_gbp": "100",
+                    "reason": "Partial quality dispute",
+                    "created_by": "USER-1",
+                },
+            )
+            self.assertEqual(carve_out_resp.status_code, 200)
+            self.assertEqual(carve_out_resp.json()["suggested_state"], "DISPUTE_REVIEW")
+
+            carve_outs_resp = client.get("/invoices/inv-api-carve-out/resolution/dispute-carve-outs")
+            self.assertEqual(carve_outs_resp.status_code, 200)
+            self.assertEqual(len(carve_outs_resp.json()["carve_outs"]), 1)
 
     def test_public_verification_pages_and_bundle_download(self) -> None:
         with TemporaryDirectory() as tmp_dir:

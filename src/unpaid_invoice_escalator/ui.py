@@ -2008,7 +2008,7 @@ def render_operations_html() -> str:
             </div>
           </div>
           <div style="margin-top: 18px;">
-            <h3 style="margin:0 0 10px;">Record installment payment</h3>
+            <h3 style="margin:0 0 10px;">Report installment payment for verification</h3>
             <div class="form-grid">
               <label class="field">Plan<select id="plan-payment-plan-id"></select></label>
               <label class="field">Installment<select id="plan-payment-installment-id"></select></label>
@@ -2016,7 +2016,7 @@ def render_operations_html() -> str:
               <label class="field">Recorded by<input id="plan-payment-recorded-by" value="USER-1" /></label>
             </div>
             <div class="inline-actions" style="margin-top: 14px;">
-              <button id="record-plan-payment" class="secondary-button" type="button">Record plan payment</button>
+              <button id="record-plan-payment" class="secondary-button" type="button">Report plan payment</button>
             </div>
             <div id="plan-payment-result" class="status-line" style="margin-top: 12px;"></div>
           </div>
@@ -2025,7 +2025,7 @@ def render_operations_html() -> str:
           <div class="panel-header">
             <div>
               <h3>Settlement actions</h3>
-              <div class="panel-subtle">Create full-and-final offers and record acceptance from creditor or debtor.</div>
+              <div class="panel-subtle">Create full-and-final offers, capture bilateral acceptance, and hold chasers while verified payment is still due.</div>
             </div>
           </div>
           <div class="form-grid">
@@ -2210,7 +2210,7 @@ def render_operations_html() -> str:
     const invoiceId = document.getElementById("plan-invoice-id").value.trim();
     const planId = document.getElementById("plan-payment-plan-id").value;
     const installmentId = document.getElementById("plan-payment-installment-id").value;
-    fcdUi.setStatus("operations-status", "Recording payment-plan payment...");
+    fcdUi.setStatus("operations-status", "Reporting payment-plan payment for verification...");
     try {
       const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/resolution/payment-plans/${encodeURIComponent(planId)}/payments`, "POST", {
         installment_id: installmentId,
@@ -2220,13 +2220,14 @@ def render_operations_html() -> str:
       document.getElementById("plan-payment-result").innerHTML = `
         <div class="kv-list">
           <div class="kv-row"><label>Plan</label><div>${fcdUi.escape(result.plan_id)}</div></div>
-          <div class="kv-row"><label>Payment</label><div>${fcdUi.escape(result.payment_id)}</div></div>
+          <div class="kv-row"><label>Report</label><div>${fcdUi.escape(result.report_id)}</div></div>
           <div class="kv-row"><label>Amount</label><div>${fcdUi.escape(result.amount_gbp)}</div></div>
-          <div class="kv-row"><label>Recorded at</label><div>${fcdUi.escape(result.recorded_at)}</div></div>
+          <div class="kv-row"><label>Reported at</label><div>${fcdUi.escape(result.recorded_at)}</div></div>
+          <div class="kv-row"><label>Status</label><div>${fcdUi.escape(result.status)}</div></div>
         </div>
       `;
       await refreshResolutionPanels();
-      fcdUi.setStatus("operations-status", `Payment-plan payment recorded for ${result.invoice_id}`);
+      fcdUi.setStatus("operations-status", `Payment-plan payment reported for verification on ${result.invoice_id}`);
     } catch (error) {
       document.getElementById("plan-payment-result").textContent = error.message;
       fcdUi.setStatus("operations-status", error.message);
@@ -2274,7 +2275,9 @@ def render_operations_html() -> str:
           <div class="kv-row"><label>Offer</label><div>${fcdUi.escape(result.offer_id)}</div></div>
           <div class="kv-row"><label>Acceptance</label><div>${fcdUi.escape(result.acceptance_id)}</div></div>
           <div class="kv-row"><label>Role</label><div>${fcdUi.escape(result.accepter_role)}</div></div>
-          <div class="kv-row"><label>Finalized</label><div>${fcdUi.escape(String(result.finalized))}</div></div>
+          <div class="kv-row"><label>Status</label><div>${fcdUi.escape(result.status)}</div></div>
+          <div class="kv-row"><label>Remaining payment</label><div>${fcdUi.escape(result.remaining_payment_gbp)}</div></div>
+          <div class="kv-row"><label>Chasers paused</label><div>${fcdUi.escape(String(result.chasers_paused))}</div></div>
         </div>
       `;
       await refreshResolutionPanels();
@@ -2726,10 +2729,84 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
           <div id="workspace-audit" class="log-list"></div>
         </div>
       </section>
+
+      <section class="cards-2">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Resolution artifacts</h2>
+              <div class="panel-subtle">Generate promise-to-pay and settlement artifacts from live resolution records.</div>
+            </div>
+          </div>
+          <div class="form-grid">
+            <label class="field">Payment plan<select id="workspace-plan-id"></select></label>
+            <label class="field">Promise filename<input id="workspace-plan-filename" value="{invoice_id}_promise_to_pay.pdf" /></label>
+            <label class="field">Settlement offer<select id="workspace-offer-id"></select></label>
+            <label class="field">Settlement filename<input id="workspace-offer-filename" value="{invoice_id}_settlement_agreement.pdf" /></label>
+          </div>
+          <div class="inline-actions" style="margin-top: 14px;">
+            <button id="generate-promise-artifact" type="button">Generate promise to pay</button>
+            <button id="generate-settlement-artifact" class="secondary-button" type="button">Generate settlement agreement</button>
+          </div>
+          <div id="workspace-resolution-result" class="status-line" style="margin-top: 12px;"></div>
+          <div style="margin-top: 18px;">
+            <h3 style="margin:0 0 10px;">Settlement acceptance</h3>
+            <div class="form-grid">
+              <label class="field">Accepted by<input id="workspace-offer-accepted-by" value="USER-1" /></label>
+              <label class="field">Role
+                <select id="workspace-offer-accepter-role">
+                  <option value="CREDITOR">CREDITOR</option>
+                  <option value="DEBTOR">DEBTOR</option>
+                </select>
+              </label>
+            </div>
+            <div class="inline-actions" style="margin-top: 14px;">
+              <button id="workspace-accept-settlement" class="secondary-button" type="button">Record settlement acceptance</button>
+            </div>
+            <div id="workspace-acceptance-result" class="status-line" style="margin-top: 12px;"></div>
+          </div>
+          <div style="margin-top: 14px;">
+            <h3 style="margin:0 0 10px;">Resolution history</h3>
+            <div id="workspace-resolution-history" class="action-list">
+              <div class="empty-state">No payment plans or settlement offers recorded yet.</div>
+            </div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Ledger manifest controls</h2>
+              <div class="panel-subtle">Generate and verify manifest exports for this specific case.</div>
+            </div>
+          </div>
+          <div class="form-grid">
+            <label class="field">Output format
+              <select id="workspace-manifest-format">
+                <option value="json">JSON</option>
+                <option value="pdf">PDF</option>
+              </select>
+            </label>
+            <label class="field">Manifest filename<input id="workspace-manifest-filename" value="{invoice_id}_manifest.json" /></label>
+            <label class="field">Verify filename<input id="workspace-manifest-verify-filename" value="{invoice_id}_manifest.json" /></label>
+          </div>
+          <div class="inline-actions" style="margin-top: 14px;">
+            <button id="generate-manifest" type="button">Generate manifest</button>
+            <button id="verify-manifest" class="secondary-button" type="button">Verify manifest</button>
+          </div>
+          <div id="workspace-manifest-result" class="status-line" style="margin-top: 12px;"></div>
+          <div style="margin-top: 14px;">
+            <h3 style="margin:0 0 10px;">Export inventory</h3>
+            <div id="workspace-export-inventory" class="action-list">
+              <div class="empty-state">No export artifacts recorded yet.</div>
+            </div>
+          </div>
+        </div>
+      </section>
     """
     script = """
 <script>
   const workspaceInvoiceId = "__INVOICE_ID__";
+  const workspaceState = { plans: [], offers: [], artifacts: [] };
 
   function renderWorkspaceMetrics(detail) {
     const cards = [
@@ -2771,15 +2848,195 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
     target.innerHTML = entries.slice().reverse().map(formatter).join("");
   }
 
+  function syncWorkspaceSelectors() {
+    const planSelect = document.getElementById("workspace-plan-id");
+    const offerSelect = document.getElementById("workspace-offer-id");
+    planSelect.innerHTML = workspaceState.plans.length
+      ? workspaceState.plans.map((plan) => `<option value="${fcdUi.escape(plan.plan_id)}">${fcdUi.escape(`${plan.plan_id} | ${plan.status} | ${plan.remaining_amount_gbp}`)}</option>`).join("")
+      : "";
+    offerSelect.innerHTML = workspaceState.offers.length
+      ? workspaceState.offers.map((offer) => `<option value="${fcdUi.escape(offer.offer_id)}">${fcdUi.escape(`${offer.offer_id} | ${offer.status} | ${offer.offered_amount_gbp}`)}</option>`).join("")
+      : "";
+  }
+
+  function renderWorkspaceResolutionHistory() {
+    const rows = [
+      ...workspaceState.plans.map((plan) => ({
+        label: `Plan ${plan.plan_id}`,
+        meta: `${plan.status} | ${plan.installment_count} installments | remaining ${plan.remaining_amount_gbp}`
+      })),
+      ...workspaceState.offers.map((offer) => ({
+        label: `Offer ${offer.offer_id}`,
+        meta: `${offer.status} | ${offer.offered_amount_gbp} | expires ${offer.expiry_date}`
+      }))
+    ];
+    document.getElementById("workspace-resolution-history").innerHTML = rows.length
+      ? rows.slice().reverse().slice(0, 6).map((row) => `
+        <div class="action-item">
+          <strong>${fcdUi.escape(row.label)}</strong>
+          <span class="list-meta">${fcdUi.escape(row.meta)}</span>
+        </div>
+      `).join("")
+      : '<div class="empty-state">No payment plans or settlement offers recorded yet.</div>';
+  }
+
+  function renderWorkspaceExportInventory() {
+    document.getElementById("workspace-export-inventory").innerHTML = workspaceState.artifacts.length
+      ? workspaceState.artifacts.slice().reverse().slice(0, 6).map((artifact) => `
+        <div class="action-item">
+          <strong>${fcdUi.escape(artifact.artifact_type)}</strong>
+          <span class="list-meta">${fcdUi.escape(`${artifact.document_id} | ${artifact.upload_timestamp}`)}</span>
+        </div>
+      `).join("")
+      : '<div class="empty-state">No export artifacts recorded yet.</div>';
+  }
+
+  function syncManifestFilename() {
+    const format = document.getElementById("workspace-manifest-format").value;
+    const filename = format === "pdf" ? `${workspaceInvoiceId}_manifest.pdf` : `${workspaceInvoiceId}_manifest.json`;
+    document.getElementById("workspace-manifest-filename").value = filename;
+    document.getElementById("workspace-manifest-verify-filename").value = filename;
+  }
+
+  async function generatePromiseArtifact() {
+    const planId = document.getElementById("workspace-plan-id").value;
+    if (!planId) {
+      document.getElementById("workspace-resolution-result").textContent = "A payment plan is required.";
+      return;
+    }
+    document.getElementById("workspace-resolution-result").textContent = "Generating promise-to-pay artifact...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/resolution/artifacts/promise-to-pay`, "POST", {
+        plan_id: planId,
+        output_filename: document.getElementById("workspace-plan-filename").value
+      });
+      document.getElementById("workspace-resolution-result").innerHTML = `
+        <div class="kv-list">
+          <div class="kv-row"><label>Plan</label><div>${fcdUi.escape(result.plan_id)}</div></div>
+          <div class="kv-row"><label>Artifact type</label><div>${fcdUi.escape(result.artifact_type)}</div></div>
+          <div class="kv-row"><label>Document ID</label><div>${fcdUi.escape(result.document_id)}</div></div>
+          <div class="kv-row"><label>File hash</label><div>${fcdUi.escape(result.file_hash)}</div></div>
+        </div>
+      `;
+      await loadWorkspace();
+    } catch (error) {
+      document.getElementById("workspace-resolution-result").textContent = error.message;
+    }
+  }
+
+  async function generateSettlementArtifact() {
+    const offerId = document.getElementById("workspace-offer-id").value;
+    if (!offerId) {
+      document.getElementById("workspace-resolution-result").textContent = "A settlement offer is required.";
+      return;
+    }
+    document.getElementById("workspace-resolution-result").textContent = "Generating settlement artifact...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/resolution/artifacts/settlement-agreement`, "POST", {
+        offer_id: offerId,
+        output_filename: document.getElementById("workspace-offer-filename").value
+      });
+      document.getElementById("workspace-resolution-result").innerHTML = `
+        <div class="kv-list">
+          <div class="kv-row"><label>Offer</label><div>${fcdUi.escape(result.offer_id)}</div></div>
+          <div class="kv-row"><label>Artifact type</label><div>${fcdUi.escape(result.artifact_type)}</div></div>
+          <div class="kv-row"><label>Document ID</label><div>${fcdUi.escape(result.document_id)}</div></div>
+          <div class="kv-row"><label>File hash</label><div>${fcdUi.escape(result.file_hash)}</div></div>
+        </div>
+      `;
+      await loadWorkspace();
+    } catch (error) {
+      document.getElementById("workspace-resolution-result").textContent = error.message;
+    }
+  }
+
+  async function acceptWorkspaceSettlement() {
+    const offerId = document.getElementById("workspace-offer-id").value;
+    if (!offerId) {
+      document.getElementById("workspace-acceptance-result").textContent = "A settlement offer is required.";
+      return;
+    }
+    document.getElementById("workspace-acceptance-result").textContent = "Recording settlement acceptance...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/resolution/settlement-offers/${encodeURIComponent(offerId)}/accept`, "POST", {
+        accepted_by: document.getElementById("workspace-offer-accepted-by").value,
+        accepter_role: document.getElementById("workspace-offer-accepter-role").value
+      });
+      document.getElementById("workspace-acceptance-result").innerHTML = `
+        <div class="kv-list">
+          <div class="kv-row"><label>Offer</label><div>${fcdUi.escape(result.offer_id)}</div></div>
+          <div class="kv-row"><label>Acceptance</label><div>${fcdUi.escape(result.acceptance_id)}</div></div>
+          <div class="kv-row"><label>Role</label><div>${fcdUi.escape(result.accepter_role)}</div></div>
+          <div class="kv-row"><label>Status</label><div>${fcdUi.escape(result.status)}</div></div>
+          <div class="kv-row"><label>Remaining payment</label><div>${fcdUi.escape(result.remaining_payment_gbp)}</div></div>
+          <div class="kv-row"><label>Chasers paused</label><div>${fcdUi.escape(String(result.chasers_paused))}</div></div>
+        </div>
+      `;
+      await loadWorkspace();
+    } catch (error) {
+      document.getElementById("workspace-acceptance-result").textContent = error.message;
+    }
+  }
+
+  async function generateManifest() {
+    document.getElementById("workspace-manifest-result").textContent = "Generating ledger manifest...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/ledger-manifests`, "POST", {
+        output_filename: document.getElementById("workspace-manifest-filename").value,
+        output_format: document.getElementById("workspace-manifest-format").value
+      });
+      document.getElementById("workspace-manifest-result").innerHTML = `
+        <div class="kv-list">
+          <div class="kv-row"><label>Format</label><div>${fcdUi.escape(result.manifest_format)}</div></div>
+          <div class="kv-row"><label>Outstanding</label><div>${fcdUi.escape(result.outstanding_balance_gbp)}</div></div>
+          <div class="kv-row"><label>Chain valid</label><div>${fcdUi.escape(String(result.chain_valid))}</div></div>
+          <div class="kv-row"><label>Events</label><div>${fcdUi.escape(result.events_count)}</div></div>
+        </div>
+      `;
+      document.getElementById("workspace-manifest-verify-filename").value = document.getElementById("workspace-manifest-filename").value;
+      await loadWorkspace();
+    } catch (error) {
+      document.getElementById("workspace-manifest-result").textContent = error.message;
+    }
+  }
+
+  async function verifyManifest() {
+    document.getElementById("workspace-manifest-result").textContent = "Verifying ledger manifest...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/ledger-manifests/verify`, "POST", {
+        output_filename: document.getElementById("workspace-manifest-verify-filename").value
+      });
+      document.getElementById("workspace-manifest-result").innerHTML = `
+        <div class="kv-list">
+          <div class="kv-row"><label>Signature valid</label><div>${fcdUi.escape(String(result.signature_valid))}</div></div>
+          <div class="kv-row"><label>Core matches current ledger</label><div>${fcdUi.escape(String(result.core_matches_current_ledger))}</div></div>
+          <div class="kv-row"><label>Overall valid</label><div>${fcdUi.escape(String(result.overall_valid))}</div></div>
+        </div>
+      `;
+    } catch (error) {
+      document.getElementById("workspace-manifest-result").textContent = error.message;
+    }
+  }
+
   async function loadWorkspace() {
-    const [detail, communications, compliance, audit] = await Promise.all([
+    const [detail, communications, compliance, audit, plansPayload, offersPayload, artifactsPayload] = await Promise.all([
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/communications`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/compliance-ledger`),
-      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/audit-trail`)
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/audit-trail`),
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/resolution/payment-plans`),
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/resolution/settlement-offers`),
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/evidence-artifacts`)
     ]);
+    workspaceState.plans = plansPayload.plans || [];
+    workspaceState.offers = offersPayload.offers || [];
+    workspaceState.artifacts = artifactsPayload.artifacts || [];
     renderWorkspaceMetrics(detail);
     renderWorkspaceSummary(detail);
+    syncWorkspaceSelectors();
+    syncManifestFilename();
+    renderWorkspaceResolutionHistory();
+    renderWorkspaceExportInventory();
     renderLogList("workspace-communications", communications.communications || [], (entry) => `
       <div class="log-item">
         <strong>${fcdUi.escape(entry.subject)}</strong>
@@ -2810,6 +3067,12 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
     `);
   }
 
+  document.getElementById("generate-promise-artifact").addEventListener("click", generatePromiseArtifact);
+  document.getElementById("generate-settlement-artifact").addEventListener("click", generateSettlementArtifact);
+  document.getElementById("workspace-accept-settlement").addEventListener("click", acceptWorkspaceSettlement);
+  document.getElementById("generate-manifest").addEventListener("click", generateManifest);
+  document.getElementById("verify-manifest").addEventListener("click", verifyManifest);
+  document.getElementById("workspace-manifest-format").addEventListener("change", syncManifestFilename);
   window.addEventListener("load", loadWorkspace);
 </script>
 """.replace("__INVOICE_ID__", invoice_id)

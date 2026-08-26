@@ -8,6 +8,7 @@ import unittest
 
 from unpaid_invoice_escalator.models import (
     Actor,
+    ArtifactType,
     AuditTrailEntry,
     BankDetailVerificationState,
     ClientFeeAction,
@@ -23,8 +24,16 @@ from unpaid_invoice_escalator.models import (
     Invoice,
     Jurisdiction,
     PaymentPlanAgreement,
+    PaymentPlanDecision,
+    PaymentPlanDecisionStatus,
     PreOverdueHygieneRecord,
+    ReportedPayment,
+    ReportedPaymentDecision,
+    ReportedPaymentEvidenceLink,
+    ReportedPaymentStatus,
     SettlementBankDetailRecord,
+    SettlementOffer,
+    SettlementOfferFinalization,
 )
 from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
 from unpaid_invoice_escalator.services.dual_ledger_engine import DualLedgerEngine
@@ -204,6 +213,141 @@ class TestSQLiteStore(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_reported_payment_tables_are_persisted_and_append_only(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "escalator-reported-payments.db")
+            store = SQLiteStore(db_path)
+            ledger = SQLiteInvoiceLedger(store)
+            invoice = Invoice(
+                invoice_id="inv-db-payment-report",
+                currency="GBP",
+                principal_amount=Decimal("650"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            store.append_reported_payment(
+                ReportedPayment(
+                    report_id="report-1",
+                    invoice_id=invoice.invoice_id,
+                    case_id="FCD-R-2026-000111",
+                    debtor_identifier="debtor@example.com",
+                    reported_at=datetime.now(timezone.utc),
+                    amount_gbp=Decimal("125.00"),
+                    payment_reference="PAY-REF-1",
+                    payment_date=date(2026, 2, 10),
+                    details="Reported from portal",
+                    settlement_offer_id="offer-1",
+                )
+            )
+            store.append_reported_payment_decision(
+                ReportedPaymentDecision(
+                    decision_id="decision-1",
+                    report_id="report-1",
+                    invoice_id=invoice.invoice_id,
+                    decided_at=datetime.now(timezone.utc),
+                    decided_by="USER-1",
+                    status=ReportedPaymentStatus.NEEDS_EVIDENCE,
+                    notes="Please upload remittance.",
+                )
+            )
+            artifact_path = Path(tmp_dir) / "doc-1.txt"
+            artifact_path.write_text("payment evidence", encoding="utf-8")
+            artifact = ledger.record_evidence_artifact(
+                invoice_id=invoice.invoice_id,
+                file_path=str(artifact_path),
+                user_id="debtor@example.com",
+                artifact_type=ArtifactType.PAYMENT_EVIDENCE,
+            )
+            store.append_reported_payment_evidence_link(
+                ReportedPaymentEvidenceLink(
+                    link_id="link-1",
+                    report_id="report-1",
+                    invoice_id=invoice.invoice_id,
+                    document_id=artifact.document_id,
+                    linked_at=datetime.now(timezone.utc),
+                    linked_by="debtor@example.com",
+                )
+            )
+
+            self.assertEqual(store.reported_payment_by_id("report-1").payment_reference, "PAY-REF-1")
+            self.assertEqual(store.reported_payment_by_id("report-1").settlement_offer_id, "offer-1")
+            self.assertEqual(store.reported_payment_decisions_for_report("report-1")[0].status, ReportedPaymentStatus.NEEDS_EVIDENCE)
+            self.assertEqual(store.reported_payment_evidence_links_for_report("report-1")[0].document_id, artifact.document_id)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                for table in (
+                    "reported_payments",
+                    "reported_payment_decisions",
+                    "reported_payment_evidence_links",
+                ):
+                    with self.assertRaises(sqlite3.DatabaseError):
+                        conn.execute(f"UPDATE {table} SET invoice_id = 'altered'")
+                    conn.rollback()
+                    with self.assertRaises(sqlite3.DatabaseError):
+                        conn.execute(f"DELETE FROM {table}")
+                    conn.rollback()
+            finally:
+                conn.close()
+
+    def test_settlement_finalization_table_is_append_only(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "escalator-settlement-finalization.db")
+            store = SQLiteStore(db_path)
+            invoice = Invoice(
+                invoice_id="inv-db-settlement-finalization",
+                currency="GBP",
+                principal_amount=Decimal("1000"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            store.append_settlement_offer(
+                SettlementOffer(
+                    offer_id="offer-1",
+                    invoice_id=invoice.invoice_id,
+                    offered_at=datetime.now(timezone.utc),
+                    offered_by="USER-1",
+                    offered_amount_gbp=Decimal("750.00"),
+                    expiry_date=date(2026, 9, 1),
+                    notes="Full and final",
+                )
+            )
+            store.append_settlement_offer_finalization(
+                SettlementOfferFinalization(
+                    finalization_id="finalization-1",
+                    offer_id="offer-1",
+                    invoice_id=invoice.invoice_id,
+                    finalized_at=datetime.now(timezone.utc),
+                    finalized_by="USER-1",
+                    triggering_report_id=None,
+                    confirmed_payment_total_gbp=Decimal("750.00"),
+                    outstanding_before_gbp=Decimal("250.00"),
+                    settlement_discount_applied_gbp=Decimal("250.00"),
+                )
+            )
+
+            self.assertEqual(
+                store.settlement_offer_finalization_by_offer_id("offer-1").settlement_discount_applied_gbp,
+                Decimal("250.00"),
+            )
+
+            conn = sqlite3.connect(db_path)
+            try:
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("UPDATE settlement_offer_finalizations SET finalized_by = 'USER-X'")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM settlement_offer_finalizations")
+                conn.rollback()
+            finally:
+                conn.close()
+
     def test_payment_plan_tables_are_append_only(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "escalator.db")
@@ -230,6 +374,17 @@ class TestSQLiteStore(unittest.TestCase):
                     frequency_days=30,
                 )
             )
+            store.append_payment_plan_decision(
+                PaymentPlanDecision(
+                    decision_id="plan-decision-1",
+                    plan_id="plan-1",
+                    invoice_id=invoice.invoice_id,
+                    decided_at=datetime.now(timezone.utc),
+                    decided_by="USER-2",
+                    actor_role="DEBTOR",
+                    status=PaymentPlanDecisionStatus.ACCEPTED,
+                )
+            )
             conn = sqlite3.connect(db_path)
             try:
                 with self.assertRaises(sqlite3.DatabaseError):
@@ -237,6 +392,12 @@ class TestSQLiteStore(unittest.TestCase):
                 conn.rollback()
                 with self.assertRaises(sqlite3.DatabaseError):
                     conn.execute("DELETE FROM payment_plan_agreements")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("UPDATE payment_plan_decisions SET actor_role = 'SYSTEM'")
+                conn.rollback()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    conn.execute("DELETE FROM payment_plan_decisions")
                 conn.rollback()
             finally:
                 conn.close()

@@ -32,12 +32,19 @@ from unpaid_invoice_escalator.models import (
     Jurisdiction,
     LedgerEvent,
     PaymentPlanAgreement,
+    PaymentPlanDecision,
+    PaymentPlanDecisionStatus,
     PaymentPlanInstallment,
     PaymentPlanPayment,
     PreOverdueHygieneRecord,
     RecoveryCostCategory,
+    ReportedPayment,
+    ReportedPaymentDecision,
+    ReportedPaymentEvidenceLink,
+    ReportedPaymentStatus,
     SettlementBankDetailRecord,
     SettlementAcceptance,
+    SettlementOfferFinalization,
     SettlementOffer,
 )
 
@@ -234,6 +241,58 @@ class SQLiteStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS reported_payments (
+                    report_id TEXT PRIMARY KEY,
+                    invoice_id TEXT NOT NULL,
+                    case_id TEXT NOT NULL,
+                    debtor_identifier TEXT NOT NULL,
+                    reported_at TEXT NOT NULL,
+                    amount_gbp TEXT NOT NULL,
+                    payment_reference TEXT NOT NULL DEFAULT '',
+                    payment_date TEXT,
+                    details TEXT NOT NULL DEFAULT '',
+                    plan_id TEXT,
+                    installment_id TEXT,
+                    settlement_offer_id TEXT,
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reported_payment_decisions (
+                    decision_id TEXT PRIMARY KEY,
+                    report_id TEXT NOT NULL,
+                    invoice_id TEXT NOT NULL,
+                    decided_at TEXT NOT NULL,
+                    decided_by TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    confirmed_amount_gbp TEXT,
+                    linked_debtor_entry_id TEXT,
+                    FOREIGN KEY(report_id) REFERENCES reported_payments(report_id),
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reported_payment_evidence_links (
+                    link_id TEXT PRIMARY KEY,
+                    report_id TEXT NOT NULL,
+                    invoice_id TEXT NOT NULL,
+                    document_id TEXT NOT NULL,
+                    linked_at TEXT NOT NULL,
+                    linked_by TEXT NOT NULL,
+                    FOREIGN KEY(report_id) REFERENCES reported_payments(report_id),
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id),
+                    FOREIGN KEY(document_id) REFERENCES evidence_artifacts(document_id)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS communication_delivery_events (
                     event_id TEXT PRIMARY KEY,
                     communication_id TEXT NOT NULL,
@@ -252,6 +311,16 @@ class SQLiteStore:
             }
             if "automated" not in communication_columns:
                 conn.execute("ALTER TABLE communications ADD COLUMN automated INTEGER NOT NULL DEFAULT 1")
+            reported_payment_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(reported_payments)").fetchall()
+            }
+            if "plan_id" not in reported_payment_columns:
+                conn.execute("ALTER TABLE reported_payments ADD COLUMN plan_id TEXT")
+            if "installment_id" not in reported_payment_columns:
+                conn.execute("ALTER TABLE reported_payments ADD COLUMN installment_id TEXT")
+            if "settlement_offer_id" not in reported_payment_columns:
+                conn.execute("ALTER TABLE reported_payments ADD COLUMN settlement_offer_id TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS payment_plan_agreements (
@@ -264,10 +333,25 @@ class SQLiteStore:
                     first_due_date TEXT NOT NULL,
                     frequency_days INTEGER NOT NULL,
                     notes TEXT NOT NULL DEFAULT '',
+                    proposer_role TEXT NOT NULL DEFAULT 'CREDITOR',
+                    parent_plan_id TEXT,
+                    version_number INTEGER NOT NULL DEFAULT 1,
                     FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
                 )
                 """
             )
+            payment_plan_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(payment_plan_agreements)").fetchall()
+            }
+            if "proposer_role" not in payment_plan_columns:
+                conn.execute(
+                    "ALTER TABLE payment_plan_agreements ADD COLUMN proposer_role TEXT NOT NULL DEFAULT 'CREDITOR'"
+                )
+            if "parent_plan_id" not in payment_plan_columns:
+                conn.execute("ALTER TABLE payment_plan_agreements ADD COLUMN parent_plan_id TEXT")
+            if "version_number" not in payment_plan_columns:
+                conn.execute("ALTER TABLE payment_plan_agreements ADD COLUMN version_number INTEGER NOT NULL DEFAULT 1")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS payment_plan_installments (
@@ -292,8 +376,31 @@ class SQLiteStore:
                     paid_at TEXT NOT NULL,
                     amount_gbp TEXT NOT NULL,
                     recorded_by TEXT NOT NULL,
+                    reported_payment_id TEXT,
                     FOREIGN KEY(plan_id) REFERENCES payment_plan_agreements(plan_id),
                     FOREIGN KEY(installment_id) REFERENCES payment_plan_installments(installment_id),
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            payment_plan_payment_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(payment_plan_payments)").fetchall()
+            }
+            if "reported_payment_id" not in payment_plan_payment_columns:
+                conn.execute("ALTER TABLE payment_plan_payments ADD COLUMN reported_payment_id TEXT")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payment_plan_decisions (
+                    decision_id TEXT PRIMARY KEY,
+                    plan_id TEXT NOT NULL,
+                    invoice_id TEXT NOT NULL,
+                    decided_at TEXT NOT NULL,
+                    decided_by TEXT NOT NULL,
+                    actor_role TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    notes TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(plan_id) REFERENCES payment_plan_agreements(plan_id),
                     FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
                 )
                 """
@@ -323,6 +430,24 @@ class SQLiteStore:
                     accepter_role TEXT NOT NULL,
                     FOREIGN KEY(offer_id) REFERENCES settlement_offers(offer_id),
                     FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS settlement_offer_finalizations (
+                    finalization_id TEXT PRIMARY KEY,
+                    offer_id TEXT NOT NULL,
+                    invoice_id TEXT NOT NULL,
+                    finalized_at TEXT NOT NULL,
+                    finalized_by TEXT NOT NULL,
+                    triggering_report_id TEXT,
+                    confirmed_payment_total_gbp TEXT NOT NULL,
+                    outstanding_before_gbp TEXT NOT NULL,
+                    settlement_discount_applied_gbp TEXT NOT NULL,
+                    FOREIGN KEY(offer_id) REFERENCES settlement_offers(offer_id),
+                    FOREIGN KEY(invoice_id) REFERENCES invoices(invoice_id),
+                    FOREIGN KEY(triggering_report_id) REFERENCES reported_payments(report_id)
                 )
                 """
             )
@@ -436,6 +561,24 @@ class SQLiteStore:
             )
             conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_reported_payments_invoice_time
+                ON reported_payments(invoice_id, reported_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_reported_payment_decisions_report_time
+                ON reported_payment_decisions(report_id, decided_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_reported_payment_evidence_links_report_time
+                ON reported_payment_evidence_links(report_id, linked_at)
+                """
+            )
+            conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_bank_details_invoice_time
                 ON settlement_bank_detail_records(invoice_id, created_at)
                 """
@@ -454,6 +597,12 @@ class SQLiteStore:
             )
             conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_payment_plans_parent
+                ON payment_plan_agreements(parent_plan_id, created_at)
+                """
+            )
+            conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_payment_installments_plan
                 ON payment_plan_installments(plan_id, sequence_number)
                 """
@@ -466,6 +615,12 @@ class SQLiteStore:
             )
             conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_payment_plan_decisions_plan
+                ON payment_plan_decisions(plan_id, decided_at)
+                """
+            )
+            conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_settlement_offers_invoice
                 ON settlement_offers(invoice_id, offered_at)
                 """
@@ -474,6 +629,12 @@ class SQLiteStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_settlement_acceptances_offer
                 ON settlement_acceptances(offer_id, accepted_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_settlement_offer_finalizations_offer
+                ON settlement_offer_finalizations(offer_id, finalized_at)
                 """
             )
             conn.execute(
@@ -681,11 +842,16 @@ class SQLiteStore:
                 """
             )
             for table_name in (
+                "reported_payments",
+                "reported_payment_decisions",
+                "reported_payment_evidence_links",
                 "payment_plan_agreements",
                 "payment_plan_installments",
                 "payment_plan_payments",
+                "payment_plan_decisions",
                 "settlement_offers",
                 "settlement_acceptances",
+                "settlement_offer_finalizations",
                 "dispute_carve_outs",
                 "settlement_bank_detail_records",
             ):
@@ -1297,6 +1463,186 @@ class SQLiteStore:
             )
             conn.commit()
 
+    def append_reported_payment(self, report: ReportedPayment) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO reported_payments (
+                    report_id, invoice_id, case_id, debtor_identifier, reported_at,
+                    amount_gbp, payment_reference, payment_date, details, plan_id, installment_id, settlement_offer_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report.report_id,
+                    report.invoice_id,
+                    report.case_id,
+                    report.debtor_identifier,
+                    report.reported_at.isoformat(),
+                    str(report.amount_gbp),
+                    report.payment_reference,
+                    None if report.payment_date is None else report.payment_date.isoformat(),
+                    report.details,
+                    report.plan_id,
+                    report.installment_id,
+                    report.settlement_offer_id,
+                ),
+            )
+            conn.commit()
+
+    def reported_payment_by_id(self, report_id: str) -> ReportedPayment | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT report_id, invoice_id, case_id, debtor_identifier, reported_at,
+                       amount_gbp, payment_reference, payment_date, details, plan_id, installment_id, settlement_offer_id
+                FROM reported_payments
+                WHERE report_id = ?
+                """,
+                (report_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ReportedPayment(
+            report_id=row["report_id"],
+            invoice_id=row["invoice_id"],
+            case_id=row["case_id"],
+            debtor_identifier=row["debtor_identifier"],
+            reported_at=datetime.fromisoformat(row["reported_at"]),
+            amount_gbp=Decimal(row["amount_gbp"]),
+            payment_reference=row["payment_reference"],
+            payment_date=None if row["payment_date"] is None else date.fromisoformat(row["payment_date"]),
+            details=row["details"],
+            plan_id=row["plan_id"],
+            installment_id=row["installment_id"],
+            settlement_offer_id=row["settlement_offer_id"],
+        )
+
+    def reported_payments_for_invoice(self, invoice_id: str) -> tuple[ReportedPayment, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT report_id, invoice_id, case_id, debtor_identifier, reported_at,
+                       amount_gbp, payment_reference, payment_date, details, plan_id, installment_id, settlement_offer_id
+                FROM reported_payments
+                WHERE invoice_id = ?
+                ORDER BY reported_at ASC, rowid ASC
+                """,
+                (invoice_id,),
+            ).fetchall()
+        return tuple(
+            ReportedPayment(
+                report_id=row["report_id"],
+                invoice_id=row["invoice_id"],
+                case_id=row["case_id"],
+                debtor_identifier=row["debtor_identifier"],
+                reported_at=datetime.fromisoformat(row["reported_at"]),
+                amount_gbp=Decimal(row["amount_gbp"]),
+                payment_reference=row["payment_reference"],
+                payment_date=None if row["payment_date"] is None else date.fromisoformat(row["payment_date"]),
+                details=row["details"],
+                plan_id=row["plan_id"],
+                installment_id=row["installment_id"],
+                settlement_offer_id=row["settlement_offer_id"],
+            )
+            for row in rows
+        )
+
+    def append_reported_payment_decision(self, decision: ReportedPaymentDecision) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO reported_payment_decisions (
+                    decision_id, report_id, invoice_id, decided_at, decided_by, status,
+                    reason, notes, confirmed_amount_gbp, linked_debtor_entry_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision.decision_id,
+                    decision.report_id,
+                    decision.invoice_id,
+                    decision.decided_at.isoformat(),
+                    decision.decided_by,
+                    decision.status.value,
+                    decision.reason,
+                    decision.notes,
+                    None if decision.confirmed_amount_gbp is None else str(decision.confirmed_amount_gbp),
+                    decision.linked_debtor_entry_id,
+                ),
+            )
+            conn.commit()
+
+    def reported_payment_decisions_for_report(self, report_id: str) -> tuple[ReportedPaymentDecision, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT decision_id, report_id, invoice_id, decided_at, decided_by, status,
+                       reason, notes, confirmed_amount_gbp, linked_debtor_entry_id
+                FROM reported_payment_decisions
+                WHERE report_id = ?
+                ORDER BY decided_at ASC, rowid ASC
+                """,
+                (report_id,),
+            ).fetchall()
+        return tuple(
+            ReportedPaymentDecision(
+                decision_id=row["decision_id"],
+                report_id=row["report_id"],
+                invoice_id=row["invoice_id"],
+                decided_at=datetime.fromisoformat(row["decided_at"]),
+                decided_by=row["decided_by"],
+                status=ReportedPaymentStatus(row["status"]),
+                reason=row["reason"],
+                notes=row["notes"],
+                confirmed_amount_gbp=(
+                    None if row["confirmed_amount_gbp"] is None else Decimal(row["confirmed_amount_gbp"])
+                ),
+                linked_debtor_entry_id=row["linked_debtor_entry_id"],
+            )
+            for row in rows
+        )
+
+    def append_reported_payment_evidence_link(self, link: ReportedPaymentEvidenceLink) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO reported_payment_evidence_links (
+                    link_id, report_id, invoice_id, document_id, linked_at, linked_by
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    link.link_id,
+                    link.report_id,
+                    link.invoice_id,
+                    link.document_id,
+                    link.linked_at.isoformat(),
+                    link.linked_by,
+                ),
+            )
+            conn.commit()
+
+    def reported_payment_evidence_links_for_report(self, report_id: str) -> tuple[ReportedPaymentEvidenceLink, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT link_id, report_id, invoice_id, document_id, linked_at, linked_by
+                FROM reported_payment_evidence_links
+                WHERE report_id = ?
+                ORDER BY linked_at ASC, rowid ASC
+                """,
+                (report_id,),
+            ).fetchall()
+        return tuple(
+            ReportedPaymentEvidenceLink(
+                link_id=row["link_id"],
+                report_id=row["report_id"],
+                invoice_id=row["invoice_id"],
+                document_id=row["document_id"],
+                linked_at=datetime.fromisoformat(row["linked_at"]),
+                linked_by=row["linked_by"],
+            )
+            for row in rows
+        )
+
     def communication_for_id(self, communication_id: str) -> CommunicationRecord | None:
         with self._connection() as conn:
             row = conn.execute(
@@ -1418,8 +1764,8 @@ class SQLiteStore:
                 """
                 INSERT INTO payment_plan_agreements (
                     plan_id, invoice_id, created_at, proposed_by, installment_amount_gbp,
-                    installment_count, first_due_date, frequency_days, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    installment_count, first_due_date, frequency_days, notes, proposer_role, parent_plan_id, version_number
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     agreement.plan_id,
@@ -1431,9 +1777,41 @@ class SQLiteStore:
                     agreement.first_due_date.isoformat(),
                     agreement.frequency_days,
                     agreement.notes,
+                    agreement.proposer_role,
+                    agreement.parent_plan_id,
+                    agreement.version_number,
                 ),
             )
             conn.commit()
+
+    def payment_plan_agreement_by_id(self, plan_id: str) -> PaymentPlanAgreement | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT plan_id, invoice_id, created_at, proposed_by, installment_amount_gbp,
+                       installment_count, first_due_date, frequency_days, notes, proposer_role, parent_plan_id,
+                       version_number
+                FROM payment_plan_agreements
+                WHERE plan_id = ?
+                """,
+                (plan_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return PaymentPlanAgreement(
+            plan_id=row["plan_id"],
+            invoice_id=row["invoice_id"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            proposed_by=row["proposed_by"],
+            installment_amount_gbp=Decimal(row["installment_amount_gbp"]),
+            installment_count=int(row["installment_count"]),
+            first_due_date=date.fromisoformat(row["first_due_date"]),
+            frequency_days=int(row["frequency_days"]),
+            notes=row["notes"],
+            proposer_role=row["proposer_role"],
+            parent_plan_id=row["parent_plan_id"],
+            version_number=int(row["version_number"]),
+        )
 
     def append_payment_plan_installments(self, installments: tuple[PaymentPlanInstallment, ...]) -> None:
         if not installments:
@@ -1464,7 +1842,8 @@ class SQLiteStore:
             rows = conn.execute(
                 """
                 SELECT plan_id, invoice_id, created_at, proposed_by, installment_amount_gbp,
-                       installment_count, first_due_date, frequency_days, notes
+                       installment_count, first_due_date, frequency_days, notes, proposer_role, parent_plan_id,
+                       version_number
                 FROM payment_plan_agreements
                 WHERE invoice_id = ?
                 ORDER BY created_at ASC, rowid ASC
@@ -1482,6 +1861,9 @@ class SQLiteStore:
                 first_due_date=date.fromisoformat(row["first_due_date"]),
                 frequency_days=int(row["frequency_days"]),
                 notes=row["notes"],
+                proposer_role=row["proposer_role"],
+                parent_plan_id=row["parent_plan_id"],
+                version_number=int(row["version_number"]),
             )
             for row in rows
         )
@@ -1514,8 +1896,8 @@ class SQLiteStore:
             conn.execute(
                 """
                 INSERT INTO payment_plan_payments (
-                    payment_id, plan_id, installment_id, invoice_id, paid_at, amount_gbp, recorded_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    payment_id, plan_id, installment_id, invoice_id, paid_at, amount_gbp, recorded_by, reported_payment_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payment.payment_id,
@@ -1525,6 +1907,7 @@ class SQLiteStore:
                     payment.paid_at.isoformat(),
                     str(payment.amount_gbp),
                     payment.recorded_by,
+                    payment.reported_payment_id,
                 ),
             )
             conn.commit()
@@ -1533,7 +1916,7 @@ class SQLiteStore:
         with self._connection() as conn:
             rows = conn.execute(
                 """
-                SELECT payment_id, plan_id, installment_id, invoice_id, paid_at, amount_gbp, recorded_by
+                SELECT payment_id, plan_id, installment_id, invoice_id, paid_at, amount_gbp, recorded_by, reported_payment_id
                 FROM payment_plan_payments
                 WHERE plan_id = ?
                 ORDER BY paid_at ASC, rowid ASC
@@ -1549,6 +1932,53 @@ class SQLiteStore:
                 paid_at=datetime.fromisoformat(row["paid_at"]),
                 amount_gbp=Decimal(row["amount_gbp"]),
                 recorded_by=row["recorded_by"],
+                reported_payment_id=row["reported_payment_id"],
+            )
+            for row in rows
+        )
+
+    def append_payment_plan_decision(self, decision: PaymentPlanDecision) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO payment_plan_decisions (
+                    decision_id, plan_id, invoice_id, decided_at, decided_by, actor_role, status, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision.decision_id,
+                    decision.plan_id,
+                    decision.invoice_id,
+                    decision.decided_at.isoformat(),
+                    decision.decided_by,
+                    decision.actor_role,
+                    decision.status.value,
+                    decision.notes,
+                ),
+            )
+            conn.commit()
+
+    def payment_plan_decisions_for_plan(self, plan_id: str) -> tuple[PaymentPlanDecision, ...]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT decision_id, plan_id, invoice_id, decided_at, decided_by, actor_role, status, notes
+                FROM payment_plan_decisions
+                WHERE plan_id = ?
+                ORDER BY decided_at ASC, rowid ASC
+                """,
+                (plan_id,),
+            ).fetchall()
+        return tuple(
+            PaymentPlanDecision(
+                decision_id=row["decision_id"],
+                plan_id=row["plan_id"],
+                invoice_id=row["invoice_id"],
+                decided_at=datetime.fromisoformat(row["decided_at"]),
+                decided_by=row["decided_by"],
+                actor_role=row["actor_role"],
+                status=PaymentPlanDecisionStatus(row["status"]),
+                notes=row["notes"],
             )
             for row in rows
         )
@@ -1659,6 +2089,58 @@ class SQLiteStore:
                 accepter_role=row["accepter_role"],
             )
             for row in rows
+        )
+
+    def append_settlement_offer_finalization(self, finalization: SettlementOfferFinalization) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO settlement_offer_finalizations (
+                    finalization_id, offer_id, invoice_id, finalized_at, finalized_by,
+                    triggering_report_id, confirmed_payment_total_gbp, outstanding_before_gbp,
+                    settlement_discount_applied_gbp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    finalization.finalization_id,
+                    finalization.offer_id,
+                    finalization.invoice_id,
+                    finalization.finalized_at.isoformat(),
+                    finalization.finalized_by,
+                    finalization.triggering_report_id,
+                    str(finalization.confirmed_payment_total_gbp),
+                    str(finalization.outstanding_before_gbp),
+                    str(finalization.settlement_discount_applied_gbp),
+                ),
+            )
+            conn.commit()
+
+    def settlement_offer_finalization_by_offer_id(self, offer_id: str) -> SettlementOfferFinalization | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT finalization_id, offer_id, invoice_id, finalized_at, finalized_by,
+                       triggering_report_id, confirmed_payment_total_gbp, outstanding_before_gbp,
+                       settlement_discount_applied_gbp
+                FROM settlement_offer_finalizations
+                WHERE offer_id = ?
+                ORDER BY finalized_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (offer_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SettlementOfferFinalization(
+            finalization_id=row["finalization_id"],
+            offer_id=row["offer_id"],
+            invoice_id=row["invoice_id"],
+            finalized_at=datetime.fromisoformat(row["finalized_at"]),
+            finalized_by=row["finalized_by"],
+            triggering_report_id=row["triggering_report_id"],
+            confirmed_payment_total_gbp=Decimal(row["confirmed_payment_total_gbp"]),
+            outstanding_before_gbp=Decimal(row["outstanding_before_gbp"]),
+            settlement_discount_applied_gbp=Decimal(row["settlement_discount_applied_gbp"]),
         )
 
     def append_dispute_carve_out(self, carve_out: DisputeCarveOut) -> None:
