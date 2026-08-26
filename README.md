@@ -18,6 +18,8 @@ Credit-control and evidence-assembly software for B2B invoice recovery workflows
 - Dual-ledger engine with strict debtor-claim and FCD-client-fee isolation.
 - Pre-overdue contract hygiene workflow with legal-review disclaimer handling.
 - Claim-ready evidence bundle PDF generation.
+- Company-status checks, Breathing Space controls, insolvency-review workflows, and restricted-note segregation.
+- Portfolio retention queue reporting plus in-process ops scripts for compliance workflows.
 
 ## Project Structure
 - Source: [src/unpaid_invoice_escalator/](C:/Dev/projects/P26003-escalation-software/src/unpaid_invoice_escalator)
@@ -92,6 +94,14 @@ $env:PYTHONPATH="C:\Dev\projects\P26003-escalation-software\src"
 python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --issue-date 2026-01-01 --due-date 2026-01-31 --jurisdiction ENGLAND_WALES --debtor-type LIMITED --today 2026-02-15
 ```
 
+## Run workflow admin scripts
+
+```powershell
+$env:PYTHONPATH="C:\Dev\projects\P26003-escalation-software\src"
+python scripts\ops\workflow-admin.py retention-queue --db-path data\escalator.db
+python scripts\ops\workflow-admin.py company-status-check --db-path data\escalator.db --invoice-id inv-1 --checked-by USER-1 --company-status ACTIVE --source COMPANIES_HOUSE --evidence-summary "Register reviewed"
+```
+
 ## Ops Runbook Assets
 - Simple all-in-one guide: [everything-manual-for-dummies.md](C:/Dev/projects/P26003-escalation-software/scripts/ops/everything-manual-for-dummies.md)
 - Go-live command sheet: [go-live-command-sheet.ps1](C:/Dev/projects/P26003-escalation-software/scripts/ops/go-live-command-sheet.ps1)
@@ -101,6 +111,7 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - Ledger reconciliation utility: [reconcile-ledger.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/reconcile-ledger.py)
 - SBC export utility: [export-sbc-bundle.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/export-sbc-bundle.py)
 - Retention audit utility: [audit-retention-holds.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/audit-retention-holds.py)
+- Workflow admin utility: [workflow-admin.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/workflow-admin.py)
 
 ## API Endpoints
 - `GET /health`
@@ -135,6 +146,7 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `POST /invoices/{invoice_id}/discrepancy-check`
 - `GET /invoices/{invoice_id}/compliance-ledger`
 - `GET /data-retention-policy`
+- `GET /data-retention-queue?as_of_date=YYYY-MM-DD&upcoming_within_days=45`
 - `GET /invoices/{invoice_id}/data-retention-review?as_of_date=YYYY-MM-DD`
 - `POST /invoices/{invoice_id}/data-retention-legal-holds/open`
 - `POST /invoices/{invoice_id}/data-retention-legal-holds/release`
@@ -166,6 +178,14 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `POST /invoices/{invoice_id}/debtor-actions/dispute/resolve`
 - `POST /invoices/{invoice_id}/humane-pauses/open`
 - `POST /invoices/{invoice_id}/humane-pauses/release`
+- `POST /invoices/{invoice_id}/company-status-checks`
+- `GET /invoices/{invoice_id}/company-status-checks`
+- `POST /invoices/{invoice_id}/breathing-space/open`
+- `POST /invoices/{invoice_id}/breathing-space/release`
+- `POST /invoices/{invoice_id}/insolvency-reviews/open`
+- `POST /invoices/{invoice_id}/insolvency-reviews/release`
+- `POST /invoices/{invoice_id}/restricted-notes`
+- `GET /invoices/{invoice_id}/restricted-notes?viewer_id=USER-1`
 - `GET /invoices/{invoice_id}/governance-summary`
 - `GET /invoices/{invoice_id}/client-handoff`
 - `POST /invoices/{invoice_id}/client-handoff/review`
@@ -228,6 +248,12 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
   - `server_errors_total`
 - Treat non-null `last_alert` as an operational signal to review logs.
 - All responses include `x-request-id` and security headers (`x-content-type-options`, `x-frame-options`, `referrer-policy`, `cache-control`) for traceability and browser hardening.
+
+## Compliance and retention operations
+- The compliance workspace now exposes company-status checks, Breathing Space controls, insolvency review actions, and restricted-note summaries in the browser UI.
+- `GET /data-retention-queue` provides a portfolio view of eligible, legal-hold, and near-threshold retention cases for reports and ops scripts.
+- [audit-retention-holds.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/audit-retention-holds.py) now calls the same retention-queue API logic used by the product, avoiding hard-coded retention thresholds in ops reporting.
+- [workflow-admin.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/workflow-admin.py) lets operators run compliance actions without standing up a separate HTTP server.
 
 ## Readiness & Deployment Validation
 - `GET /ready` returns:

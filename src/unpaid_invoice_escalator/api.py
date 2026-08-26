@@ -1990,8 +1990,14 @@ def create_app(
                     "and has moved to solicitor or higher-court handoff."
                 )
             else:
-                court_fee = dual_ledger_engine.quote_official_court_fee(invoice=invoice, claim_value_gbp=outstanding)
-                court_fee_notice = "Official court fee payable to the court authority, not FCD revenue."
+                try:
+                    court_fee = dual_ledger_engine.quote_official_court_fee(invoice=invoice, claim_value_gbp=outstanding)
+                    court_fee_notice = "Official court fee payable to the court authority, not FCD revenue."
+                except ValueError as exc:
+                    court_fee_notice = (
+                        "Official court fee could not be quoted from the active court-fee pack. "
+                        f"Review the rule pack before client handoff proceeds: {exc}"
+                    )
         artifacts = store.artifacts_for_invoice(invoice.invoice_id)
         review_entry = _latest_matching_compliance_entry(invoice.invoice_id, "CLIENT_HANDOFF_REVIEWED")
         bundle_audit_entries = [
@@ -2101,6 +2107,9 @@ def create_app(
             blockers.append(
                 f"Case age {age_days} days is below retention threshold ({required_days} days) for {retention_variant_name}."
             )
+        days_until_disposal = None if retention_variant_name == RetentionVariant.LEGAL_HOLD_ACTIVE.value else max(
+            0, required_days - age_days
+        )
         return {
             "invoice_id": invoice_id,
             "as_of_date": as_of_date.isoformat(),
@@ -2113,8 +2122,64 @@ def create_app(
             "compliance_entries_count": len(compliance_entries),
             "legal_hold_open": legal_hold_open,
             "legal_hold_details": legal_hold_details,
+            "retention_state": (
+                "LEGAL_HOLD"
+                if legal_hold_open
+                else "ELIGIBLE_FOR_DISPOSAL"
+                if len(blockers) == 0
+                else "PENDING_RETENTION"
+            ),
+            "days_until_disposal_eligibility": days_until_disposal,
             "eligible_for_disposal": len(blockers) == 0,
             "blockers": blockers,
+        }
+
+    def _data_retention_queue(*, as_of_date: date, upcoming_within_days: int) -> dict[str, object]:
+        items: list[dict[str, object]] = []
+        for invoice_meta in store.list_invoices():
+            invoice_id = invoice_meta.get("invoice_id")
+            if not invoice_id:
+                continue
+            invoice = store.get_invoice(str(invoice_id))
+            if invoice is None:
+                continue
+            review = _data_retention_review(invoice.invoice_id, as_of_date=as_of_date)
+            items.append(
+                {
+                    **review,
+                    "current_state": store.infer_state(invoice.invoice_id).value,
+                    "jurisdiction": invoice.jurisdiction.value,
+                    "debtor_type": invoice.debtor_type.value,
+                }
+            )
+        items.sort(
+            key=lambda item: (
+                0 if bool(item["eligible_for_disposal"]) else 1,
+                0 if bool(item["legal_hold_open"]) else 1,
+                int(item["days_until_disposal_eligibility"] or 0),
+                str(item["invoice_id"]),
+            )
+        )
+        eligible = [item for item in items if bool(item["eligible_for_disposal"])]
+        legal_hold = [item for item in items if bool(item["legal_hold_open"])]
+        upcoming = [
+            item
+            for item in items
+            if not bool(item["eligible_for_disposal"])
+            and not bool(item["legal_hold_open"])
+            and isinstance(item["days_until_disposal_eligibility"], int)
+            and int(item["days_until_disposal_eligibility"]) <= upcoming_within_days
+        ]
+        return {
+            "as_of_date": as_of_date.isoformat(),
+            "upcoming_within_days": upcoming_within_days,
+            "summary": {
+                "total_cases": len(items),
+                "eligible_for_disposal": len(eligible),
+                "legal_hold_open": len(legal_hold),
+                "upcoming_review_window": len(upcoming),
+            },
+            "items": items,
         }
 
     def _ensure_managed_storage_path(path: Path) -> None:
@@ -4593,6 +4658,15 @@ def create_app(
             raise HTTPException(status_code=404, detail="Invoice not found.")
         return _data_retention_review(invoice_id, as_of_date=as_of_date or date.today())
 
+    @app.get("/data-retention-queue")
+    def data_retention_queue(as_of_date: date | None = None, upcoming_within_days: int = 45) -> dict[str, object]:
+        if upcoming_within_days < 0:
+            raise HTTPException(status_code=400, detail="upcoming_within_days must be zero or greater.")
+        return _data_retention_queue(
+            as_of_date=as_of_date or date.today(),
+            upcoming_within_days=upcoming_within_days,
+        )
+
     @app.post("/invoices/{invoice_id}/data-retention-legal-holds/open")
     def open_data_retention_legal_hold(
         invoice_id: str, payload: DataRetentionLegalHoldOpenRequest
@@ -6017,7 +6091,10 @@ def create_app(
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
-        fee = dual_ledger_engine.quote_official_court_fee(invoice=invoice, claim_value_gbp=payload.claim_value_gbp)
+        try:
+            fee = dual_ledger_engine.quote_official_court_fee(invoice=invoice, claim_value_gbp=payload.claim_value_gbp)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {
             "invoice_id": invoice_id,
             "jurisdiction": invoice.jurisdiction.value,

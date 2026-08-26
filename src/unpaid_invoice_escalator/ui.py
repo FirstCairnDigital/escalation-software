@@ -1847,14 +1847,26 @@ def render_reports_html() -> str:
           <div id="report-retention-controls" class="action-list"></div>
         </div>
       </section>
+      <section style="margin-top: 22px;">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Retention queue</h2>
+              <div class="panel-subtle">Eligible, blocked, and near-threshold cases pulled from the live retention review queue.</div>
+            </div>
+          </div>
+          <div id="report-retention-queue" class="action-list"></div>
+        </div>
+      </section>
     """
     script = """
 <script>
   async function loadReportsPage() {
-    const [payload, readiness, retention] = await Promise.all([
+    const [payload, readiness, retention, retentionQueue] = await Promise.all([
       fcdUi.request("/dashboard"),
       fcdUi.request("/deployment/startup-config-validation/report"),
-      fcdUi.request("/data-retention-policy")
+      fcdUi.request("/data-retention-policy"),
+      fcdUi.request("/data-retention-queue")
     ]);
     const metrics = payload.metrics || {};
     const query = (document.getElementById("global-search").value || "").trim().toLowerCase();
@@ -1935,6 +1947,18 @@ def render_reports_html() -> str:
         </div>
       `)
     ].join("") || '<div class="empty-state">No retention variants configured.</div>';
+    const queueSummary = retentionQueue.summary || {};
+    const queueItems = retentionQueue.items || [];
+    document.getElementById("report-retention-queue").innerHTML = [
+      `<div class="action-item"><strong>Queue summary</strong><span class="list-meta">${fcdUi.escape(`eligible ${queueSummary.eligible_for_disposal || 0} | legal hold ${queueSummary.legal_hold_open || 0} | upcoming ${queueSummary.upcoming_review_window || 0}`)}</span></div>`,
+      ...queueItems.slice(0, 8).map((item) => `
+        <div class="action-item">
+          <strong>${fcdUi.escape(item.invoice_id)}</strong>
+          <span class="list-meta">${fcdUi.escape(`${item.retention_state} | ${item.current_state} | ${item.days_until_disposal_eligibility ?? "n/a"} day(s) to eligibility`)}</span>
+          <div class="mono">${fcdUi.escape((item.blockers || []).join(" | ") || "Eligible for disposal review.")}</div>
+        </div>
+      `)
+    ].join("") || '<div class="empty-state">No retention queue data available.</div>';
   }
 
   document.getElementById("global-search").addEventListener("input", loadReportsPage);
@@ -2699,6 +2723,50 @@ def render_compliance_html() -> str:
           <div class="panel">
             <div class="panel-header">
               <div>
+                <h2>Company status review</h2>
+                <div class="panel-subtle">Record insolvency or register checks and surface the latest stored evidence summary.</div>
+              </div>
+            </div>
+            <div id="company-status-card" class="empty-state">Loading company status checks...</div>
+            <div class="form-grid" style="margin-top: 14px;">
+              <label class="field">Checked by<input id="company-status-user" value="USER-1" /></label>
+              <label class="field">Company status<input id="company-status-value" value="ACTIVE" /></label>
+              <label class="field">Source<input id="company-status-source" value="COMPANIES_HOUSE" /></label>
+              <label class="field">Company number<input id="company-status-number" value="" /></label>
+              <label class="field" style="grid-column: 1 / -1;">Official register URL<input id="company-status-url" value="" /></label>
+              <label class="field" style="grid-column: 1 / -1;">Evidence summary<textarea id="company-status-summary">Record the official company-status finding and why it matters operationally.</textarea></label>
+            </div>
+            <div class="inline-actions" style="margin-top: 14px;">
+              <button id="record-company-status" type="button">Record company status</button>
+            </div>
+            <div id="company-status-result" class="status-line" style="margin-top: 12px;"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Statutory pause and insolvency controls</h2>
+                <div class="panel-subtle">Open or release Breathing Space and insolvency-review states without leaving compliance.</div>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label class="field">Workflow user<input id="pause-workflow-user" value="USER-1" /></label>
+              <label class="field">Source<input id="pause-workflow-source" value="COMPANIES_HOUSE" /></label>
+              <label class="field">Reference<input id="pause-workflow-reference" value="" /></label>
+              <label class="field">Review due date<input id="pause-workflow-review-date" value="" placeholder="YYYY-MM-DD" /></label>
+              <label class="field" style="grid-column: 1 / -1;">Reason<textarea id="pause-workflow-reason">Record the factual reason for the statutory or insolvency hold.</textarea></label>
+              <label class="field" style="grid-column: 1 / -1;">Resolution notes<textarea id="pause-workflow-resolution-notes">Record why the pause or review is being released.</textarea></label>
+            </div>
+            <div class="inline-actions" style="margin-top: 14px;">
+              <button id="open-breathing-space" type="button">Open breathing space</button>
+              <button id="release-breathing-space" class="secondary-button" type="button">Release breathing space</button>
+              <button id="open-insolvency-review" class="secondary-button" type="button">Open insolvency review</button>
+              <button id="release-insolvency-review" class="ghost-button" type="button">Release insolvency review</button>
+            </div>
+            <div id="pause-workflow-result" class="status-line" style="margin-top: 12px;"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <div>
                 <h2>Client handoff readiness</h2>
                 <div class="panel-subtle">Jurisdiction destination, court-fee context, and review signoff for client handoff.</div>
               </div>
@@ -2727,6 +2795,25 @@ def render_compliance_html() -> str:
               </div>
             </div>
             <div id="portal-summary-card" class="empty-state">Loading portal summary...</div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Restricted note controls</h2>
+                <div class="panel-subtle">Keep sensitive material segregated while exposing only summary-safe workflow details elsewhere.</div>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label class="field">Created by<input id="restricted-note-user" value="USER-1" /></label>
+              <label class="field">Category<input id="restricted-note-category" value="VULNERABILITY_NOTICE" /></label>
+              <label class="field" style="grid-column: 1 / -1;">Summary<textarea id="restricted-note-summary">Workflow-safe summary only.</textarea></label>
+              <label class="field" style="grid-column: 1 / -1;">Sensitive details<textarea id="restricted-note-sensitive">Store restricted detail here.</textarea></label>
+            </div>
+            <div class="inline-actions" style="margin-top: 14px;">
+              <button id="record-restricted-note" type="button">Record restricted note</button>
+            </div>
+            <div id="restricted-note-result" class="status-line" style="margin-top: 12px;"></div>
+            <div id="restricted-notes-list" class="action-list" style="margin-top: 14px;"></div>
           </div>
         </div>
       </section>
@@ -2803,6 +2890,104 @@ def render_compliance_html() -> str:
         <div class="kv-row"><label>Rule pack</label><div>${fcdUi.escape(payload.rule_pack_version || payload.version || "Active")}</div></div>
       </div>
     `;
+  }
+
+  function renderGovernanceSummary(summary) {
+    const target = document.getElementById("compliance-summary");
+    if (!summary) {
+      target.textContent = "Governance summary unavailable.";
+      return;
+    }
+    const blockers = summary.blocking_reasons || [];
+    const latestCompanyStatus = summary.latest_company_status_check?.company_status || "Not recorded";
+    target.className = summary.restricted || summary.chasers_paused ? "note-box" : "good-box";
+    target.innerHTML = `
+      <strong>${fcdUi.escape(summary.next_operator_action || "Review current restrictions.")}</strong>
+      <div style="margin-top:8px;">Restricted: ${fcdUi.escape(String(summary.restricted))} | Chasers paused: ${fcdUi.escape(String(summary.chasers_paused))} | Handoff required: ${fcdUi.escape(String(summary.handoff_required))}</div>
+      <div style="margin-top:8px;">Latest company status: ${fcdUi.escape(latestCompanyStatus)} | Restricted notes: ${fcdUi.escape(String(summary.restricted_note_count || 0))}</div>
+      ${blockers.length ? `<div style="margin-top:8px;">${fcdUi.escape(blockers.join(" | "))}</div>` : ""}
+    `;
+  }
+
+  function renderHandoffCard(summary) {
+    const target = document.getElementById("handoff-card");
+    if (!summary) {
+      target.textContent = "Handoff summary unavailable.";
+      return;
+    }
+    const requiredDocuments = summary.required_documents || [];
+    const evidence = summary.evidence_inventory || {};
+    target.innerHTML = `
+      <div class="kv-list">
+        <div class="kv-row"><label>Eligible for handoff</label><div>${fcdUi.escape(String(summary.eligible_for_handoff))}</div></div>
+        <div class="kv-row"><label>Destination</label><div>${fcdUi.escape(summary.destination_label || "-")}</div></div>
+        <div class="kv-row"><label>Official court fee</label><div>${fcdUi.escape(summary.official_court_fee_gbp || "n/a")}</div></div>
+        <div class="kv-row"><label>Rule pack</label><div>${fcdUi.escape(summary.rule_pack_version || "-")}</div></div>
+        <div class="kv-row"><label>Bundle generated</label><div>${fcdUi.escape(summary.latest_bundle_generated_at || "Not yet")}</div></div>
+      </div>
+      <div class="action-list">
+        <div class="action-item"><strong>Required documents</strong><span class="list-meta">${fcdUi.escape(requiredDocuments.join(" | ") || "None")}</span></div>
+        <div class="action-item"><strong>Evidence posture</strong><span class="list-meta">${fcdUi.escape(`contracts ${evidence.contract_artifacts || 0} | proof ${evidence.proof_artifacts || 0} | notices ${evidence.pre_action_notices || 0} | chain ${String(evidence.chain_valid)}`)}</span></div>
+        <div class="action-item"><strong>External fee notice</strong><span class="list-meta">${fcdUi.escape(summary.external_fee_notice || "")}</span></div>
+        <div class="action-item"><strong>Latest review</strong><span class="list-meta">${fcdUi.escape(summary.latest_review ? `${summary.latest_review.reviewed_by || "-"} | ${summary.latest_review.reviewed_at || "-"}` : "Not reviewed")}</span></div>
+      </div>
+    `;
+  }
+
+  function renderPortalSummary(summary) {
+    const target = document.getElementById("portal-summary-card");
+    if (!summary) {
+      target.textContent = "Portal summary unavailable.";
+      return;
+    }
+    const recent = summary.recent_activity || [];
+    target.innerHTML = `
+      <div class="kv-list">
+        <div class="kv-row"><label>Registered</label><div>${fcdUi.escape(String(summary.registered))}</div></div>
+        <div class="kv-row"><label>Case ID</label><div>${fcdUi.escape(summary.case_id || "-")}</div></div>
+        <div class="kv-row"><label>Current state</label><div>${fcdUi.escape(summary.current_state || "-")}</div></div>
+        <div class="kv-row"><label>Settlement destination</label><div>${fcdUi.escape(String(summary.settlement_destination_available))}</div></div>
+      </div>
+      <div class="action-list">
+        <div class="action-item"><strong>Bank verification</strong><span class="list-meta">${fcdUi.escape(summary.bank_verification_state || "Not configured")}</span></div>
+        <div class="action-item"><strong>Recent activity</strong><span class="list-meta">${fcdUi.escape(recent.map((item) => item.event_type).join(" | ") || "None")}</span></div>
+      </div>
+    `;
+  }
+
+  function renderCompanyStatusCard(payload) {
+    const target = document.getElementById("company-status-card");
+    const latest = payload?.latest || null;
+    if (!latest) {
+      target.innerHTML = '<div class="empty-state">No company-status checks recorded.</div>';
+      return;
+    }
+    target.innerHTML = `
+      <div class="kv-list">
+        <div class="kv-row"><label>Status</label><div>${fcdUi.escape(latest.company_status || "-")}</div></div>
+        <div class="kv-row"><label>Checked by</label><div>${fcdUi.escape(latest.checked_by || "-")}</div></div>
+        <div class="kv-row"><label>Source</label><div>${fcdUi.escape(latest.source || "-")}</div></div>
+        <div class="kv-row"><label>Review due</label><div>${fcdUi.escape(latest.review_due_date || "n/a")}</div></div>
+      </div>
+      <div class="action-list">
+        <div class="action-item"><strong>Evidence summary</strong><span class="list-meta">${fcdUi.escape(latest.evidence_summary || "")}</span></div>
+        <div class="action-item"><strong>Recommended restrictions</strong><span class="list-meta">${fcdUi.escape((latest.restrictions_recommended || []).join(" | ") || "None")}</span></div>
+      </div>
+    `;
+  }
+
+  function renderRestrictedNotesList(payload) {
+    const target = document.getElementById("restricted-notes-list");
+    const notes = payload?.notes || [];
+    target.innerHTML = notes.length
+      ? notes.slice().reverse().map((note) => `
+          <div class="action-item">
+            <strong>${fcdUi.escape(note.note_category)}</strong>
+            <span class="list-meta">${fcdUi.escape(`${note.created_by} | ${note.created_at}`)}</span>
+            <div class="mono">${fcdUi.escape(note.summary)}</div>
+          </div>
+        `).join("")
+      : '<div class="empty-state">No restricted notes recorded.</div>';
   }
 
   function renderComplianceDetail(detail, compliance, audit) {
@@ -2976,20 +3161,137 @@ def render_compliance_html() -> str:
     }
   }
 
+  async function recordCompanyStatus() {
+    const invoiceId = complianceState.selectedId;
+    if (!invoiceId) return;
+    document.getElementById("company-status-result").textContent = "Recording company status...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/company-status-checks`, "POST", {
+        checked_by: document.getElementById("company-status-user").value,
+        company_status: document.getElementById("company-status-value").value,
+        source: document.getElementById("company-status-source").value,
+        company_number: document.getElementById("company-status-number").value || null,
+        official_register_url: document.getElementById("company-status-url").value || null,
+        evidence_summary: document.getElementById("company-status-summary").value
+      });
+      document.getElementById("company-status-result").textContent = `${result.company_status} recorded for ${result.invoice_id}`;
+      await selectComplianceCase(invoiceId);
+    } catch (error) {
+      document.getElementById("company-status-result").textContent = error.message;
+    }
+  }
+
+  async function openBreathingSpace() {
+    const invoiceId = complianceState.selectedId;
+    if (!invoiceId) return;
+    document.getElementById("pause-workflow-result").textContent = "Opening breathing space...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/breathing-space/open`, "POST", {
+        opened_by: document.getElementById("pause-workflow-user").value,
+        source: document.getElementById("pause-workflow-source").value,
+        reference: document.getElementById("pause-workflow-reference").value || null,
+        review_due_date: document.getElementById("pause-workflow-review-date").value || null,
+        reason: document.getElementById("pause-workflow-reason").value
+      });
+      document.getElementById("pause-workflow-result").textContent = `${result.status} for ${result.invoice_id}`;
+      await selectComplianceCase(invoiceId);
+    } catch (error) {
+      document.getElementById("pause-workflow-result").textContent = error.message;
+    }
+  }
+
+  async function releaseBreathingSpace() {
+    const invoiceId = complianceState.selectedId;
+    if (!invoiceId) return;
+    document.getElementById("pause-workflow-result").textContent = "Releasing breathing space...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/breathing-space/release`, "POST", {
+        released_by: document.getElementById("pause-workflow-user").value,
+        release_reason: document.getElementById("pause-workflow-reason").value,
+        resolution_notes: document.getElementById("pause-workflow-resolution-notes").value,
+        resume_state: "OVERDUE_CHASER"
+      });
+      document.getElementById("pause-workflow-result").textContent = `${result.status} for ${result.invoice_id}`;
+      await selectComplianceCase(invoiceId);
+    } catch (error) {
+      document.getElementById("pause-workflow-result").textContent = error.message;
+    }
+  }
+
+  async function openInsolvencyReview() {
+    const invoiceId = complianceState.selectedId;
+    if (!invoiceId) return;
+    document.getElementById("pause-workflow-result").textContent = "Opening insolvency review...";
+    try {
+      const companyStatusPayload = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/company-status-checks`);
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/insolvency-reviews/open`, "POST", {
+        opened_by: document.getElementById("pause-workflow-user").value,
+        source: document.getElementById("pause-workflow-source").value,
+        reason: document.getElementById("pause-workflow-reason").value,
+        review_due_date: document.getElementById("pause-workflow-review-date").value || null,
+        company_status_check_id: companyStatusPayload.latest?.check_id || null
+      });
+      document.getElementById("pause-workflow-result").textContent = `${result.status} for ${result.invoice_id}`;
+      await selectComplianceCase(invoiceId);
+    } catch (error) {
+      document.getElementById("pause-workflow-result").textContent = error.message;
+    }
+  }
+
+  async function releaseInsolvencyReview() {
+    const invoiceId = complianceState.selectedId;
+    if (!invoiceId) return;
+    document.getElementById("pause-workflow-result").textContent = "Releasing insolvency review...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/insolvency-reviews/release`, "POST", {
+        released_by: document.getElementById("pause-workflow-user").value,
+        release_reason: document.getElementById("pause-workflow-reason").value,
+        resolution_notes: document.getElementById("pause-workflow-resolution-notes").value,
+        resume_state: "OVERDUE_CHASER"
+      });
+      document.getElementById("pause-workflow-result").textContent = `${result.status} for ${result.invoice_id}`;
+      await selectComplianceCase(invoiceId);
+    } catch (error) {
+      document.getElementById("pause-workflow-result").textContent = error.message;
+    }
+  }
+
+  async function recordRestrictedNote() {
+    const invoiceId = complianceState.selectedId;
+    if (!invoiceId) return;
+    document.getElementById("restricted-note-result").textContent = "Recording restricted note...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/restricted-notes`, "POST", {
+        created_by: document.getElementById("restricted-note-user").value,
+        note_category: document.getElementById("restricted-note-category").value,
+        summary: document.getElementById("restricted-note-summary").value,
+        sensitive_details: document.getElementById("restricted-note-sensitive").value,
+        related_event_type: "MANUAL_RESTRICTED_NOTE"
+      });
+      document.getElementById("restricted-note-result").textContent = `${result.note_category} recorded for ${result.invoice_id}`;
+      await selectComplianceCase(invoiceId);
+    } catch (error) {
+      document.getElementById("restricted-note-result").textContent = error.message;
+    }
+  }
+
   async function selectComplianceCase(invoiceId) {
     complianceState.selectedId = invoiceId;
     fcdUi.updateQueryParam("invoice", invoiceId);
     const overview = (complianceState.dashboard?.cases || []).find((item) => item.invoice_id === invoiceId) || null;
     renderComplianceMetrics(overview);
     syncPicker(complianceState.dashboard?.cases || []);
-    const [compliance, audit, detail, rulePack, governance, handoff, portal] = await Promise.all([
+    const noteViewer = document.getElementById("restricted-note-user").value || document.getElementById("company-status-user").value || "USER-1";
+    const [compliance, audit, detail, rulePack, governance, handoff, portal, companyStatus, restrictedNotes] = await Promise.all([
       fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/compliance-ledger`),
       fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/audit-trail`),
       fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}`),
       overview ? fcdUi.request(`/rule-packs/${encodeURIComponent(overview.jurisdiction)}/active`) : Promise.resolve(null),
       fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/governance-summary`),
       fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/client-handoff`),
-      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/debtor-portal-summary`)
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/debtor-portal-summary`),
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/company-status-checks`),
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/restricted-notes?viewer_id=${encodeURIComponent(noteViewer)}`)
     ]);
     renderGovernanceSummary(governance);
     renderComplianceEntries(compliance.entries || []);
@@ -2998,6 +3300,8 @@ def render_compliance_html() -> str:
     renderRulePackCard(detail, rulePack);
     renderHandoffCard(handoff);
     renderPortalSummary(portal);
+    renderCompanyStatusCard(companyStatus);
+    renderRestrictedNotesList(restrictedNotes);
   }
 
   async function loadCompliancePage() {
@@ -3028,7 +3332,13 @@ def render_compliance_html() -> str:
   document.getElementById("run-legal-gate").addEventListener("click", () => runComplianceAction("legal-gate"));
   document.getElementById("open-humane-pause").addEventListener("click", openHumanePause);
   document.getElementById("release-humane-pause").addEventListener("click", releaseHumanePause);
+  document.getElementById("record-company-status").addEventListener("click", recordCompanyStatus);
+  document.getElementById("open-breathing-space").addEventListener("click", openBreathingSpace);
+  document.getElementById("release-breathing-space").addEventListener("click", releaseBreathingSpace);
+  document.getElementById("open-insolvency-review").addEventListener("click", openInsolvencyReview);
+  document.getElementById("release-insolvency-review").addEventListener("click", releaseInsolvencyReview);
   document.getElementById("review-client-handoff").addEventListener("click", reviewClientHandoff);
+  document.getElementById("record-restricted-note").addEventListener("click", recordRestrictedNote);
   window.addEventListener("load", loadCompliancePage);
 </script>
 """
@@ -3212,6 +3522,20 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
           <div id="workspace-portal" class="empty-state">Loading portal summary...</div>
         </div>
       </section>
+      <section class="cards-3" style="margin-top: 22px;">
+        <div class="panel">
+          <div class="panel-header"><h3>Company status</h3></div>
+          <div id="workspace-company-status" class="empty-state">Loading company status...</div>
+        </div>
+        <div class="panel">
+          <div class="panel-header"><h3>Restricted notes</h3></div>
+          <div id="workspace-restricted-notes" class="empty-state">Loading restricted notes...</div>
+        </div>
+        <div class="panel">
+          <div class="panel-header"><h3>Retention review</h3></div>
+          <div id="workspace-retention-review" class="empty-state">Loading retention review...</div>
+        </div>
+      </section>
     """
     script = """
 <script>
@@ -3270,6 +3594,7 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
       <div class="action-list">
         <div class="action-item"><strong>Restriction codes</strong><span class="list-meta">${fcdUi.escape((governance?.restriction_codes || []).join(" | ") || "None")}</span></div>
         <div class="action-item"><strong>Blocking reasons</strong><span class="list-meta">${fcdUi.escape((governance?.blocking_reasons || []).join(" | ") || "None")}</span></div>
+        <div class="action-item"><strong>Latest company status</strong><span class="list-meta">${fcdUi.escape(governance?.latest_company_status_check?.company_status || "Not recorded")}</span></div>
       </div>
     `;
   }
@@ -3301,6 +3626,52 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
       <div class="action-list">
         <div class="action-item"><strong>Recent portal activity</strong><span class="list-meta">${fcdUi.escape((summary?.recent_activity || []).map((item) => item.event_type).join(" | ") || "None")}</span></div>
       </div>
+    `;
+  }
+
+  function renderWorkspaceCompanyStatus(payload) {
+    const latest = payload?.latest || null;
+    document.getElementById("workspace-company-status").innerHTML = latest ? `
+      <div class="kv-list">
+        <div class="kv-row"><label>Status</label><div>${fcdUi.escape(latest.company_status || "-")}</div></div>
+        <div class="kv-row"><label>Checked by</label><div>${fcdUi.escape(latest.checked_by || "-")}</div></div>
+        <div class="kv-row"><label>Source</label><div>${fcdUi.escape(latest.source || "-")}</div></div>
+        <div class="kv-row"><label>Review due</label><div>${fcdUi.escape(latest.review_due_date || "n/a")}</div></div>
+      </div>
+      <div class="action-list">
+        <div class="action-item"><strong>Evidence summary</strong><span class="list-meta">${fcdUi.escape(latest.evidence_summary || "")}</span></div>
+        <div class="action-item"><strong>Recommended restrictions</strong><span class="list-meta">${fcdUi.escape((latest.restrictions_recommended || []).join(" | ") || "None")}</span></div>
+      </div>
+    ` : '<div class="empty-state">No company-status checks recorded.</div>';
+  }
+
+  function renderWorkspaceRestrictedNotes(payload) {
+    const notes = payload?.notes || [];
+    document.getElementById("workspace-restricted-notes").innerHTML = notes.length
+      ? notes.slice().reverse().slice(0, 4).map((note) => `
+          <div class="action-item">
+            <strong>${fcdUi.escape(note.note_category)}</strong>
+            <span class="list-meta">${fcdUi.escape(`${note.created_by} | ${note.created_at}`)}</span>
+            <div class="mono">${fcdUi.escape(note.summary)}</div>
+          </div>
+        `).join("")
+      : '<div class="empty-state">No restricted notes recorded.</div>';
+  }
+
+  function renderWorkspaceRetentionReview(review) {
+    const dueText = review?.eligible_for_disposal
+      ? "Eligible for disposal review."
+      : review?.legal_hold_applied
+        ? "Legal hold blocks disposal."
+        : `Next review in ${review?.days_until_disposal_eligibility ?? "n/a"} days.`;
+    document.getElementById("workspace-retention-review").innerHTML = `
+      <div class="kv-list">
+        <div class="kv-row"><label>Retention state</label><div>${fcdUi.escape(review?.retention_state || "-")}</div></div>
+        <div class="kv-row"><label>Eligible for disposal</label><div>${fcdUi.escape(String(review?.eligible_for_disposal || false))}</div></div>
+        <div class="kv-row"><label>Legal hold</label><div>${fcdUi.escape(String(review?.legal_hold_applied || false))}</div></div>
+        <div class="kv-row"><label>Case age days</label><div>${fcdUi.escape(String(review?.case_age_days ?? "-"))}</div></div>
+      </div>
+      <div class="note-box" style="margin-top: 14px;">${fcdUi.escape(dueText)}</div>
     `;
   }
 
@@ -3620,7 +3991,7 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
   }
 
   async function loadWorkspace() {
-    const [detail, communications, compliance, audit, plansPayload, offersPayload, reportsPayload, artifactsPayload, governance, handoff, portal] = await Promise.all([
+    const [detail, communications, compliance, audit, plansPayload, offersPayload, reportsPayload, artifactsPayload, governance, handoff, portal, companyStatus, restrictedNotes, retentionReview] = await Promise.all([
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/communications`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/compliance-ledger`),
@@ -3631,7 +4002,10 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/evidence-artifacts`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/governance-summary`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/client-handoff`),
-      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/debtor-portal-summary`)
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/debtor-portal-summary`),
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/company-status-checks`),
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/restricted-notes?viewer_id=USER-1`),
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/data-retention-review`)
     ]);
     workspaceState.plans = plansPayload.plans || [];
     workspaceState.offers = offersPayload.offers || [];
@@ -3648,6 +4022,9 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
     renderWorkspaceGovernance(governance);
     renderWorkspaceHandoff(handoff);
     renderWorkspacePortal(portal);
+    renderWorkspaceCompanyStatus(companyStatus);
+    renderWorkspaceRestrictedNotes(restrictedNotes);
+    renderWorkspaceRetentionReview(retentionReview);
     renderLogList("workspace-communications", communications.communications || [], (entry) => `
       <div class="log-item">
         <strong>${fcdUi.escape(entry.subject)}</strong>

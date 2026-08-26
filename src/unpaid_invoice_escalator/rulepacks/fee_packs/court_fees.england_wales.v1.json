@@ -7,9 +7,13 @@
   "source_reference": "HMCTS issue fee schedule (operational pack)",
   "fee_bands": [
     { "min_claim": 0, "max_claim": 300, "fixed_fee": 35, "percentage_rate": null },
+    { "min_claim": 300.01, "max_claim": 500, "fixed_fee": 50, "percentage_rate": null },
+    { "min_claim": 500.01, "max_claim": 1000, "fixed_fee": 70, "percentage_rate": null },
+    { "min_claim": 1000.01, "max_claim": 1500, "fixed_fee": 80, "percentage_rate": null },
+    { "min_claim": 1500.01, "max_claim": 3000, "fixed_fee": 115, "percentage_rate": null },
     { "min_claim": 3000.01, "max_claim": 5000, "fixed_fee": 205, "percentage_rate": null },
     { "min_claim": 5000.01, "max_claim": 10000, "fixed_fee": 455, "percentage_rate": null },
-    { "min_claim": 10000.01, "max_claim": null, "fixed_fee": null, "percentage_rate": 0.05 }
+    { "min_claim": 10000.01, "max_claim": 200000, "fixed_fee": null, "percentage_rate": 0.05 },
+    { "min_claim": 200000.01, "max_claim": null, "fixed_fee": 10000, "percentage_rate": null }
   ]
 }
-

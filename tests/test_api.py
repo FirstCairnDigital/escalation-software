@@ -39,11 +39,15 @@ class TestApi(unittest.TestCase):
             compliance_page = client.get("/ui/compliance")
             self.assertEqual(compliance_page.status_code, 200)
             self.assertIn("Humane pause controls", compliance_page.text)
+            self.assertIn("Company status review", compliance_page.text)
+            self.assertIn("Restricted note controls", compliance_page.text)
+            self.assertIn("function renderGovernanceSummary", compliance_page.text)
             self.assertIn("Client handoff readiness", compliance_page.text)
             reports_page = client.get("/ui/reports")
             self.assertEqual(reports_page.status_code, 200)
             self.assertIn("Environment checks", reports_page.text)
             self.assertIn("Policy controls", reports_page.text)
+            self.assertIn("Retention queue", reports_page.text)
 
             create_resp = client.post(
                 "/invoices",
@@ -367,6 +371,9 @@ class TestApi(unittest.TestCase):
             self.assertIn("Governance snapshot", workspace_resp.text)
             self.assertIn("Client handoff readiness", workspace_resp.text)
             self.assertIn("Portal activity", workspace_resp.text)
+            self.assertIn("Company status", workspace_resp.text)
+            self.assertIn("Restricted notes", workspace_resp.text)
+            self.assertIn("Retention review", workspace_resp.text)
             rule_resp = client.get("/rule-packs/NORTHERN_IRELAND/active?on_date=2026-02-01")
             self.assertEqual(rule_resp.status_code, 200)
             self.assertEqual(rule_resp.json()["rule_id"], "ni-commercial-invoice-recovery")
@@ -1626,6 +1633,13 @@ class TestApi(unittest.TestCase):
             review_resp = client.get("/invoices/inv-api-retention/data-retention-review?as_of_date=2035-01-01")
             self.assertEqual(review_resp.status_code, 200)
             self.assertTrue(review_resp.json()["eligible_for_disposal"])
+            self.assertEqual(review_resp.json()["retention_state"], "ELIGIBLE_FOR_DISPOSAL")
+            self.assertEqual(review_resp.json()["days_until_disposal_eligibility"], 0)
+
+            queue_resp = client.get("/data-retention-queue?as_of_date=2035-01-01")
+            self.assertEqual(queue_resp.status_code, 200)
+            self.assertEqual(queue_resp.json()["summary"]["eligible_for_disposal"], 1)
+            self.assertEqual(queue_resp.json()["items"][0]["invoice_id"], "inv-api-retention")
 
             dispose_resp = client.post(
                 "/invoices/inv-api-retention/data-retention-disposals",
@@ -1683,6 +1697,8 @@ class TestApi(unittest.TestCase):
             self.assertEqual(review_resp.status_code, 200)
             self.assertTrue(review_resp.json()["legal_hold_open"])
             self.assertIn("Active legal hold blocks retention disposal.", review_resp.json()["blockers"])
+            self.assertEqual(review_resp.json()["retention_state"], "LEGAL_HOLD")
+            self.assertIsNone(review_resp.json()["days_until_disposal_eligibility"])
 
             blocked_dispose = client.post(
                 "/invoices/inv-api-retention-hold/data-retention-disposals",
@@ -1704,6 +1720,38 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(dispose_after_release.status_code, 200)
             self.assertFalse(artifact_path.exists())
+
+    def test_client_handoff_quotes_england_wales_mid_band_fee(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-handoff-gap.db")
+            app = create_app(db_path=db_path, artifacts_dir=str(Path(tmp_dir) / "artifacts"), bundles_dir=str(Path(tmp_dir) / "bundles"))
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-ew-gap",
+                    "currency": "GBP",
+                    "principal_amount": "1250",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            handoff_resp = client.get("/invoices/inv-ew-gap/client-handoff")
+            self.assertEqual(handoff_resp.status_code, 200)
+            self.assertEqual(handoff_resp.json()["official_court_fee_gbp"], "80")
+            self.assertIn("payable to the court authority", handoff_resp.json()["external_fee_notice"])
+
+            fee_quote_resp = client.post(
+                "/invoices/inv-ew-gap/court-fee-quotes",
+                json={"claim_value_gbp": "1250"},
+            )
+            self.assertEqual(fee_quote_resp.status_code, 200)
+            self.assertEqual(fee_quote_resp.json()["official_court_fee_gbp"], "80")
 
     def test_data_retention_taxonomy_and_active_hold_guardrail(self) -> None:
         with TemporaryDirectory() as tmp_dir:
