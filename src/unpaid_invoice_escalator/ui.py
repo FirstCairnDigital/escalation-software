@@ -871,6 +871,7 @@ def render_dashboard_html() -> str:
           </div>
         </div>
       </section>
+
     """
 
     script = """
@@ -933,6 +934,67 @@ def render_dashboard_html() -> str:
       <div class="inline-actions">
         <a class="ghost-button" style="padding:11px 16px;" href="/ui/invoices/${encodeURIComponent(item.invoice_id)}">Open workspace</a>
         <a class="ghost-button" style="padding:11px 16px;" href="/ui/compliance?invoice=${encodeURIComponent(item.invoice_id)}">Review compliance</a>
+      </div>
+    `;
+  }
+
+  function renderGovernanceSummary(summary) {
+    const target = document.getElementById("compliance-summary");
+    if (!summary) {
+      target.textContent = "Governance summary unavailable.";
+      return;
+    }
+    const blockers = summary.blocking_reasons || [];
+    target.className = summary.restricted || summary.chasers_paused ? "note-box" : "good-box";
+    target.innerHTML = `
+      <strong>${fcdUi.escape(summary.next_operator_action || "Review current restrictions.")}</strong>
+      <div style="margin-top:8px;">Restricted: ${fcdUi.escape(String(summary.restricted))} | Chasers paused: ${fcdUi.escape(String(summary.chasers_paused))} | Handoff required: ${fcdUi.escape(String(summary.handoff_required))}</div>
+      ${blockers.length ? `<div style="margin-top:8px;">${fcdUi.escape(blockers.join(" | "))}</div>` : ""}
+    `;
+  }
+
+  function renderHandoffCard(summary) {
+    const target = document.getElementById("handoff-card");
+    if (!summary) {
+      target.textContent = "Handoff summary unavailable.";
+      return;
+    }
+    const requiredDocuments = summary.required_documents || [];
+    const evidence = summary.evidence_inventory || {};
+    target.innerHTML = `
+      <div class="kv-list">
+        <div class="kv-row"><label>Eligible for handoff</label><div>${fcdUi.escape(String(summary.eligible_for_handoff))}</div></div>
+        <div class="kv-row"><label>Destination</label><div>${fcdUi.escape(summary.destination_label || "-")}</div></div>
+        <div class="kv-row"><label>Official court fee</label><div>${fcdUi.escape(summary.official_court_fee_gbp || "n/a")}</div></div>
+        <div class="kv-row"><label>Rule pack</label><div>${fcdUi.escape(summary.rule_pack_version || "-")}</div></div>
+        <div class="kv-row"><label>Bundle generated</label><div>${fcdUi.escape(summary.latest_bundle_generated_at || "Not yet")}</div></div>
+      </div>
+      <div class="action-list">
+        <div class="action-item"><strong>Required documents</strong><span class="list-meta">${fcdUi.escape(requiredDocuments.join(" | ") || "None")}</span></div>
+        <div class="action-item"><strong>Evidence posture</strong><span class="list-meta">${fcdUi.escape(`contracts ${evidence.contract_artifacts || 0} | proof ${evidence.proof_artifacts || 0} | notices ${evidence.pre_action_notices || 0} | chain ${String(evidence.chain_valid)}`)}</span></div>
+        <div class="action-item"><strong>External fee notice</strong><span class="list-meta">${fcdUi.escape(summary.external_fee_notice || "")}</span></div>
+        <div class="action-item"><strong>Latest review</strong><span class="list-meta">${fcdUi.escape(summary.latest_review ? `${summary.latest_review.reviewed_by || "-"} | ${summary.latest_review.reviewed_at || "-"}` : "Not reviewed")}</span></div>
+      </div>
+    `;
+  }
+
+  function renderPortalSummary(summary) {
+    const target = document.getElementById("portal-summary-card");
+    if (!summary) {
+      target.textContent = "Portal summary unavailable.";
+      return;
+    }
+    const recent = summary.recent_activity || [];
+    target.innerHTML = `
+      <div class="kv-list">
+        <div class="kv-row"><label>Registered</label><div>${fcdUi.escape(String(summary.registered))}</div></div>
+        <div class="kv-row"><label>Case ID</label><div>${fcdUi.escape(summary.case_id || "-")}</div></div>
+        <div class="kv-row"><label>Current state</label><div>${fcdUi.escape(summary.current_state || "-")}</div></div>
+        <div class="kv-row"><label>Settlement destination</label><div>${fcdUi.escape(String(summary.settlement_destination_available))}</div></div>
+      </div>
+      <div class="action-list">
+        <div class="action-item"><strong>Bank verification</strong><span class="list-meta">${fcdUi.escape(summary.bank_verification_state || "Not configured")}</span></div>
+        <div class="action-item"><strong>Recent activity</strong><span class="list-meta">${fcdUi.escape(recent.map((item) => item.event_type).join(" | ") || "None")}</span></div>
       </div>
     `;
   }
@@ -1554,10 +1616,12 @@ def render_disputes_html() -> str:
         <div class="kv-row"><label>Jurisdiction</label><div>${fcdUi.escape(detail.jurisdiction)}</div></div>
         <div class="kv-row"><label>Compliance events</label><div>${fcdUi.escape((compliance.entries || []).length)}</div></div>
         <div class="kv-row"><label>Audit entries</label><div>${fcdUi.escape((audit.entries || []).length)}</div></div>
+        <div class="kv-row"><label>Chasers paused</label><div>${fcdUi.escape(String(detail.governance?.chasers_paused || false))}</div></div>
       </div>
       <div class="action-list">
         <div class="action-item"><strong>Latest compliance</strong><span class="list-meta">${fcdUi.escape(recentCompliance.map((item) => item.event_type).join(", ") || "None")}</span></div>
         <div class="action-item"><strong>Latest audit</strong><span class="list-meta">${fcdUi.escape(recentAudit.map((item) => item.action).join(", ") || "None")}</span></div>
+        <div class="action-item"><strong>Governance</strong><span class="list-meta">${fcdUi.escape((detail.governance?.blocking_reasons || []).join(" | ") || "No active blockers")}</span></div>
       </div>
       <div class="inline-actions">
         <a class="ghost-button" style="padding:11px 16px;" href="/ui/compliance?invoice=${encodeURIComponent(detail.invoice_id)}">Open compliance</a>
@@ -1569,9 +1633,12 @@ def render_disputes_html() -> str:
   async function loadDisputesPage(preferredInvoiceId = null) {
     const payload = await fcdUi.request("/dashboard");
     const query = (document.getElementById("global-search").value || "").trim().toLowerCase();
-    const cases = (payload.cases || []).filter((item) =>
-      ["DISPUTED", "DISPUTE_REVIEW", "BREATHING_SPACE_PAUSE", "JURISDICTION_UNCERTAIN", "CLIENT_HANDOFF"].includes(item.current_state)
-    ).filter((item) => {
+    const cases = (payload.cases || []).filter((item) => {
+      const governance = item.governance || {};
+      return ["DISPUTED", "DISPUTE_REVIEW", "BREATHING_SPACE_PAUSE", "JURISDICTION_UNCERTAIN", "CLIENT_HANDOFF"].includes(item.current_state)
+        || Boolean(governance.restricted)
+        || Boolean(governance.handoff_required);
+    }).filter((item) => {
       if (!query) return true;
       return [item.invoice_id, item.current_state, item.jurisdiction, item.next_step].join(" ").toLowerCase().includes(query);
     });
@@ -1661,6 +1728,7 @@ def render_creditors_html() -> str:
           </div>
         </div>
       </section>
+
     """
     script = """
 <script>
@@ -2602,6 +2670,64 @@ def render_compliance_html() -> str:
             </div>
             <div id="rule-pack-card" class="empty-state">Loading rule-pack information...</div>
           </div>
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Humane pause controls</h2>
+                <div class="panel-subtle">Pause outreach for welfare or vulnerability concerns using summary-only notes.</div>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label class="field">Concern type<input id="humane-pause-type" value="WELFARE_CONCERN" /></label>
+              <label class="field">Opened / released by<input id="humane-pause-user" value="USER-1" /></label>
+              <label class="field">Review due date<input id="humane-pause-review-date" value="" placeholder="YYYY-MM-DD" /></label>
+              <label class="field">Sensitive details present
+                <select id="humane-pause-sensitive">
+                  <option value="false">No</option>
+                  <option value="true">Yes</option>
+                </select>
+              </label>
+              <label class="field" style="grid-column: 1 / -1;">Summary<textarea id="humane-pause-summary">Pause automated outreach while the creditor reviews a welfare or vulnerability concern.</textarea></label>
+              <label class="field" style="grid-column: 1 / -1;">Notes<textarea id="humane-pause-notes">Store summary only. Do not record raw medical or highly sensitive evidence in the workflow log.</textarea></label>
+            </div>
+            <div class="inline-actions" style="margin-top: 14px;">
+              <button id="open-humane-pause" type="button">Open humane pause</button>
+              <button id="release-humane-pause" class="secondary-button" type="button">Release humane pause</button>
+            </div>
+            <div id="humane-pause-result" class="status-line" style="margin-top: 12px;"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Client handoff readiness</h2>
+                <div class="panel-subtle">Jurisdiction destination, court-fee context, and review signoff for client handoff.</div>
+              </div>
+            </div>
+            <div id="handoff-card" class="empty-state">Loading handoff readiness...</div>
+            <div class="form-grid" style="margin-top: 14px;">
+              <label class="field">Reviewed by<input id="handoff-reviewed-by" value="USER-1" /></label>
+              <label class="field">Ready to export
+                <select id="handoff-ready-to-export">
+                  <option value="true">Yes</option>
+                  <option value="false">No</option>
+                </select>
+              </label>
+              <label class="field" style="grid-column: 1 / -1;">Review notes<textarea id="handoff-review-notes">Reviewed the pack posture and prepared for client decision.</textarea></label>
+            </div>
+            <div class="inline-actions" style="margin-top: 14px;">
+              <button id="review-client-handoff" class="secondary-button" type="button">Record handoff review</button>
+            </div>
+            <div id="handoff-review-result" class="status-line" style="margin-top: 12px;"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Debtor portal summary</h2>
+                <div class="panel-subtle">Portal registration, recent debtor interactions, and settlement visibility.</div>
+              </div>
+            </div>
+            <div id="portal-summary-card" class="empty-state">Loading portal summary...</div>
+          </div>
         </div>
       </section>
     """
@@ -2795,26 +2921,83 @@ def render_compliance_html() -> str:
     }
   }
 
+  async function openHumanePause() {
+    const invoiceId = complianceState.selectedId;
+    if (!invoiceId) return;
+    document.getElementById("humane-pause-result").textContent = "Opening humane pause...";
+    try {
+      const reviewDate = document.getElementById("humane-pause-review-date").value.trim();
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/humane-pauses/open`, "POST", {
+        opened_by: document.getElementById("humane-pause-user").value,
+        concern_type: document.getElementById("humane-pause-type").value,
+        summary: document.getElementById("humane-pause-summary").value,
+        notes: document.getElementById("humane-pause-notes").value,
+        review_due_date: reviewDate || null,
+        sensitive_details_present: document.getElementById("humane-pause-sensitive").value === "true"
+      });
+      document.getElementById("humane-pause-result").textContent = `${result.status} for ${result.invoice_id}`;
+      await selectComplianceCase(invoiceId);
+    } catch (error) {
+      document.getElementById("humane-pause-result").textContent = error.message;
+    }
+  }
+
+  async function releaseHumanePause() {
+    const invoiceId = complianceState.selectedId;
+    if (!invoiceId) return;
+    document.getElementById("humane-pause-result").textContent = "Releasing humane pause...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/humane-pauses/release`, "POST", {
+        released_by: document.getElementById("humane-pause-user").value,
+        release_reason: document.getElementById("humane-pause-type").value,
+        resolution_notes: document.getElementById("humane-pause-notes").value
+      });
+      document.getElementById("humane-pause-result").textContent = `${result.status} for ${result.invoice_id}`;
+      await selectComplianceCase(invoiceId);
+    } catch (error) {
+      document.getElementById("humane-pause-result").textContent = error.message;
+    }
+  }
+
+  async function reviewClientHandoff() {
+    const invoiceId = complianceState.selectedId;
+    if (!invoiceId) return;
+    document.getElementById("handoff-review-result").textContent = "Recording handoff review...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/client-handoff/review`, "POST", {
+        reviewed_by: document.getElementById("handoff-reviewed-by").value,
+        ready_to_export: document.getElementById("handoff-ready-to-export").value === "true",
+        notes: document.getElementById("handoff-review-notes").value
+      });
+      document.getElementById("handoff-review-result").textContent = `Handoff review recorded for ${result.invoice_id}`;
+      await selectComplianceCase(invoiceId);
+    } catch (error) {
+      document.getElementById("handoff-review-result").textContent = error.message;
+    }
+  }
+
   async function selectComplianceCase(invoiceId) {
     complianceState.selectedId = invoiceId;
     fcdUi.updateQueryParam("invoice", invoiceId);
     const overview = (complianceState.dashboard?.cases || []).find((item) => item.invoice_id === invoiceId) || null;
     renderComplianceMetrics(overview);
     syncPicker(complianceState.dashboard?.cases || []);
-    const [compliance, audit, detail, rulePack] = await Promise.all([
+    const [compliance, audit, detail, rulePack, governance, handoff, portal] = await Promise.all([
       fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/compliance-ledger`),
       fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/audit-trail`),
       fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}`),
-      overview ? fcdUi.request(`/rule-packs/${encodeURIComponent(overview.jurisdiction)}/active`) : Promise.resolve(null)
+      overview ? fcdUi.request(`/rule-packs/${encodeURIComponent(overview.jurisdiction)}/active`) : Promise.resolve(null),
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/governance-summary`),
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/client-handoff`),
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/debtor-portal-summary`)
     ]);
-    const restricted = (compliance.entries || []).some((entry) => String(entry.event_type || "").includes("CHALLENGE_OPEN") || String(entry.event_type || "").includes("DISPUTE"));
-    document.getElementById("compliance-summary").innerHTML = restricted
-      ? "Recovery is currently restricted or dispute-linked. Review the compliance and audit entries before further escalation."
-      : "No immediate compliance restriction detected in the latest recorded entries.";
+    renderGovernanceSummary(governance);
     renderComplianceEntries(compliance.entries || []);
     renderAuditEntries(audit.entries || []);
     renderComplianceDetail(detail, compliance, audit);
     renderRulePackCard(detail, rulePack);
+    renderHandoffCard(handoff);
+    renderPortalSummary(portal);
   }
 
   async function loadCompliancePage() {
@@ -2829,6 +3012,8 @@ def render_compliance_html() -> str:
       document.getElementById("compliance-summary").textContent = "No cases available.";
       document.getElementById("compliance-list").innerHTML = '<div class="empty-state">No cases available.</div>';
       document.getElementById("audit-list").innerHTML = '<div class="empty-state">No cases available.</div>';
+      document.getElementById("handoff-card").innerHTML = '<div class="empty-state">No cases available.</div>';
+      document.getElementById("portal-summary-card").innerHTML = '<div class="empty-state">No cases available.</div>';
       return;
     }
     const preferred = fcdUi.queryParam("invoice") || filteredCases[0].invoice_id;
@@ -2841,6 +3026,9 @@ def render_compliance_html() -> str:
   document.getElementById("run-case-health").addEventListener("click", () => runComplianceAction("case-health"));
   document.getElementById("run-devils-advocate").addEventListener("click", () => runComplianceAction("devils-advocate"));
   document.getElementById("run-legal-gate").addEventListener("click", () => runComplianceAction("legal-gate"));
+  document.getElementById("open-humane-pause").addEventListener("click", openHumanePause);
+  document.getElementById("release-humane-pause").addEventListener("click", releaseHumanePause);
+  document.getElementById("review-client-handoff").addEventListener("click", reviewClientHandoff);
   window.addEventListener("load", loadCompliancePage);
 </script>
 """
@@ -3009,6 +3197,21 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
           </div>
         </div>
       </section>
+
+      <section class="cards-3" style="margin-top: 22px;">
+        <div class="panel">
+          <div class="panel-header"><h3>Governance snapshot</h3></div>
+          <div id="workspace-governance" class="empty-state">Loading governance summary...</div>
+        </div>
+        <div class="panel">
+          <div class="panel-header"><h3>Client handoff readiness</h3></div>
+          <div id="workspace-handoff" class="empty-state">Loading handoff readiness...</div>
+        </div>
+        <div class="panel">
+          <div class="panel-header"><h3>Portal activity</h3></div>
+          <div id="workspace-portal" class="empty-state">Loading portal summary...</div>
+        </div>
+      </section>
     """
     script = """
 <script>
@@ -3040,6 +3243,7 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
 
   function renderWorkspaceSummary(detail) {
     const tone = fcdUi.stateTone(detail.current_state);
+    const governance = detail.governance || {};
     document.getElementById("workspace-summary").innerHTML = `
       <div class="kv-list">
         <div class="kv-row"><label>Invoice</label><div>${fcdUi.escape(detail.invoice_id)}</div></div>
@@ -3049,6 +3253,53 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
         <div class="kv-row"><label>Jurisdiction</label><div>${fcdUi.escape(detail.jurisdiction)}</div></div>
         <div class="kv-row"><label>Debtor type</label><div>${fcdUi.escape(detail.debtor_type)}</div></div>
         <div class="kv-row"><label>Due date</label><div>${fcdUi.escape(detail.due_date)}</div></div>
+        <div class="kv-row"><label>Chasers paused</label><div>${fcdUi.escape(String(governance.chasers_paused || false))}</div></div>
+      </div>
+      <div class="note-box" style="margin-top: 14px;">${fcdUi.escape(governance.next_operator_action || "Review live case signals before proceeding.")}</div>
+    `;
+  }
+
+  function renderWorkspaceGovernance(governance) {
+    document.getElementById("workspace-governance").innerHTML = `
+      <div class="kv-list">
+        <div class="kv-row"><label>Restricted</label><div>${fcdUi.escape(String(governance?.restricted || false))}</div></div>
+        <div class="kv-row"><label>Handoff required</label><div>${fcdUi.escape(String(governance?.handoff_required || false))}</div></div>
+        <div class="kv-row"><label>Active plan</label><div>${fcdUi.escape(governance?.active_payment_plan_id || "-")}</div></div>
+        <div class="kv-row"><label>Awaiting settlement</label><div>${fcdUi.escape(governance?.awaiting_settlement_offer_id || "-")}</div></div>
+      </div>
+      <div class="action-list">
+        <div class="action-item"><strong>Restriction codes</strong><span class="list-meta">${fcdUi.escape((governance?.restriction_codes || []).join(" | ") || "None")}</span></div>
+        <div class="action-item"><strong>Blocking reasons</strong><span class="list-meta">${fcdUi.escape((governance?.blocking_reasons || []).join(" | ") || "None")}</span></div>
+      </div>
+    `;
+  }
+
+  function renderWorkspaceHandoff(summary) {
+    const evidence = summary?.evidence_inventory || {};
+    document.getElementById("workspace-handoff").innerHTML = `
+      <div class="kv-list">
+        <div class="kv-row"><label>Eligible</label><div>${fcdUi.escape(String(summary?.eligible_for_handoff || false))}</div></div>
+        <div class="kv-row"><label>Destination</label><div>${fcdUi.escape(summary?.destination_label || "-")}</div></div>
+        <div class="kv-row"><label>Court fee</label><div>${fcdUi.escape(summary?.official_court_fee_gbp || "n/a")}</div></div>
+        <div class="kv-row"><label>Bundle at</label><div>${fcdUi.escape(summary?.latest_bundle_generated_at || "Not yet")}</div></div>
+      </div>
+      <div class="action-list">
+        <div class="action-item"><strong>Documents</strong><span class="list-meta">${fcdUi.escape((summary?.required_documents || []).join(" | ") || "None")}</span></div>
+        <div class="action-item"><strong>Evidence posture</strong><span class="list-meta">${fcdUi.escape(`contracts ${evidence.contract_artifacts || 0} | proof ${evidence.proof_artifacts || 0} | notices ${evidence.pre_action_notices || 0}`)}</span></div>
+      </div>
+    `;
+  }
+
+  function renderWorkspacePortal(summary) {
+    document.getElementById("workspace-portal").innerHTML = `
+      <div class="kv-list">
+        <div class="kv-row"><label>Registered</label><div>${fcdUi.escape(String(summary?.registered || false))}</div></div>
+        <div class="kv-row"><label>Portal case</label><div>${fcdUi.escape(summary?.case_id || "-")}</div></div>
+        <div class="kv-row"><label>Settlement destination</label><div>${fcdUi.escape(String(summary?.settlement_destination_available || false))}</div></div>
+        <div class="kv-row"><label>Bank state</label><div>${fcdUi.escape(summary?.bank_verification_state || "-")}</div></div>
+      </div>
+      <div class="action-list">
+        <div class="action-item"><strong>Recent portal activity</strong><span class="list-meta">${fcdUi.escape((summary?.recent_activity || []).map((item) => item.event_type).join(" | ") || "None")}</span></div>
       </div>
     `;
   }
@@ -3369,7 +3620,7 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
   }
 
   async function loadWorkspace() {
-    const [detail, communications, compliance, audit, plansPayload, offersPayload, reportsPayload, artifactsPayload] = await Promise.all([
+    const [detail, communications, compliance, audit, plansPayload, offersPayload, reportsPayload, artifactsPayload, governance, handoff, portal] = await Promise.all([
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/communications`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/compliance-ledger`),
@@ -3377,7 +3628,10 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/resolution/payment-plans`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/resolution/settlement-offers`),
       fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/reported-payments`),
-      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/evidence-artifacts`)
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/evidence-artifacts`),
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/governance-summary`),
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/client-handoff`),
+      fcdUi.request(`/invoices/${encodeURIComponent(workspaceInvoiceId)}/debtor-portal-summary`)
     ]);
     workspaceState.plans = plansPayload.plans || [];
     workspaceState.offers = offersPayload.offers || [];
@@ -3391,6 +3645,9 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
     renderWorkspaceReportedPayments();
     renderWorkspaceResolutionHistory();
     renderWorkspaceExportInventory();
+    renderWorkspaceGovernance(governance);
+    renderWorkspaceHandoff(handoff);
+    renderWorkspacePortal(portal);
     renderLogList("workspace-communications", communications.communications || [], (entry) => `
       <div class="log-item">
         <strong>${fcdUi.escape(entry.subject)}</strong>

@@ -164,6 +164,12 @@ python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --iss
 - `POST /portal/actions/settlement-offers`
 - `POST /portal/actions/confirm-paid`
 - `POST /invoices/{invoice_id}/debtor-actions/dispute/resolve`
+- `POST /invoices/{invoice_id}/humane-pauses/open`
+- `POST /invoices/{invoice_id}/humane-pauses/release`
+- `GET /invoices/{invoice_id}/governance-summary`
+- `GET /invoices/{invoice_id}/client-handoff`
+- `POST /invoices/{invoice_id}/client-handoff/review`
+- `GET /invoices/{invoice_id}/debtor-portal-summary`
 - `GET /invoices/{invoice_id}/evidence-artifacts?artifact_type=&limit=100&offset=0`
 - `GET /invoices/{invoice_id}/ledger-events?event_type=&limit=100&offset=0`
 - `GET /invoices/{invoice_id}/debtor-ledger`
@@ -257,6 +263,10 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 - Debtor portal hides settlement destination and payment links when CoP state is `COP_UNVERIFIED` or `COP_FAILED`.
 - Data-retention disposal is blocked when a case-level retention legal hold is open; holds are opened/released via dedicated endpoints with immutable audit entries.
 - Evidence bundle generation can include resolution artifacts via `include_resolution_artifacts=true`.
+- Humane pause controls now provide a summary-only welfare/vulnerability hold that blocks escalation without storing raw sensitive medical details in workflow records.
+- Governance summaries expose live restriction codes, pause reasons, and next operator action so the UI can warn before unsafe progression.
+- Client handoff summaries provide jurisdiction destination, required documents, rule-pack version, official court-fee context, and review signoff history.
+- Debtor portal JSON/HTML now includes case status, restriction summary, settlement destination visibility, and recent portal activity for operator reconciliation.
 
 ## SQLite Upgrade / Rollout Notes
 - [sqlite_store.py](C:/Dev/P26003-escalation-software.worktrees/code-inspection-report/src/unpaid_invoice_escalator/persistence/sqlite_store.py) remains the schema authority and automatically creates the new payment-verification and settlement-finalization tables on startup.
@@ -274,7 +284,8 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
   2. confirm `/health` and `/ready`
   3. open [ui.py](C:/Dev/P26003-escalation-software.worktrees/code-inspection-report/src/unpaid_invoice_escalator/ui.py) operations/workspace pages
   4. verify reported-payment review and settlement-progress controls render
-  5. verify one non-production payment-verification flow before promoting the upgraded database
+  5. verify humane-pause controls, governance snapshot, and handoff readiness panels render on the compliance/workspace pages
+  6. verify one non-production payment-verification and client-handoff review flow before promoting the upgraded databasese
 
 ## Viability & Proportionality
 - Viability assessments combine projected FCD action fee, projected court fee, and estimated time-cost against current outstanding amount.

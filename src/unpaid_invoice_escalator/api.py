@@ -50,7 +50,7 @@ from unpaid_invoice_escalator.services.debtor_verification_portal import DebtorV
 from unpaid_invoice_escalator.services.devils_advocate_engine import DevilsAdvocateEngine
 from unpaid_invoice_escalator.services.escalation_runner import EscalationRunner
 from unpaid_invoice_escalator.services.five_ledger_engine import FiveLedgerEngine
-from unpaid_invoice_escalator.services.jurisdiction_engine import JurisdictionFacts
+from unpaid_invoice_escalator.services.jurisdiction_engine import EscalationContext, JurisdictionEngine, JurisdictionFacts
 from unpaid_invoice_escalator.services.ledger_manifest_exporter import LedgerManifestExporter
 from unpaid_invoice_escalator.services.late_payment_engine import LatePaymentEngine
 from unpaid_invoice_escalator.services.legal_hold_taxonomy import LegalHoldTaxonomy
@@ -465,6 +465,29 @@ class ResolveDebtorDisputeRequest(BaseModel):
     resolution_notes: str
 
 
+class HumanePauseOpenRequest(BaseModel):
+    opened_by: str
+    concern_type: str
+    summary: str
+    notes: str = ""
+    debtor_identifier: str | None = None
+    contact_channel: str | None = None
+    review_due_date: date | None = None
+    sensitive_details_present: bool = False
+
+
+class HumanePauseReleaseRequest(BaseModel):
+    released_by: str
+    release_reason: str
+    resolution_notes: str = ""
+
+
+class ClientHandoffReviewRequest(BaseModel):
+    reviewed_by: str
+    ready_to_export: bool = True
+    notes: str = ""
+
+
 class SettlementBankDetailUpdateRequest(BaseModel):
     updated_by: str
     account_holder_name: str
@@ -519,7 +542,7 @@ def _accepts_html(request: Request) -> bool:
     return "text/html" in accept_header.lower() or "application/xhtml+xml" in accept_header.lower()
 
 
-def _render_verify_html(case_id: str | None, valid: bool, message: str) -> str:
+def _render_verify_html(case_id: str | None, verification_code: str | None, valid: bool, message: str) -> str:
     title = "Verification check" if valid else "Verification failed"
     status = "Valid verification" if valid else "Verification failed"
     return f"""<!doctype html>
@@ -547,7 +570,7 @@ def _render_verify_html(case_id: str | None, valid: bool, message: str) -> str:
     <p>{message}</p>
     {f'<div class=\"meta\">Case ID: {case_id}</div>' if case_id else ''}
     <div class=\"actions\">
-      <a class=\"button\" href=\"/portal?case={case_id or ''}&code={''}\">Open debtor portal</a>
+      <a class=\"button\" href=\"/portal?case={case_id or ''}&code={verification_code or ''}\">Open debtor portal</a>
       <a class=\"button\" href=\"/\">Return to dashboard</a>
     </div>
   </div>
@@ -556,8 +579,23 @@ def _render_verify_html(case_id: str | None, valid: bool, message: str) -> str:
 """
 
 
-def _render_portal_html(case_id: str, message: str, source_notice: str, resolution_options: list[str]) -> str:
+def _render_portal_html(
+    case_id: str,
+    message: str,
+    source_notice: str,
+    resolution_options: list[str],
+    *,
+    current_state: str,
+    outstanding_balance_gbp: str,
+    restrictions: list[str],
+    settlement_destination_message: str,
+    recent_activity: list[dict[str, str]],
+) -> str:
     options_html = "".join(f"<li>{option}</li>" for option in resolution_options)
+    restrictions_html = "".join(f"<li>{item}</li>" for item in restrictions) or "<li>No active restrictions recorded.</li>"
+    recent_html = "".join(
+        f"<li>{item['event_type']} | {item['timestamp']}</li>" for item in recent_activity
+    ) or "<li>No portal activity recorded yet.</li>"
     return f"""<!doctype html>
 <html lang=\"en\">
 <head>
@@ -581,6 +619,12 @@ def _render_portal_html(case_id: str, message: str, source_notice: str, resoluti
   <div class=\"wrap\">
     <h1>Debtor verification portal</h1>
     <div class=\"message\"><strong>Verified case:</strong> {case_id}<br />{message}</div>
+    <div class=\"notice\">
+      <strong>Case status</strong>
+      <p>Current workflow state: {current_state}</p>
+      <p>Outstanding balance: GBP {outstanding_balance_gbp}</p>
+      <p>{settlement_destination_message}</p>
+    </div>
     <div class=\"button-grid\">
       <button class=\"secondary\" type=\"button\">[ Pay Full Balance Now ]</button>
       <button type=\"button\">[ Confirm Payment Date ]</button>
@@ -599,6 +643,14 @@ def _render_portal_html(case_id: str, message: str, source_notice: str, resoluti
       <h2>Neutral options</h2>
       <ul>{options_html}</ul>
       <div class=\"muted\">This service is for invoice administration only and does not replace independent legal advice.</div>
+    </div>
+    <div class=\"notice\">
+      <strong>Restrictions and review state</strong>
+      <ul>{restrictions_html}</ul>
+    </div>
+    <div class=\"notice\">
+      <strong>Recent recorded portal activity</strong>
+      <ul>{recent_html}</ul>
     </div>
   </div>
 </body>
@@ -706,7 +758,9 @@ def create_app(
     )
     store = SQLiteStore(db_path)
     ledger = SQLiteInvoiceLedger(store)
-    runner = EscalationRunner(ledger=ledger)
+    rule_pack_loader = RulePackLoader()
+    jurisdiction_engine = JurisdictionEngine(rule_pack_loader=rule_pack_loader)
+    runner = EscalationRunner(ledger=ledger, jurisdiction_engine=jurisdiction_engine)
     late_payment_engine = LatePaymentEngine(ledger=ledger)
     manifest_exporter = LedgerManifestExporter(
         store=store,
@@ -714,7 +768,6 @@ def create_app(
         key_id=manifest_key_id,
         verification_keys=verification_keys,
     )
-    rule_pack_loader = RulePackLoader()
     dual_ledger_engine = DualLedgerEngine(store=store, event_ledger=ledger)
     hygiene_engine = PreOverdueHygieneEngine()
     discrepancy_validator = DataDiscrepancyValidator()
@@ -1025,8 +1078,21 @@ def create_app(
             "steps": steps,
         }
 
+    def _compliance_entries(invoice_id: str) -> tuple[ComplianceLedgerEntry, ...]:
+        return store.compliance_entries_for_invoice(invoice_id)
+
+    def _latest_matching_compliance_entry(
+        invoice_id: str, *event_types: str
+    ) -> ComplianceLedgerEntry | None:
+        entries = _compliance_entries(invoice_id)
+        wanted = set(event_types)
+        for entry in reversed(entries):
+            if entry.event_type in wanted:
+                return entry
+        return None
+
     def _latest_case_health_confidence(invoice_id: str) -> str | None:
-        entries = store.compliance_entries_for_invoice(invoice_id)
+        entries = _compliance_entries(invoice_id)
         for entry in reversed(entries):
             if entry.event_type == "CASE_HEALTH_CHECK":
                 confidence = str(entry.details.get("case_confidence", "")).strip().upper()
@@ -1034,7 +1100,7 @@ def create_app(
         return None
 
     def _data_accuracy_challenge_is_open(invoice_id: str) -> bool:
-        entries = store.compliance_entries_for_invoice(invoice_id)
+        entries = _compliance_entries(invoice_id)
         for entry in reversed(entries):
             if entry.event_type == "DATA_ACCURACY_CHALLENGE_RESOLVED":
                 return False
@@ -1043,7 +1109,7 @@ def create_app(
         return False
 
     def _debtor_dispute_is_open(invoice_id: str) -> bool:
-        entries = store.compliance_entries_for_invoice(invoice_id)
+        entries = _compliance_entries(invoice_id)
         for entry in reversed(entries):
             if entry.event_type == "DEBTOR_DISPUTE_RESOLVED":
                 return False
@@ -1051,8 +1117,17 @@ def create_app(
                 return True
         return False
 
+    def _humane_pause_snapshot(invoice_id: str) -> dict[str, object]:
+        entries = _compliance_entries(invoice_id)
+        for entry in reversed(entries):
+            if entry.event_type == "HUMANE_PAUSE_RELEASED":
+                return {"open": False, "opened": None, "released": {"timestamp": entry.timestamp.isoformat(), **entry.details}}
+            if entry.event_type == "HUMANE_PAUSE_OPENED":
+                return {"open": True, "opened": {"timestamp": entry.timestamp.isoformat(), **entry.details}, "released": None}
+        return {"open": False, "opened": None, "released": None}
+
     def _portal_payment_date_pending(invoice_id: str, *, as_of_date: date) -> bool:
-        entries = store.compliance_entries_for_invoice(invoice_id)
+        entries = _compliance_entries(invoice_id)
         for entry in reversed(entries):
             if entry.event_type == "PORTAL_PAYMENT_DATE_FULFILLED":
                 return False
@@ -1068,7 +1143,7 @@ def create_app(
         return False
 
     def _latest_discrepancy_invalid(invoice_id: str) -> bool:
-        entries = store.compliance_entries_for_invoice(invoice_id)
+        entries = _compliance_entries(invoice_id)
         for entry in reversed(entries):
             if entry.event_type == "DISCREPANCY_VALIDATION":
                 return not bool(entry.details.get("valid", False))
@@ -1419,9 +1494,214 @@ def create_app(
             )
         )
 
+    def _case_governance_summary(
+        invoice: Invoice,
+        *,
+        current_state: InvoiceState | None = None,
+        as_of_date: date | None = None,
+    ) -> dict[str, object]:
+        target_date = as_of_date or date.today()
+        resolved_state = current_state or store.infer_state(invoice.invoice_id)
+        humane_pause = _humane_pause_snapshot(invoice.invoice_id)
+        active_plan_id, active_plan_status = _active_or_defaulted_payment_plan(invoice.invoice_id, target_date)
+        awaiting_settlement_offer_id, awaiting_settlement_offer = _awaiting_settlement_offer(invoice.invoice_id, target_date)
+        restriction_codes: list[str] = []
+        blocking_reasons: list[str] = []
+
+        if _data_accuracy_challenge_is_open(invoice.invoice_id):
+            restriction_codes.append("DATA_ACCURACY_CHALLENGE")
+            blocking_reasons.append("Data accuracy challenge is open and recovery remains restricted.")
+        if _debtor_dispute_is_open(invoice.invoice_id):
+            restriction_codes.append("DEBTOR_DISPUTE")
+            blocking_reasons.append("Debtor dispute is open and requires review before escalation.")
+        if bool(humane_pause["open"]):
+            restriction_codes.append("HUMANE_PAUSE")
+            blocking_reasons.append("Humane pause is active. Hold outreach and use restricted note handling.")
+        if resolved_state == InvoiceState.BREATHING_SPACE_PAUSE:
+            restriction_codes.append("BREATHING_SPACE")
+            blocking_reasons.append("Breathing Space pause is active.")
+        if resolved_state == InvoiceState.JURISDICTION_UNCERTAIN:
+            restriction_codes.append("JURISDICTION_UNCERTAIN")
+            blocking_reasons.append("Jurisdiction facts need review before procedural progress.")
+        if _portal_payment_date_pending(invoice.invoice_id, as_of_date=target_date):
+            blocking_reasons.append("Debtor-promised payment date has not yet passed.")
+        if _payment_verification_pending_is_open(invoice.invoice_id):
+            blocking_reasons.append("Debtor-reported payment is awaiting creditor verification.")
+        if _has_unresolved_delivery_failure(invoice.invoice_id):
+            blocking_reasons.append("Communication delivery failure remains unresolved.")
+        if active_plan_status == "ACTIVE":
+            blocking_reasons.append(f"Payment plan {active_plan_id} is active and chasers remain paused.")
+        if awaiting_settlement_offer_id is not None and awaiting_settlement_offer is not None:
+            blocking_reasons.append(
+                f"Settlement offer {awaiting_settlement_offer_id} is awaiting payment with "
+                f"{awaiting_settlement_offer['remaining_payment_gbp']} remaining."
+            )
+
+        restricted = bool(restriction_codes)
+        chasers_paused = restricted or _payment_verification_pending_is_open(invoice.invoice_id)
+        chasers_paused = chasers_paused or _portal_payment_date_pending(invoice.invoice_id, as_of_date=target_date)
+        chasers_paused = chasers_paused or active_plan_status == "ACTIVE" or awaiting_settlement_offer_id is not None
+        handoff_required = resolved_state == InvoiceState.CLIENT_HANDOFF
+        if handoff_required:
+            blocking_reasons.append("Automated processing has ended and the case is in client handoff.")
+
+        next_operator_action = "Continue procedural workflow."
+        if bool(humane_pause["open"]):
+            next_operator_action = "Maintain humane pause and restricted-note handling until reviewed."
+        elif _data_accuracy_challenge_is_open(invoice.invoice_id):
+            next_operator_action = "Resolve the open data accuracy challenge before any escalation."
+        elif _debtor_dispute_is_open(invoice.invoice_id):
+            next_operator_action = "Review the dispute and separate any undisputed balance if appropriate."
+        elif resolved_state == InvoiceState.BREATHING_SPACE_PAUSE:
+            next_operator_action = "Maintain statutory pause until the protected period is cleared."
+        elif handoff_required:
+            next_operator_action = "Review handoff pack readiness and transfer to the client for decision."
+        elif _payment_verification_pending_is_open(invoice.invoice_id):
+            next_operator_action = "Confirm or reject the reported payment before resuming outreach."
+        elif active_plan_status == "ACTIVE":
+            next_operator_action = "Monitor the active payment plan while outreach stays paused."
+        elif awaiting_settlement_offer_id is not None:
+            next_operator_action = "Monitor settlement payment and keep chasers paused until funds are confirmed."
+
+        return {
+            "invoice_id": invoice.invoice_id,
+            "current_state": resolved_state.value,
+            "restricted": restricted,
+            "chasers_paused": chasers_paused,
+            "handoff_required": handoff_required,
+            "restriction_codes": restriction_codes,
+            "blocking_reasons": blocking_reasons,
+            "next_operator_action": next_operator_action,
+            "humane_pause": humane_pause,
+            "active_payment_plan_id": active_plan_id,
+            "active_payment_plan_status": active_plan_status,
+            "awaiting_settlement_offer_id": awaiting_settlement_offer_id,
+        }
+
+    def _court_handoff_destination(invoice: Invoice, *, outstanding_amount: Decimal, on_date: date) -> tuple[str, tuple[str, ...]]:
+        pack = rule_pack_loader.load_for(invoice.jurisdiction, on_date)
+        automation_limit = Decimal(str(pack.fcd_automation_limit))
+        workflow = pack.workflow
+        if invoice.jurisdiction == Jurisdiction.SCOTLAND:
+            if outstanding_amount > automation_limit:
+                return "Ordinary Cause / Scottish Solicitor review", tuple(workflow["over_limit_pack"])
+            return "SCTS Civil Online", tuple(workflow["small_claims_pack"])
+        if invoice.jurisdiction == Jurisdiction.NORTHERN_IRELAND:
+            if outstanding_amount > automation_limit:
+                return "County Court Civil Bill / NI Solicitor review", tuple(workflow["over_limit_pack"])
+            return "NI Direct Small Claims", tuple(workflow["small_claims_pack"])
+        if outstanding_amount > automation_limit:
+            return "County Court / Solicitor review", tuple(workflow["over_limit_pack"])
+        return "Money Claim Online / County Court", tuple(workflow["small_claims_pack"])
+
+    def _client_handoff_summary(invoice: Invoice, *, current_state: InvoiceState | None = None) -> dict[str, object]:
+        resolved_state = current_state or store.infer_state(invoice.invoice_id)
+        today = date.today()
+        outstanding = store.debtor_ledger_balance_for_invoice(invoice.invoice_id)
+        governance = _case_governance_summary(invoice, current_state=resolved_state, as_of_date=today)
+        rule_pack = rule_pack_loader.load_for(invoice.jurisdiction, today)
+        automation_limit = Decimal(str(rule_pack.fcd_automation_limit))
+        destination_label, required_documents = _court_handoff_destination(
+            invoice, outstanding_amount=outstanding, on_date=today
+        )
+        eligibility = resolved_state == InvoiceState.CLIENT_HANDOFF
+        if not eligibility:
+            preview = jurisdiction_engine.decide(
+                invoice,
+                EscalationContext(
+                    current_state=resolved_state,
+                    today=today,
+                    state_entered_on=store.infer_state_entered_on(invoice.invoice_id, resolved_state),
+                    outstanding_amount=outstanding,
+                ),
+            )
+            eligibility = preview.next_state == InvoiceState.CLIENT_HANDOFF
+        court_fee = None
+        court_fee_notice = "No official court fee is quoted when the outstanding balance is not positive."
+        if outstanding > Decimal("0.00"):
+            if invoice.jurisdiction in {Jurisdiction.SCOTLAND, Jurisdiction.NORTHERN_IRELAND} and outstanding > automation_limit:
+                court_fee_notice = (
+                    "No small-claims court fee is quoted because this case exceeds the automated small-claims workflow limit "
+                    "and has moved to solicitor or higher-court handoff."
+                )
+            else:
+                court_fee = dual_ledger_engine.quote_official_court_fee(invoice=invoice, claim_value_gbp=outstanding)
+                court_fee_notice = "Official court fee payable to the court authority, not FCD revenue."
+        artifacts = store.artifacts_for_invoice(invoice.invoice_id)
+        review_entry = _latest_matching_compliance_entry(invoice.invoice_id, "CLIENT_HANDOFF_REVIEWED")
+        bundle_audit_entries = [
+            entry for entry in store.audit_trail_entries_for_invoice(invoice.invoice_id) if entry.action == "EVIDENCE_BUNDLE_GENERATED"
+        ]
+        return {
+            "invoice_id": invoice.invoice_id,
+            "current_state": resolved_state.value,
+            "eligible_for_handoff": eligibility,
+            "destination_label": destination_label,
+            "required_documents": list(required_documents),
+            "outstanding_balance_gbp": str(outstanding),
+            "automation_limit_gbp": str(automation_limit.quantize(Decimal("0.01"))),
+            "official_court_fee_gbp": None if court_fee is None else str(court_fee),
+            "external_fee_notice": court_fee_notice,
+            "rule_pack_version": rule_pack.rule_version,
+            "source_authority": rule_pack.source_authority,
+            "human_approval_required": rule_pack.human_approval_required,
+            "enforcement_note": str(rule_pack.workflow["enforcement_note"]),
+            "governance": governance,
+            "evidence_inventory": {
+                "total_artifacts": len(artifacts),
+                "contract_artifacts": sum(1 for item in artifacts if item.artifact_type == ArtifactType.CONTRACT),
+                "proof_artifacts": sum(1 for item in artifacts if item.artifact_type == ArtifactType.PROOF_OF_DELIVERY),
+                "pre_action_notices": sum(1 for item in artifacts if item.artifact_type == ArtifactType.PRE_ACTION_NOTICE),
+                "chain_valid": store.verify_chain(invoice.invoice_id),
+            },
+            "latest_bundle_generated_at": None if not bundle_audit_entries else bundle_audit_entries[-1].timestamp.isoformat(),
+            "latest_review": (
+                None
+                if review_entry is None
+                else {
+                    "reviewed_at": review_entry.timestamp.isoformat(),
+                    **review_entry.details,
+                }
+            ),
+        }
+
+    def _debtor_portal_summary(invoice: Invoice, *, current_state: InvoiceState | None = None) -> dict[str, object]:
+        resolved_state = current_state or store.infer_state(invoice.invoice_id)
+        verification_case = store.debtor_verification_case_for_invoice(invoice.invoice_id)
+        governance = _case_governance_summary(invoice, current_state=resolved_state)
+        latest_bank = store.latest_settlement_bank_detail_for_invoice(invoice.invoice_id)
+        settlement_destination_available = bool(
+            latest_bank is not None and _bank_details_visible_in_portal(latest_bank.cop_state)
+        )
+        recent_activity = []
+        for entry in reversed(_compliance_entries(invoice.invoice_id)):
+            event_type = str(entry.event_type)
+            if event_type.startswith("PORTAL_") or event_type in {
+                "DEBTOR_VERIFICATION_REGISTERED",
+                "DEBTOR_PAYMENT_REPORTED",
+                "PAYMENT_VERIFICATION_PENDING",
+                "PAYMENT_VERIFICATION_CONFIRMED",
+                "PAYMENT_VERIFICATION_REJECTED",
+                "PAYMENT_VERIFICATION_NEEDS_EVIDENCE",
+            }:
+                recent_activity.append({"event_type": event_type, "timestamp": entry.timestamp.isoformat()})
+            if len(recent_activity) == 5:
+                break
+        return {
+            "invoice_id": invoice.invoice_id,
+            "registered": verification_case is not None,
+            "case_id": None if verification_case is None else verification_case.case_id,
+            "current_state": resolved_state.value,
+            "outstanding_balance_gbp": str(store.debtor_ledger_balance_for_invoice(invoice.invoice_id)),
+            "settlement_destination_available": settlement_destination_available,
+            "bank_verification_state": None if latest_bank is None else latest_bank.cop_state.value,
+            "governance": governance,
+            "recent_activity": recent_activity,
+        }
+
     def _data_retention_review(invoice_id: str, *, as_of_date: date) -> dict[str, object]:
         ledger_events = store.events_for_invoice(invoice_id)
-        compliance_entries = store.compliance_entries_for_invoice(invoice_id)
+        compliance_entries = _compliance_entries(invoice_id)
         artifacts = store.artifacts_for_invoice(invoice_id)
         legal_hold_open = False
         legal_hold_details: dict[str, object] | None = None
@@ -1616,11 +1896,11 @@ def create_app(
         result = debtor_verification_portal.verify(case_id=case, verification_code=code)
         if not result.valid:
             if _accepts_html(request):
-                return HTMLResponse(_render_verify_html(case, False, result.message))
+                return HTMLResponse(_render_verify_html(case, code, False, result.message))
             raise HTTPException(status_code=404, detail=result.message)
         payload = {"valid": True, "message": result.message}
         if _accepts_html(request):
-            return HTMLResponse(_render_verify_html(case, True, result.message))
+            return HTMLResponse(_render_verify_html(case, code, True, result.message))
         return payload
 
     @app.get("/portal", response_model=None)
@@ -1628,7 +1908,7 @@ def create_app(
         result = debtor_verification_portal.verify(case_id=case, verification_code=code)
         if not result.valid:
             if _accepts_html(request):
-                return HTMLResponse(_render_verify_html(case, False, result.message))
+                return HTMLResponse(_render_verify_html(case, code, False, result.message))
             raise HTTPException(status_code=404, detail=result.message)
         creditor_name = result.creditor_name or "the creditor"
         verification_case = store.debtor_verification_case_by_case_id(case.strip())
@@ -1654,6 +1934,10 @@ def create_app(
                     settlement_destination_message = (
                         "Settlement destination hidden pending Confirmation of Payee verification."
                     )
+        invoice = None if verification_case is None else store.get_invoice(verification_case.invoice_id)
+        portal_summary = None
+        if invoice is not None:
+            portal_summary = _debtor_portal_summary(invoice)
         payload = {
             "valid": True,
             "case_id": result.case_id,
@@ -1677,6 +1961,10 @@ def create_app(
             "settlement_destination_available": settlement_destination_available,
             "settlement_destination_message": settlement_destination_message,
             "settlement_destination": settlement_destination,
+            "current_state": None if portal_summary is None else portal_summary["current_state"],
+            "outstanding_balance_gbp": None if portal_summary is None else portal_summary["outstanding_balance_gbp"],
+            "restrictions": [] if portal_summary is None else list(portal_summary["governance"]["restriction_codes"]),
+            "recent_activity": [] if portal_summary is None else portal_summary["recent_activity"],
         }
         if _accepts_html(request):
             return HTMLResponse(
@@ -1685,6 +1973,11 @@ def create_app(
                     message=result.message,
                     source_notice=payload["source_of_data_notice"],
                     resolution_options=payload["resolution_options"],
+                    current_state=str(payload["current_state"] or "UNKNOWN"),
+                    outstanding_balance_gbp=str(payload["outstanding_balance_gbp"] or "0.00"),
+                    restrictions=[str(item) for item in payload["restrictions"]],
+                    settlement_destination_message=settlement_destination_message,
+                    recent_activity=[{"event_type": str(item["event_type"]), "timestamp": str(item["timestamp"])} for item in payload["recent_activity"]],
                 )
             )
         return payload
@@ -2388,12 +2681,13 @@ def create_app(
                 due_today += 1
             if is_overdue:
                 overdue += 1
+            governance = _case_governance_summary(invoice, current_state=current_state, as_of_date=today)
             if current_state in {
                 InvoiceState.DISPUTED,
                 InvoiceState.DISPUTE_REVIEW,
                 InvoiceState.BREATHING_SPACE_PAUSE,
                 InvoiceState.JURISDICTION_UNCERTAIN,
-            }:
+            } or bool(governance["restricted"]) or bool(governance["chasers_paused"]):
                 blocked_or_paused += 1
             if current_state == InvoiceState.CLIENT_HANDOFF:
                 handoff_ready += 1
@@ -2436,6 +2730,7 @@ def create_app(
                     "latest_event_at": None if latest_event is None else latest_event.timestamp.isoformat(),
                     "chain_valid": store.verify_chain(invoice.invoice_id),
                     "next_step": next_step,
+                    "governance": governance,
                 }
             )
 
@@ -2575,6 +2870,7 @@ def create_app(
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
         current_state = store.infer_state(invoice_id)
+        governance = _case_governance_summary(invoice, current_state=current_state)
         return {
             "invoice_id": invoice.invoice_id,
             "currency": invoice.currency,
@@ -2586,6 +2882,7 @@ def create_app(
             "debtor_type": invoice.debtor_type.value,
             "current_state": current_state.value,
             "chain_valid": store.verify_chain(invoice_id),
+            "governance": governance,
         }
 
     @app.get("/invoices/{invoice_id}/communication-preview")
@@ -3192,6 +3489,168 @@ def create_app(
             data_payload={"creditor_user_id": payload.creditor_user_id},
         )
         return {"invoice_id": invoice_id, "status": "DISPUTE_RESOLVED"}
+
+    @app.post("/invoices/{invoice_id}/humane-pauses/open")
+    def open_humane_pause(invoice_id: str, payload: HumanePauseOpenRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        snapshot = _humane_pause_snapshot(invoice_id)
+        if bool(snapshot["open"]):
+            raise HTTPException(status_code=409, detail="A humane pause is already open for this invoice.")
+        now = datetime.now(timezone.utc)
+        details = {
+            "opened_by": payload.opened_by,
+            "concern_type": payload.concern_type.strip(),
+            "summary": payload.summary.strip(),
+            "notes": payload.notes,
+            "debtor_identifier": payload.debtor_identifier,
+            "contact_channel": payload.contact_channel,
+            "review_due_date": None if payload.review_due_date is None else payload.review_due_date.isoformat(),
+            "sensitive_details_present": payload.sensitive_details_present,
+            "restricted_access": "SUMMARY_ONLY",
+        }
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="HUMANE_PAUSE_OPENED",
+                details=details,
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.CLIENT,
+            event_type="HUMANE_PAUSE_OPENED",
+            timestamp=now,
+            data_payload={
+                "opened_by": payload.opened_by,
+                "concern_type": payload.concern_type.strip(),
+                "review_due_date": None if payload.review_due_date is None else payload.review_due_date.isoformat(),
+                "restricted_access": "SUMMARY_ONLY",
+            },
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="COMPLIANCE",
+            action="HUMANE_PAUSE_OPENED",
+            actor=payload.opened_by,
+            details={"concern_type": payload.concern_type.strip(), "restricted_access": "SUMMARY_ONLY"},
+        )
+        return {
+            "invoice_id": invoice_id,
+            "status": "HUMANE_PAUSE_OPEN",
+            "chasers_paused": True,
+            "governance": _case_governance_summary(invoice),
+        }
+
+    @app.post("/invoices/{invoice_id}/humane-pauses/release")
+    def release_humane_pause(invoice_id: str, payload: HumanePauseReleaseRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        snapshot = _humane_pause_snapshot(invoice_id)
+        if not bool(snapshot["open"]):
+            raise HTTPException(status_code=409, detail="No open humane pause exists for this invoice.")
+        now = datetime.now(timezone.utc)
+        details = {
+            "released_by": payload.released_by,
+            "release_reason": payload.release_reason,
+            "resolution_notes": payload.resolution_notes,
+            "released_opened_details": snapshot["opened"],
+        }
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="HUMANE_PAUSE_RELEASED",
+                details=details,
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.CLIENT,
+            event_type="HUMANE_PAUSE_RELEASED",
+            timestamp=now,
+            data_payload={"released_by": payload.released_by, "release_reason": payload.release_reason},
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="COMPLIANCE",
+            action="HUMANE_PAUSE_RELEASED",
+            actor=payload.released_by,
+            details={"release_reason": payload.release_reason},
+        )
+        return {
+            "invoice_id": invoice_id,
+            "status": "HUMANE_PAUSE_RELEASED",
+            "chasers_paused": _case_governance_summary(invoice)["chasers_paused"],
+            "governance": _case_governance_summary(invoice),
+        }
+
+    @app.get("/invoices/{invoice_id}/governance-summary")
+    def governance_summary(invoice_id: str) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        return _case_governance_summary(invoice)
+
+    @app.get("/invoices/{invoice_id}/client-handoff")
+    def client_handoff_summary(invoice_id: str) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        return _client_handoff_summary(invoice)
+
+    @app.post("/invoices/{invoice_id}/client-handoff/review")
+    def review_client_handoff(invoice_id: str, payload: ClientHandoffReviewRequest) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        summary = _client_handoff_summary(invoice)
+        if not bool(summary["eligible_for_handoff"]):
+            raise HTTPException(status_code=409, detail="Invoice is not yet ready for client handoff review.")
+        now = datetime.now(timezone.utc)
+        details = {
+            "reviewed_by": payload.reviewed_by,
+            "ready_to_export": payload.ready_to_export,
+            "notes": payload.notes,
+            "destination_label": summary["destination_label"],
+            "required_documents": summary["required_documents"],
+        }
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="CLIENT_HANDOFF_REVIEWED",
+                details=details,
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.CLIENT,
+            event_type="CLIENT_HANDOFF_REVIEWED",
+            timestamp=now,
+            data_payload={"reviewed_by": payload.reviewed_by, "ready_to_export": payload.ready_to_export},
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="EXPORT",
+            action="CLIENT_HANDOFF_REVIEWED",
+            actor=payload.reviewed_by,
+            details={"destination_label": summary["destination_label"], "ready_to_export": payload.ready_to_export},
+        )
+        return _client_handoff_summary(invoice)
+
+    @app.get("/invoices/{invoice_id}/debtor-portal-summary")
+    def debtor_portal_summary(invoice_id: str) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        return _debtor_portal_summary(invoice)
 
     @app.get("/invoices/{invoice_id}/evidence-artifacts")
     def list_evidence_artifacts(
@@ -4918,6 +5377,11 @@ def create_app(
                 status_code=409,
                 detail="Escalation blocked while debtor data-accuracy challenge is open.",
             )
+        if bool(_humane_pause_snapshot(invoice_id)["open"]):
+            raise HTTPException(
+                status_code=409,
+                detail="Escalation blocked while a humane pause is open.",
+            )
         if _debtor_dispute_is_open(invoice_id):
             raise HTTPException(
                 status_code=409,
@@ -5187,6 +5651,9 @@ def create_app(
             _latest_compliance_entry("DISCREPANCY_VALIDATION"),
             _latest_compliance_entry("DATA_ACCURACY_CHALLENGE_OPEN"),
             _latest_compliance_entry("DATA_ACCURACY_CHALLENGE_RESOLVED"),
+            _latest_compliance_entry("HUMANE_PAUSE_OPENED"),
+            _latest_compliance_entry("HUMANE_PAUSE_RELEASED"),
+            _latest_compliance_entry("CLIENT_HANDOFF_REVIEWED"),
         ]
         latest_hash = ledger_events[-1].hash if ledger_events else "GENESIS"
         event_chain_attestation = [

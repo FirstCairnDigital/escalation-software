@@ -36,7 +36,10 @@ class TestApi(unittest.TestCase):
             self.assertIn("Settlement actions", operations_page.text)
             self.assertIn("Reported payment review", operations_page.text)
             self.assertIn("Report installment payment for verification", operations_page.text)
-            self.assertEqual(client.get("/ui/compliance").status_code, 200)
+            compliance_page = client.get("/ui/compliance")
+            self.assertEqual(compliance_page.status_code, 200)
+            self.assertIn("Humane pause controls", compliance_page.text)
+            self.assertIn("Client handoff readiness", compliance_page.text)
             reports_page = client.get("/ui/reports")
             self.assertEqual(reports_page.status_code, 200)
             self.assertIn("Environment checks", reports_page.text)
@@ -361,6 +364,9 @@ class TestApi(unittest.TestCase):
             self.assertIn("Settlement acceptance", workspace_resp.text)
             self.assertIn("Settlement progress", workspace_resp.text)
             self.assertIn("Reported payment review", workspace_resp.text)
+            self.assertIn("Governance snapshot", workspace_resp.text)
+            self.assertIn("Client handoff readiness", workspace_resp.text)
+            self.assertIn("Portal activity", workspace_resp.text)
             rule_resp = client.get("/rule-packs/NORTHERN_IRELAND/active?on_date=2026-02-01")
             self.assertEqual(rule_resp.status_code, 200)
             self.assertEqual(rule_resp.json()["rule_id"], "ni-commercial-invoice-recovery")
@@ -2117,11 +2123,19 @@ class TestApi(unittest.TestCase):
             self.assertEqual(verify_html.status_code, 200)
             self.assertIn("First Cairn Digital case verification", verify_html.text)
             self.assertIn("genuine", verify_html.text.lower())
+            self.assertIn(f"/portal?case={case_id}&code={code}", verify_html.text)
 
             portal_html = client.get(f"/portal?case={case_id}&code={code}", headers={"Accept": "text/html"})
             self.assertEqual(portal_html.status_code, 200)
             self.assertIn("Debtor verification portal", portal_html.text)
             self.assertIn("Source of data", portal_html.text)
+            self.assertIn("Case status", portal_html.text)
+            self.assertIn("Recent recorded portal activity", portal_html.text)
+
+            portal_json = client.get(f"/portal?case={case_id}&code={code}")
+            self.assertEqual(portal_json.status_code, 200)
+            self.assertEqual(portal_json.json()["outstanding_balance_gbp"], "1500.00")
+            self.assertIn("DEBTOR_VERIFICATION_REGISTERED", [item["event_type"] for item in portal_json.json()["recent_activity"]])
 
             bundle_resp = client.get(
                 "/invoices/inv-public-portal/evidence-bundle",
@@ -2130,6 +2144,96 @@ class TestApi(unittest.TestCase):
             self.assertEqual(bundle_resp.status_code, 200)
             self.assertEqual(bundle_resp.headers["content-type"].split(";", 1)[0], "application/pdf")
             self.assertGreater(len(bundle_resp.content), 200)
+
+    def test_humane_pause_and_client_handoff_workflows(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-humane-handoff.db")
+            app = create_app(db_path=db_path, artifacts_dir=str(Path(tmp_dir) / "artifacts"), bundles_dir=str(Path(tmp_dir) / "bundles"))
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-humane-handoff",
+                    "currency": "GBP",
+                    "principal_amount": "6000",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "SCOTLAND",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            case_health_resp = client.post(
+                "/invoices/inv-humane-handoff/case-health-check",
+                json={
+                    "user_id": "USER-102",
+                    "correct_customer_legal_entity": True,
+                    "description_of_goods_or_services": True,
+                    "invoice_number_and_date_verified": True,
+                    "amount_matches_contract_or_quote": True,
+                    "correct_billing_address": True,
+                    "vat_numbers_checked": True,
+                    "purchase_order_supplied_if_required": True,
+                    "payment_terms_and_due_date_established": True,
+                    "delivery_or_acceptance_proof_attached": True,
+                    "no_unresolved_credit_notes": True,
+                    "direct_payments_checked": True,
+                    "no_known_dispute": True,
+                    "creditor_authority_verified": True,
+                    "limitation_period_checked": True,
+                    "debtor_contact_details_verified": True,
+                    "court_handoff_boundary_acknowledged": True,
+                },
+            )
+            self.assertEqual(case_health_resp.status_code, 200)
+
+            humane_open_resp = client.post(
+                "/invoices/inv-humane-handoff/humane-pauses/open",
+                json={
+                    "opened_by": "USER-7",
+                    "concern_type": "VULNERABILITY_NOTICE",
+                    "summary": "Debtor contact suggested a welfare concern and requested reduced contact.",
+                    "notes": "Record summary only.",
+                    "review_due_date": "2026-02-15",
+                    "sensitive_details_present": True,
+                },
+            )
+            self.assertEqual(humane_open_resp.status_code, 200)
+            self.assertTrue(humane_open_resp.json()["chasers_paused"])
+
+            governance_resp = client.get("/invoices/inv-humane-handoff/governance-summary")
+            self.assertEqual(governance_resp.status_code, 200)
+            self.assertTrue(governance_resp.json()["restricted"])
+            self.assertIn("HUMANE_PAUSE", governance_resp.json()["restriction_codes"])
+
+            escalate_resp = client.post(
+                "/invoices/inv-humane-handoff/escalate",
+                json={"today": "2026-02-01", "current_state": "FORMAL_NOTICE"},
+            )
+            self.assertEqual(escalate_resp.status_code, 409)
+            self.assertIn("humane pause", escalate_resp.json()["detail"].lower())
+
+            handoff_resp = client.get("/invoices/inv-humane-handoff/client-handoff")
+            self.assertEqual(handoff_resp.status_code, 200)
+            self.assertTrue(handoff_resp.json()["eligible_for_handoff"])
+            self.assertEqual(handoff_resp.json()["destination_label"], "Ordinary Cause / Scottish Solicitor review")
+            self.assertIn("Formal Notice", handoff_resp.json()["required_documents"])
+
+            handoff_review_resp = client.post(
+                "/invoices/inv-humane-handoff/client-handoff/review",
+                json={"reviewed_by": "USER-7", "ready_to_export": True, "notes": "Ready for client decision."},
+            )
+            self.assertEqual(handoff_review_resp.status_code, 200)
+            self.assertEqual(handoff_review_resp.json()["latest_review"]["reviewed_by"], "USER-7")
+
+            humane_release_resp = client.post(
+                "/invoices/inv-humane-handoff/humane-pauses/release",
+                json={"released_by": "USER-7", "release_reason": "CREDITOR_REVIEW_COMPLETE", "resolution_notes": "Manual review complete."},
+            )
+            self.assertEqual(humane_release_resp.status_code, 200)
+            self.assertFalse(humane_release_resp.json()["governance"]["restricted"])
 
     def test_health_and_production_readiness_aliases(self) -> None:
         with TemporaryDirectory() as tmp_dir:
