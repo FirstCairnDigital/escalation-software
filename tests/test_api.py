@@ -1,3 +1,6 @@
+#
+# First Cairn Digital
+# P26003 bank-detail authentication hardening
 from datetime import date, timedelta
 import os
 from pathlib import Path
@@ -118,6 +121,7 @@ class TestApi(unittest.TestCase):
 
             unauthorized_bank_update = client.post(
                 "/invoices/inv-api-1/settlement-bank-details",
+                headers={"x-api-key": "requester-key"},
                 json={
                     "updated_by": "USER-102",
                     "account_holder_name": "First Cairn Digital Client Ltd",
@@ -127,22 +131,37 @@ class TestApi(unittest.TestCase):
                     "mfa_reauthenticated": False,
                 },
             )
-            self.assertEqual(unauthorized_bank_update.status_code, 403)
+            self.assertEqual(unauthorized_bank_update.status_code, 404)
+
+            approval_resp = client.post(
+                "/invoices/inv-api-1/settlement-bank-details/approvals",
+                headers={"x-api-key": "approver-key"},
+                json={
+                    "approval_reference": "APPROVAL-REF-1",
+                    "approval_method": "AUTHENTICATED_ADMIN_APPROVAL",
+                    "notes": "Verified by admin prior to bank update.",
+                },
+            )
+            self.assertEqual(approval_resp.status_code, 200)
 
             authorized_bank_update = client.post(
                 "/invoices/inv-api-1/settlement-bank-details",
+                headers={"x-api-key": "requester-key"},
                 json={
                     "updated_by": "USER-102",
                     "account_holder_name": "First Cairn Digital Client Ltd",
                     "sort_code": "12-34-56",
                     "account_number": "12345678",
                     "expected_payee_name": "First Cairn Digital Client Ltd",
-                    "dual_control_approved_by": "ADMIN-1",
                     "dual_control_approval_reference": "APPROVAL-REF-1",
                 },
             )
             self.assertEqual(authorized_bank_update.status_code, 200)
             self.assertEqual(authorized_bank_update.json()["cop_state"], "COP_EXACT_MATCH")
+            self.assertEqual(
+                authorized_bank_update.json()["verification_method"],
+                "ACCOUNT_HOLDER_NAME_CONSISTENCY_CHECK",
+            )
 
             bank_details_resp = client.get("/invoices/inv-api-1/settlement-bank-details")
             self.assertEqual(bank_details_resp.status_code, 200)
@@ -156,23 +175,25 @@ class TestApi(unittest.TestCase):
 
             failed_bank_update = client.post(
                 "/invoices/inv-api-1/settlement-bank-details",
+                headers={"x-api-key": "requester-key"},
                 json={
                     "updated_by": "USER-102",
                     "account_holder_name": "Unexpected Name",
                     "sort_code": "12-34-56",
                     "account_number": "12345678",
                     "expected_payee_name": "First Cairn Digital Client Ltd",
+                    "dual_control_approval_reference": "APPROVAL-REF-1",
+                    "dual_control_approved_by": "WRONG-APPROVER",
                     "mfa_reauthenticated": True,
                 },
             )
-            self.assertEqual(failed_bank_update.status_code, 200)
-            self.assertEqual(failed_bank_update.json()["cop_state"], "COP_FAILED")
+            self.assertEqual(failed_bank_update.status_code, 403)
 
             portal_with_failed_bank = client.get(
                 f"/portal?case={verification_body['case_id']}&code={verification_body['verification_code']}"
             )
             self.assertEqual(portal_with_failed_bank.status_code, 200)
-            self.assertFalse(portal_with_failed_bank.json()["settlement_destination_available"])
+            self.assertTrue(portal_with_failed_bank.json()["settlement_destination_available"])
 
             comm_create_resp = client.post(
                 "/invoices/inv-api-1/communications",
@@ -2236,15 +2257,26 @@ class TestApi(unittest.TestCase):
             self.assertIn("genuine", verify_html.text.lower())
             self.assertIn(f"/portal?case={case_id}&code={code}", verify_html.text)
 
+            approval_resp = client.post(
+                "/invoices/inv-public-portal/settlement-bank-details/approvals",
+                headers={"x-api-key": "approver-key"},
+                json={
+                    "approval_reference": "APPROVAL-REF-2",
+                    "approval_method": "AUTHENTICATED_ADMIN_APPROVAL",
+                    "notes": "Verified for public portal bank details.",
+                },
+            )
+            self.assertEqual(approval_resp.status_code, 200)
+
             bank_update_resp = client.post(
                 "/invoices/inv-public-portal/settlement-bank-details",
+                headers={"x-api-key": "requester-key"},
                 json={
                     "updated_by": "USER-1",
                     "account_holder_name": "First Cairn Digital Client Ltd",
                     "sort_code": "12-34-56",
                     "account_number": "12345678",
                     "expected_payee_name": "First Cairn Digital Client Ltd",
-                    "dual_control_approved_by": "ADMIN-1",
                     "dual_control_approval_reference": "APPROVAL-REF-2",
                 },
             )

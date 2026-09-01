@@ -1,4 +1,7 @@
 from __future__ import annotations
+#
+# First Cairn Digital
+# P26003 bank-detail authentication hardening
 
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -65,7 +68,7 @@ from unpaid_invoice_escalator.services.resolution_artifact_generator import Reso
 from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
 from unpaid_invoice_escalator.services.viability_proportionality_calculator import ViabilityProportionalityCalculator
 from unpaid_invoice_escalator.security import ApiSecurityController, ROLE_RANK
-from unpaid_invoice_escalator.tenant_context import current_client_id, current_role, reset_request_context, set_request_context
+from unpaid_invoice_escalator.tenant_context import current_client_id, current_identity, current_role, reset_request_context, set_request_context
 from unpaid_invoice_escalator.ui import (
     render_cases_html,
     render_compliance_html,
@@ -557,6 +560,12 @@ class SettlementBankDetailUpdateRequest(BaseModel):
     mfa_reauthenticated: bool = False
     dual_control_approved_by: str | None = None
     dual_control_approval_reference: str | None = None
+
+
+class SettlementBankDetailApprovalRequest(BaseModel):
+    approval_reference: str
+    approval_method: str = "AUTHENTICATED_ADMIN_APPROVAL"
+    notes: str = ""
 
 
 def _parse_api_keys(raw: str) -> dict[str, str]:
@@ -2242,6 +2251,17 @@ def create_app(
     def _bank_details_visible_in_portal(state: BankDetailVerificationState) -> bool:
         return state in {BankDetailVerificationState.COP_EXACT_MATCH, BankDetailVerificationState.COP_CLOSE_MATCH}
 
+    def _latest_bank_detail_approval(invoice_id: str, approval_reference: str) -> ComplianceLedgerEntry | None:
+        reference = approval_reference.strip()
+        if not reference:
+            return None
+        for entry in reversed(_compliance_entries(invoice_id)):
+            if entry.event_type != "BANK_DETAIL_DUAL_CONTROL_APPROVED":
+                continue
+            if str(entry.details.get("approval_reference", "")).strip() == reference:
+                return entry
+        return None
+
     def _generate_promise_to_pay_artifact(invoice_id: str, plan_id: str, output_filename: str) -> EvidenceArtifact:
         agreements = store.payment_plan_agreements_for_invoice(invoice_id)
         agreement = next((item for item in agreements if item.plan_id == plan_id), None)
@@ -2966,21 +2986,25 @@ def create_app(
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
-        decision = bank_detail_guard.authorize_update(
-            updated_by=payload.updated_by,
-            mfa_reauthenticated=payload.mfa_reauthenticated,
-            dual_control_approved_by=payload.dual_control_approved_by,
-            dual_control_approval_reference=payload.dual_control_approval_reference,
-        )
-        if not decision.allowed:
-            raise HTTPException(status_code=403, detail=decision.reason or "Bank detail update not authorized.")
+        requester_identity = current_identity.get()
+        approval_reference = (payload.dual_control_approval_reference or "").strip()
+        approval_entry = _latest_bank_detail_approval(invoice_id, approval_reference)
+        if approval_entry is None:
+            raise HTTPException(status_code=404, detail="Approved bank-detail change not found.")
+        approver_identity = str(approval_entry.details.get("approver_identity", "")).strip()
+        if not approver_identity:
+            raise HTTPException(status_code=409, detail="Approved bank-detail change is missing approver identity.")
+        if approver_identity == requester_identity:
+            raise HTTPException(status_code=403, detail="Requester and approver must be distinct authenticated identities.")
+        if payload.dual_control_approved_by and payload.dual_control_approved_by.strip() != approver_identity:
+            raise HTTPException(status_code=403, detail="Supplied approver name does not match the server-side approval record.")
 
         now = datetime.now(timezone.utc)
         base_record = {
             "record_id": str(uuid4()),
             "invoice_id": invoice_id,
             "created_at": now,
-            "updated_by": payload.updated_by,
+            "updated_by": requester_identity,
             "account_holder_name": payload.account_holder_name.strip(),
             "sort_code": payload.sort_code.strip(),
             "account_number_last4": _last4(payload.account_number),
@@ -2988,8 +3012,8 @@ def create_app(
             "cop_state": BankDetailVerificationState.COP_UNVERIFIED,
             "cop_result": None,
             "expected_payee_name": payload.expected_payee_name,
-            "dual_control_approved_by": payload.dual_control_approved_by,
-            "mfa_reauthenticated": payload.mfa_reauthenticated,
+            "dual_control_approved_by": approver_identity,
+            "mfa_reauthenticated": False,
         }
         store.append_settlement_bank_detail_record(record=SettlementBankDetailRecord(**base_record))
         store.append_compliance_entry(
@@ -2999,11 +3023,14 @@ def create_app(
                 timestamp=now,
                 event_type="BANK_DETAILS_UPDATED_PENDING_COP",
                 details={
-                    "updated_by": payload.updated_by,
+                    "requester_identity": requester_identity,
+                    "approver_identity": approver_identity,
+                    "approval_reference": approval_reference,
+                    "approval_method": str(approval_entry.details.get("approval_method") or ""),
                     "sort_code": payload.sort_code.strip(),
                     "account_number_last4": _last4(payload.account_number),
                     "mfa_reauthenticated": payload.mfa_reauthenticated,
-                    "dual_control_approved_by": payload.dual_control_approved_by,
+                    "dual_control_approved_by": approver_identity,
                 },
             )
         )
@@ -3013,8 +3040,11 @@ def create_app(
             event_type="BANK_DETAILS_UPDATED_PENDING_COP",
             timestamp=now,
             data_payload={
-                "updated_by": payload.updated_by,
+                "requester_identity": requester_identity,
+                "approver_identity": approver_identity,
+                "approval_reference": approval_reference,
                 "cop_state": BankDetailVerificationState.COP_UNVERIFIED.value,
+                "verification_method": "ACCOUNT_HOLDER_NAME_CONSISTENCY_CHECK",
             },
         )
         cop_result, cop_state = bank_detail_guard.evaluate_cop(
@@ -3028,7 +3058,11 @@ def create_app(
                     invoice_id=invoice_id,
                     timestamp=now,
                     event_type="BANK_DETAILS_COP_CHECK_QUEUED",
-                    details={"updated_by": payload.updated_by},
+                    details={
+                        "requester_identity": requester_identity,
+                        "approver_identity": approver_identity,
+                        "approval_reference": approval_reference,
+                    },
                 )
             )
             ledger.append_event(
@@ -3036,12 +3070,17 @@ def create_app(
                 actor=Actor.SYSTEM,
                 event_type="BANK_DETAILS_COP_CHECK_QUEUED",
                 timestamp=now,
-                data_payload={"updated_by": payload.updated_by},
+                data_payload={
+                    "requester_identity": requester_identity,
+                    "approver_identity": approver_identity,
+                    "approval_reference": approval_reference,
+                },
             )
             return {
                 "invoice_id": invoice_id,
                 "cop_state": BankDetailVerificationState.COP_UNVERIFIED.value,
                 "cop_result": None,
+                "verification_method": "ACCOUNT_HOLDER_NAME_CONSISTENCY_CHECK",
             }
 
         verified_record = {
@@ -3058,9 +3097,12 @@ def create_app(
                 timestamp=now,
                 event_type="BANK_DETAILS_COP_CHECK_COMPLETED",
                 details={
-                    "updated_by": payload.updated_by,
+                    "requester_identity": requester_identity,
+                    "approver_identity": approver_identity,
+                    "approval_reference": approval_reference,
                     "cop_result": cop_result.value,
                     "cop_state": cop_state.value,
+                    "verification_method": "ACCOUNT_HOLDER_NAME_CONSISTENCY_CHECK",
                 },
             )
         )
@@ -3069,13 +3111,65 @@ def create_app(
             actor=Actor.SYSTEM,
             event_type="BANK_DETAILS_COP_CHECK_COMPLETED",
             timestamp=now,
-            data_payload={"cop_result": cop_result.value, "cop_state": cop_state.value},
+            data_payload={
+                "cop_result": cop_result.value,
+                "cop_state": cop_state.value,
+                "verification_method": "ACCOUNT_HOLDER_NAME_CONSISTENCY_CHECK",
+            },
         )
         return {
             "invoice_id": invoice_id,
             "cop_state": cop_state.value,
             "cop_result": cop_result.value,
+            "verification_method": "ACCOUNT_HOLDER_NAME_CONSISTENCY_CHECK",
         }
+
+    @app.post("/invoices/{invoice_id}/settlement-bank-details/approvals")
+    def create_settlement_bank_detail_approval(
+        invoice_id: str, payload: SettlementBankDetailApprovalRequest
+    ) -> dict[str, object]:
+        invoice = store.get_invoice(invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found.")
+        if current_role.get() != "admin":
+            raise HTTPException(status_code=403, detail="Bank-detail approval requires an authorised admin identity.")
+        approval_reference = payload.approval_reference.strip()
+        if not approval_reference:
+            raise HTTPException(status_code=400, detail="approval_reference must not be empty.")
+        if _latest_bank_detail_approval(invoice_id, approval_reference) is not None:
+            raise HTTPException(status_code=409, detail="Bank-detail approval reference already exists.")
+        approver_identity = current_identity.get()
+        now = datetime.now(timezone.utc)
+        details = {
+            "approval_reference": approval_reference,
+            "approver_identity": approver_identity,
+            "approval_method": payload.approval_method.strip() or "AUTHENTICATED_ADMIN_APPROVAL",
+            "notes": payload.notes,
+        }
+        store.append_compliance_entry(
+            ComplianceLedgerEntry(
+                entry_id=str(uuid4()),
+                invoice_id=invoice_id,
+                timestamp=now,
+                event_type="BANK_DETAIL_DUAL_CONTROL_APPROVED",
+                details=details,
+            )
+        )
+        ledger.append_event(
+            invoice_id=invoice_id,
+            actor=Actor.CLIENT,
+            event_type="BANK_DETAIL_DUAL_CONTROL_APPROVED",
+            timestamp=now,
+            data_payload=details,
+        )
+        _record_audit_trail(
+            invoice_id,
+            category="SECURITY",
+            action="BANK_DETAIL_DUAL_CONTROL_APPROVED",
+            actor=approver_identity,
+            details=details,
+        )
+        return {"invoice_id": invoice_id, **details}
 
     @app.get("/invoices/{invoice_id}/settlement-bank-details")
     def list_settlement_bank_details(invoice_id: str) -> dict[str, object]:

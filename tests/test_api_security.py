@@ -1,3 +1,6 @@
+#
+# First Cairn Digital
+# P26003 bank-detail authentication hardening
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory, mkdtemp
@@ -229,6 +232,157 @@ class TestApiSecurity(unittest.TestCase):
             )
             self.assertEqual(absolute_bundle_resp.status_code, 400)
 
+    def test_bank_detail_dual_control_requires_distinct_authenticated_identities(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "bank-auth.db")
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                bundles_dir=str(Path(tmp_dir) / "bundles"),
+                auth_enabled=True,
+                api_keys={
+                    "requester-key": "operator",
+                    "approver-key": "admin",
+                    "viewer-key": "viewer",
+                },
+                api_clients={
+                    "requester-key": "CLIENT-A",
+                    "approver-key": "CLIENT-A",
+                    "viewer-key": "CLIENT-A",
+                },
+                rate_limit_per_minute=100,
+                manifest_signing_key="production-signing-key",
+                manifest_key_id="fcd-kms-key-1",
+            )
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                headers={"x-api-key": "requester-key"},
+                json={
+                    "invoice_id": "inv-bank-auth",
+                    "currency": "GBP",
+                    "principal_amount": "100",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            viewer_blocked_resp = client.post(
+                "/invoices/inv-bank-auth/settlement-bank-details",
+                headers={"x-api-key": "viewer-key"},
+                json={
+                    "updated_by": "viewer-key",
+                    "account_holder_name": "Client A Trading Ltd",
+                    "sort_code": "12-34-56",
+                    "account_number": "12345678",
+                    "expected_payee_name": "Client A Trading Ltd",
+                    "dual_control_approval_reference": "BANK-REF-1",
+                },
+            )
+            self.assertEqual(viewer_blocked_resp.status_code, 403)
+
+            mfa_only_resp = client.post(
+                "/invoices/inv-bank-auth/settlement-bank-details",
+                headers={"x-api-key": "requester-key"},
+                json={
+                    "updated_by": "requester-key",
+                    "account_holder_name": "Client A Trading Ltd",
+                    "sort_code": "12-34-56",
+                    "account_number": "12345678",
+                    "expected_payee_name": "Client A Trading Ltd",
+                    "mfa_reauthenticated": True,
+                },
+            )
+            self.assertEqual(mfa_only_resp.status_code, 404)
+
+            supplied_approver_resp = client.post(
+                "/invoices/inv-bank-auth/settlement-bank-details",
+                headers={"x-api-key": "requester-key"},
+                json={
+                    "updated_by": "requester-key",
+                    "account_holder_name": "Client A Trading Ltd",
+                    "sort_code": "12-34-56",
+                    "account_number": "12345678",
+                    "expected_payee_name": "Client A Trading Ltd",
+                    "dual_control_approved_by": "ADMIN-SUPPLIED",
+                    "dual_control_approval_reference": "BANK-REF-1",
+                },
+            )
+            self.assertEqual(supplied_approver_resp.status_code, 404)
+
+            approval_resp = client.post(
+                "/invoices/inv-bank-auth/settlement-bank-details/approvals",
+                headers={"x-api-key": "approver-key"},
+                json={
+                    "approval_reference": "BANK-REF-1",
+                    "approval_method": "SERVER_SIDE_ADMIN_APPROVAL",
+                    "notes": "Approver verified the change off-request.",
+                },
+            )
+            self.assertEqual(approval_resp.status_code, 200)
+
+            self_approval_resp = client.post(
+                "/invoices/inv-bank-auth/settlement-bank-details",
+                headers={"x-api-key": "approver-key"},
+                json={
+                    "updated_by": "approver-key",
+                    "account_holder_name": "Client A Trading Ltd",
+                    "sort_code": "12-34-56",
+                    "account_number": "12345678",
+                    "expected_payee_name": "Client A Trading Ltd",
+                    "dual_control_approval_reference": "BANK-REF-1",
+                },
+            )
+            self.assertEqual(self_approval_resp.status_code, 403)
+
+            spoofed_name_resp = client.post(
+                "/invoices/inv-bank-auth/settlement-bank-details",
+                headers={"x-api-key": "requester-key"},
+                json={
+                    "updated_by": "requester-key",
+                    "account_holder_name": "Client A Trading Ltd",
+                    "sort_code": "12-34-56",
+                    "account_number": "12345678",
+                    "expected_payee_name": "Client A Trading Ltd",
+                    "dual_control_approved_by": "spoofed-name",
+                    "dual_control_approval_reference": "BANK-REF-1",
+                },
+            )
+            self.assertEqual(spoofed_name_resp.status_code, 403)
+
+            valid_resp = client.post(
+                "/invoices/inv-bank-auth/settlement-bank-details",
+                headers={"x-api-key": "requester-key"},
+                json={
+                    "updated_by": "requester-key",
+                    "account_holder_name": "Client A Trading Ltd",
+                    "sort_code": "12-34-56",
+                    "account_number": "12345678",
+                    "expected_payee_name": "Client A Trading Ltd",
+                    "dual_control_approval_reference": "BANK-REF-1",
+                },
+            )
+            self.assertEqual(valid_resp.status_code, 200)
+            self.assertEqual(valid_resp.json()["verification_method"], "ACCOUNT_HOLDER_NAME_CONSISTENCY_CHECK")
+            self.assertEqual(valid_resp.json()["cop_state"], "COP_EXACT_MATCH")
+
+            ledger_resp = client.get("/invoices/inv-bank-auth/compliance-ledger", headers={"x-api-key": "viewer-key"})
+            self.assertEqual(ledger_resp.status_code, 200)
+            events = ledger_resp.json()["entries"]
+            approval_event = next(item for item in events if item["event_type"] == "BANK_DETAIL_DUAL_CONTROL_APPROVED")
+            update_event = next(item for item in events if item["event_type"] == "BANK_DETAILS_UPDATED_PENDING_COP")
+            self.assertEqual(approval_event["details"]["approver_identity"], "approver-key")
+            self.assertEqual(update_event["details"]["requester_identity"], "requester-key")
+            self.assertEqual(update_event["details"]["approver_identity"], "approver-key")
+            self.assertEqual(update_event["details"]["approval_reference"], "BANK-REF-1")
+
+            cop_text = json.dumps(valid_resp.json())
+            self.assertNotIn("CONFIRMATION_OF_PAYEE", cop_text)
+
     def test_tenant_isolation_blocks_cross_client_access(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "tenant.db")
@@ -306,6 +460,21 @@ class TestApiSecurity(unittest.TestCase):
                 404,
             )
             self.assertEqual(client.get("/invoices/inv-tenant-b/debtor-ledger", headers={"x-api-key": "client-a-key"}).status_code, 404)
+            self.assertEqual(
+                client.post(
+                    "/invoices/inv-tenant-b/settlement-bank-details",
+                    headers={"x-api-key": "client-a-key"},
+                    json={
+                        "updated_by": "client-a-key",
+                        "account_holder_name": "Client B Trading Ltd",
+                        "sort_code": "12-34-56",
+                        "account_number": "12345678",
+                        "expected_payee_name": "Client B Trading Ltd",
+                        "dual_control_approval_reference": "BANK-CROSS-TENANT",
+                    },
+                ).status_code,
+                404,
+            )
             self.assertEqual(
                 client.post(
                     "/invoices/inv-tenant-b/resolution/payment-plans",
