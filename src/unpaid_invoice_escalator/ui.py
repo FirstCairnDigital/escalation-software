@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import html
+import json
+
 
 APP_STYLES = """
 :root {
@@ -711,6 +714,9 @@ def _icon_svg(icon: str) -> str:
         "operations": '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M14 4l6 6-9 9H5v-6l9-9z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"></path><path d="M13 5l6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path></svg>',
         "compliance": '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 3l7 3v5c0 5-3 8-7 10-4-2-7-5-7-10V6l7-3z" fill="none" stroke="currentColor" stroke-width="2"></path><path d="M9 12l2 2 4-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>',
         "reports": '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M5 19V5h14v14H5z" fill="none" stroke="currentColor" stroke-width="2"></path><path d="M8 15l3-3 2 2 3-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>',
+        "retention": '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M5 6h14v12H5z" fill="none" stroke="currentColor" stroke-width="2"></path><path d="M8 10h8M8 14h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path></svg>',
+        "handoffs": '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M4 12h9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"></path><path d="M11 8l4 4-4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path><rect x="15" y="6" width="5" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"></rect></svg>',
+        "portals": '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M4 19V8l8-4 8 4v11" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"></path><path d="M9 19v-6h6v6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>',
     }
     return icons[icon]
 
@@ -744,6 +750,9 @@ def _sidebar(active_nav: str) -> str:
         {_nav_link('/ui/operations', 'Operations', active_nav, 'operations', 'operations')}
         {_nav_link('/ui/compliance', 'Compliance', active_nav, 'compliance', 'compliance')}
         {_nav_link('/ui/reports', 'Reports', active_nav, 'reports', 'reports')}
+        {_nav_link('/ui/retention', 'Retention', active_nav, 'retention', 'retention')}
+        {_nav_link('/ui/handoffs', 'Handoffs', active_nav, 'handoffs', 'handoffs')}
+        {_nav_link('/ui/portals', 'Portal Ops', active_nav, 'portals', 'portals')}
       </nav>
       <div class="sidebar-footer">
         <strong>Operational focus</strong>
@@ -868,6 +877,9 @@ def render_dashboard_html() -> str:
             <a class="ghost-button" style="padding:11px 16px;" href="/ui/compliance">Review audit trail</a>
             <a class="ghost-button" style="padding:11px 16px;" href="/ui/cases">Open case board</a>
             <a class="ghost-button" style="padding:11px 16px;" href="/ui/disputes">Open disputes board</a>
+            <a class="ghost-button" style="padding:11px 16px;" href="/ui/retention">Open retention queue</a>
+            <a class="ghost-button" style="padding:11px 16px;" href="/ui/handoffs">Open handoff desk</a>
+            <a class="ghost-button" style="padding:11px 16px;" href="/ui/portals">Open portal operations</a>
           </div>
         </div>
       </section>
@@ -934,6 +946,8 @@ def render_dashboard_html() -> str:
       <div class="inline-actions">
         <a class="ghost-button" style="padding:11px 16px;" href="/ui/invoices/${encodeURIComponent(item.invoice_id)}">Open workspace</a>
         <a class="ghost-button" style="padding:11px 16px;" href="/ui/compliance?invoice=${encodeURIComponent(item.invoice_id)}">Review compliance</a>
+        <a class="ghost-button" style="padding:11px 16px;" href="/ui/handoffs?invoice=${encodeURIComponent(item.invoice_id)}">Review handoff</a>
+        <a class="ghost-button" style="padding:11px 16px;" href="/ui/retention?invoice=${encodeURIComponent(item.invoice_id)}">Check retention</a>
       </div>
     `;
   }
@@ -1927,6 +1941,7 @@ def render_reports_html() -> str:
     const policy = retention.policy || {};
     document.getElementById("report-retention").innerHTML = `
       <div class="kv-row"><label>Retention days</label><div>${fcdUi.escape(policy.retention_days || "")}</div></div>
+      <div class="kv-row"><label>Retention schedule</label><div>${fcdUi.escape(readiness.data_retention_cron_schedule || "Not configured")}</div></div>
       <div class="kv-row"><label>Disposal scope</label><div>${fcdUi.escape(policy.disposal_scope || "")}</div></div>
       <div class="kv-row"><label>Immutable records</label><div>${fcdUi.escape(String(policy.immutable_records_retained))}</div></div>
       <div class="kv-row"><label>Legal hold clearance</label><div>${fcdUi.escape(String(policy.requires_legal_hold_clearance))}</div></div>
@@ -1972,6 +1987,592 @@ def render_reports_html() -> str:
         content=content,
         page_script=script,
         search_placeholder="Search report data, statuses, and activity...",
+    )
+
+
+def render_retention_html() -> str:
+    content = """
+      <section class="cards-4" id="retention-metrics"></section>
+
+      <section class="split-layout">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Retention queue</h2>
+              <div class="panel-subtle">Portfolio view of eligible disposals, active legal holds, and near-threshold cases.</div>
+            </div>
+            <a class="ghost-button" style="padding:11px 16px;" href="/ui/reports">Open reports</a>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Case</th>
+                  <th>Workflow</th>
+                  <th>Retention</th>
+                  <th>Days</th>
+                </tr>
+              </thead>
+              <tbody id="retention-queue-table"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="spotlight">
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Retention detail</h2>
+                <div class="panel-subtle">Selected case storage posture, blockers, and disposal readiness.</div>
+              </div>
+            </div>
+            <div id="retention-detail" class="empty-state">Select a case to review retention posture.</div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Retention controls</h2>
+                <div class="panel-subtle">Apply or release legal holds and execute evidence-file disposal when eligible.</div>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label class="field">User<input id="retention-user" value="ADMIN-1" /></label>
+              <label class="field">Hold type<input id="retention-hold-type" value="LITIGATION_REVIEW" /></label>
+              <label class="field">Retention variant<input id="retention-variant" value="STANDARD_COMMERCIAL" /></label>
+              <label class="field">As of date<input id="retention-as-of-date" value="" placeholder="YYYY-MM-DD" /></label>
+              <label class="field" style="grid-column: 1 / -1;">Reason<textarea id="retention-reason">Retention review or legal hold reason.</textarea></label>
+              <label class="field" style="grid-column: 1 / -1;">Notes<textarea id="retention-notes">Operator notes for audit review.</textarea></label>
+            </div>
+            <div class="inline-actions" style="margin-top: 14px;">
+              <button id="retention-open-hold" type="button">Open legal hold</button>
+              <button id="retention-release-hold" class="secondary-button" type="button">Release legal hold</button>
+              <button id="retention-dispose" class="ghost-button" type="button">Execute disposal</button>
+            </div>
+            <div id="retention-action-result" class="status-line" style="margin-top: 12px;"></div>
+          </div>
+        </div>
+      </section>
+    """
+    script = """
+<script>
+  const retentionPageState = { queue: null, selectedId: null };
+
+  function renderRetentionMetrics(queue) {
+    const summary = queue.summary || {};
+    const items = queue.items || [];
+    const cards = [
+      ["Tracked cases", summary.total_cases || 0, "Retention portfolio size", "var(--primary)"],
+      ["Eligible", summary.eligible_for_disposal || 0, "Ready for evidence-file disposal review", "var(--green)"],
+      ["Legal holds", summary.legal_hold_open || 0, "Active hold restrictions", "var(--orange)"],
+      ["Upcoming", summary.upcoming_review_window || 0, "Near-threshold within review window", "var(--purple)"]
+    ];
+    document.getElementById("retention-metrics").innerHTML = cards.map(([label, value, hint, color]) =>
+      fcdUi.metricCard(label, value, hint, color, [value, value, value, value, value])
+    ).join("");
+    if (!items.length) {
+      document.getElementById("retention-detail").textContent = "No retention queue data available.";
+    }
+  }
+
+  function renderRetentionQueue(items) {
+    const query = (document.getElementById("global-search").value || "").trim().toLowerCase();
+    const filtered = items.filter((item) => {
+      if (!query) return true;
+      return [item.invoice_id, item.current_state, item.retention_state, item.retention_variant, ...(item.blockers || [])]
+        .join(" ")
+        .toLowerCase()
+        .includes(query);
+    });
+    const target = document.getElementById("retention-queue-table");
+    if (!filtered.length) {
+      target.innerHTML = '<tr><td colspan="4"><div class="empty-state">No retention cases matched the current filter.</div></td></tr>';
+      return filtered;
+    }
+    target.innerHTML = filtered.map((item) => `
+      <tr class="clickable-row ${item.invoice_id === retentionPageState.selectedId ? "selected-row" : ""}" data-retention-id="${fcdUi.escape(item.invoice_id)}">
+        <td><strong>${fcdUi.escape(item.invoice_id)}</strong></td>
+        <td><span class="pill ${fcdUi.stateTone(item.current_state)}">${fcdUi.escape(item.current_state)}</span></td>
+        <td>${fcdUi.escape(item.retention_state)}</td>
+        <td>${fcdUi.escape(String(item.days_until_disposal_eligibility ?? "n/a"))}</td>
+      </tr>
+    `).join("");
+    target.querySelectorAll("[data-retention-id]").forEach((row) => {
+      row.addEventListener("click", () => selectRetentionCase(row.getAttribute("data-retention-id")));
+    });
+    return filtered;
+  }
+
+  function renderRetentionDetail(invoice, review) {
+    const blockers = review.blockers || [];
+    document.getElementById("retention-detail").innerHTML = `
+      <div><strong>${fcdUi.escape(invoice.invoice_id)}</strong> <span class="pill ${fcdUi.stateTone(invoice.current_state)}">${fcdUi.escape(invoice.current_state)}</span></div>
+      <div class="kv-list" style="margin-top: 14px;">
+        <div class="kv-row"><label>Retention state</label><div>${fcdUi.escape(review.retention_state || "-")}</div></div>
+        <div class="kv-row"><label>Variant</label><div>${fcdUi.escape(review.retention_variant || "-")}</div></div>
+        <div class="kv-row"><label>Eligible</label><div>${fcdUi.escape(String(review.eligible_for_disposal || false))}</div></div>
+        <div class="kv-row"><label>Legal hold open</label><div>${fcdUi.escape(String(review.legal_hold_open || false))}</div></div>
+        <div class="kv-row"><label>Days to eligibility</label><div>${fcdUi.escape(String(review.days_until_disposal_eligibility ?? "n/a"))}</div></div>
+        <div class="kv-row"><label>Artifacts</label><div>${fcdUi.escape(String(review.artifacts_count || 0))}</div></div>
+      </div>
+      <div class="action-list" style="margin-top: 14px;">
+        <div class="action-item"><strong>Blockers</strong><span class="list-meta">${fcdUi.escape(blockers.join(" | ") || "Eligible for disposal review.")}</span></div>
+        <div class="action-item"><strong>Last activity</strong><span class="list-meta">${fcdUi.escape(review.last_activity_at || "None")}</span></div>
+      </div>
+      <div class="inline-actions" style="margin-top: 14px;">
+        <a class="ghost-button" style="padding:11px 16px;" href="/ui/invoices/${encodeURIComponent(invoice.invoice_id)}">Open workspace</a>
+        <a class="ghost-button" style="padding:11px 16px;" href="/ui/compliance?invoice=${encodeURIComponent(invoice.invoice_id)}">Open compliance</a>
+      </div>
+    `;
+  }
+
+  async function selectRetentionCase(invoiceId) {
+    retentionPageState.selectedId = invoiceId;
+    fcdUi.updateQueryParam("invoice", invoiceId);
+    const [invoice, review] = await Promise.all([
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}`),
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/data-retention-review`)
+    ]);
+    renderRetentionQueue(retentionPageState.queue?.items || []);
+    renderRetentionDetail(invoice, review);
+  }
+
+  async function runRetentionAction(kind) {
+    const invoiceId = retentionPageState.selectedId;
+    if (!invoiceId) return;
+    const asOfDate = document.getElementById("retention-as-of-date").value.trim();
+    const bodyMap = {
+      open: {
+        held_by: document.getElementById("retention-user").value,
+        reason: document.getElementById("retention-reason").value,
+        hold_type: document.getElementById("retention-hold-type").value,
+        retention_variant: document.getElementById("retention-variant").value,
+        notes: document.getElementById("retention-notes").value
+      },
+      release: {
+        released_by: document.getElementById("retention-user").value,
+        reason: document.getElementById("retention-reason").value,
+        notes: document.getElementById("retention-notes").value
+      },
+      dispose: {
+        approved_by: document.getElementById("retention-user").value,
+        reason: document.getElementById("retention-reason").value,
+        as_of_date: asOfDate || null
+      }
+    };
+    const pathMap = {
+      open: `/invoices/${encodeURIComponent(invoiceId)}/data-retention-legal-holds/open`,
+      release: `/invoices/${encodeURIComponent(invoiceId)}/data-retention-legal-holds/release`,
+      dispose: `/invoices/${encodeURIComponent(invoiceId)}/data-retention-disposals`
+    };
+    document.getElementById("retention-action-result").textContent = "Running retention action...";
+    try {
+      const result = await fcdUi.request(pathMap[kind], "POST", bodyMap[kind]);
+      document.getElementById("retention-action-result").textContent = JSON.stringify(result);
+      await loadRetentionPage(invoiceId);
+    } catch (error) {
+      document.getElementById("retention-action-result").textContent = error.message;
+    }
+  }
+
+  async function loadRetentionPage(preferredInvoiceId) {
+    const queue = await fcdUi.request("/data-retention-queue");
+    retentionPageState.queue = queue;
+    renderRetentionMetrics(queue);
+    const filtered = renderRetentionQueue(queue.items || []);
+    const selected = preferredInvoiceId || fcdUi.queryParam("invoice") || filtered[0]?.invoice_id || queue.items?.[0]?.invoice_id || null;
+    if (selected) {
+      await selectRetentionCase(selected);
+    }
+  }
+
+  document.getElementById("global-search").addEventListener("input", () => loadRetentionPage(retentionPageState.selectedId));
+  document.getElementById("retention-open-hold").addEventListener("click", () => runRetentionAction("open"));
+  document.getElementById("retention-release-hold").addEventListener("click", () => runRetentionAction("release"));
+  document.getElementById("retention-dispose").addEventListener("click", () => runRetentionAction("dispose"));
+  window.addEventListener("load", () => loadRetentionPage());
+</script>
+"""
+    return _render_shell(
+        title="Retention",
+        subtitle="Dedicated queue and controls for retention review, legal holds, and controlled disposal workflows.",
+        active_nav="retention",
+        content=content,
+        page_script=script,
+        search_placeholder="Search retention states, cases, and blockers...",
+    )
+
+
+def render_handoffs_html() -> str:
+    content = """
+      <section class="cards-4" id="handoff-metrics"></section>
+
+      <section class="split-layout">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Handoff queue</h2>
+              <div class="panel-subtle">Cases approaching or requiring client handoff for creditor decision and export readiness.</div>
+            </div>
+            <a class="ghost-button" style="padding:11px 16px;" href="/ui/compliance">Open compliance</a>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Case</th>
+                  <th>Status</th>
+                  <th>Balance</th>
+                  <th>Next step</th>
+                </tr>
+              </thead>
+              <tbody id="handoff-queue-table"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="spotlight">
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Handoff readiness</h2>
+                <div class="panel-subtle">Court destination, required documents, and governance posture for the selected case.</div>
+              </div>
+            </div>
+            <div id="handoff-readiness-detail" class="empty-state">Select a case to review handoff readiness.</div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Review controls</h2>
+                <div class="panel-subtle">Record review decisions and move claim-ready cases toward evidence export.</div>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label class="field">Reviewed by<input id="handoff-reviewed-by" value="USER-1" /></label>
+              <label class="field">Ready to export
+                <select id="handoff-ready-flag">
+                  <option value="true">true</option>
+                  <option value="false">false</option>
+                </select>
+              </label>
+              <label class="field" style="grid-column: 1 / -1;">Notes<textarea id="handoff-review-notes">Evidence pack ready for client decision.</textarea></label>
+            </div>
+            <div class="inline-actions" style="margin-top: 14px;">
+              <button id="handoff-review-submit" type="button">Record handoff review</button>
+            </div>
+            <div id="handoff-review-result" class="status-line" style="margin-top: 12px;"></div>
+          </div>
+        </div>
+      </section>
+    """
+    script = """
+<script>
+  const handoffPageState = { dashboard: null, selectedId: null };
+
+  function renderHandoffMetrics(payload) {
+    const metrics = payload.metrics || {};
+    const cases = payload.cases || [];
+    const cards = [
+      ["Active cases", metrics.active_cases || 0, "Tracked cases in workflow", "var(--primary)"],
+      ["Handoff ready", metrics.handoff_ready || 0, "Currently ready for client review", "var(--green)"],
+      ["Paused or blocked", metrics.blocked_or_paused || 0, "Restrictions impacting progression", "var(--orange)"],
+      ["Queue candidates", cases.length, "Cases visible in handoff review", "var(--purple)"]
+    ];
+    document.getElementById("handoff-metrics").innerHTML = cards.map(([label, value, hint, color]) =>
+      fcdUi.metricCard(label, value, hint, color, [value, value, value, value, value])
+    ).join("");
+  }
+
+  function renderHandoffQueue(cases) {
+    const query = (document.getElementById("global-search").value || "").trim().toLowerCase();
+    const filtered = cases.filter((item) => {
+      if (!query) return true;
+      return [item.invoice_id, item.current_state, item.next_step, item.jurisdiction].join(" ").toLowerCase().includes(query);
+    });
+    const ranked = filtered.slice().sort((left, right) => {
+      const leftPriority = left.current_state === "CLIENT_HANDOFF" ? 0 : 1;
+      const rightPriority = right.current_state === "CLIENT_HANDOFF" ? 0 : 1;
+      return leftPriority - rightPriority || left.invoice_id.localeCompare(right.invoice_id);
+    });
+    const target = document.getElementById("handoff-queue-table");
+    if (!ranked.length) {
+      target.innerHTML = '<tr><td colspan="4"><div class="empty-state">No handoff candidates matched the current filter.</div></td></tr>';
+      return ranked;
+    }
+    target.innerHTML = ranked.map((item) => `
+      <tr class="clickable-row ${item.invoice_id === handoffPageState.selectedId ? "selected-row" : ""}" data-handoff-id="${fcdUi.escape(item.invoice_id)}">
+        <td><strong>${fcdUi.escape(item.invoice_id)}</strong></td>
+        <td><span class="pill ${fcdUi.stateTone(item.current_state)}">${fcdUi.escape(item.current_state)}</span></td>
+        <td>${fcdUi.escape(item.currency)} ${fcdUi.escape(item.outstanding_balance_gbp)}</td>
+        <td>${fcdUi.escape(item.next_step)}</td>
+      </tr>
+    `).join("");
+    target.querySelectorAll("[data-handoff-id]").forEach((row) => {
+      row.addEventListener("click", () => selectHandoffCase(row.getAttribute("data-handoff-id")));
+    });
+    return ranked;
+  }
+
+  function renderHandoffReadiness(detail, summary, governance) {
+    const evidence = summary.evidence_inventory || {};
+    document.getElementById("handoff-readiness-detail").innerHTML = `
+      <div><strong>${fcdUi.escape(detail.invoice_id)}</strong> <span class="pill ${fcdUi.stateTone(detail.current_state)}">${fcdUi.escape(detail.current_state)}</span></div>
+      <div class="kv-list" style="margin-top: 14px;">
+        <div class="kv-row"><label>Eligible</label><div>${fcdUi.escape(String(summary.eligible_for_handoff || false))}</div></div>
+        <div class="kv-row"><label>Destination</label><div>${fcdUi.escape(summary.destination_label || "-")}</div></div>
+        <div class="kv-row"><label>Official court fee</label><div>${fcdUi.escape(summary.official_court_fee_gbp || "n/a")}</div></div>
+        <div class="kv-row"><label>Rule pack</label><div>${fcdUi.escape(summary.rule_pack_version || "-")}</div></div>
+      </div>
+      <div class="action-list" style="margin-top: 14px;">
+        <div class="action-item"><strong>Required documents</strong><span class="list-meta">${fcdUi.escape((summary.required_documents || []).join(" | ") || "None")}</span></div>
+        <div class="action-item"><strong>Evidence posture</strong><span class="list-meta">${fcdUi.escape(`contracts ${evidence.contract_artifacts || 0} | proof ${evidence.proof_artifacts || 0} | notices ${evidence.pre_action_notices || 0}`)}</span></div>
+        <div class="action-item"><strong>Governance</strong><span class="list-meta">${fcdUi.escape(governance.next_operator_action || "Review current case signals.")}</span></div>
+        <div class="action-item"><strong>Fee notice</strong><span class="list-meta">${fcdUi.escape(summary.external_fee_notice || "")}</span></div>
+      </div>
+      <div class="inline-actions" style="margin-top: 14px;">
+        <a class="ghost-button" style="padding:11px 16px;" href="/ui/invoices/${encodeURIComponent(detail.invoice_id)}">Open workspace</a>
+        <a class="ghost-button" style="padding:11px 16px;" href="/ui/compliance?invoice=${encodeURIComponent(detail.invoice_id)}">Open compliance</a>
+        <a class="ghost-button" style="padding:11px 16px;" href="/ui/retention?invoice=${encodeURIComponent(detail.invoice_id)}">Open retention</a>
+      </div>
+    `;
+  }
+
+  async function selectHandoffCase(invoiceId) {
+    handoffPageState.selectedId = invoiceId;
+    fcdUi.updateQueryParam("invoice", invoiceId);
+    const [detail, summary, governance] = await Promise.all([
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}`),
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/client-handoff`),
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/governance-summary`)
+    ]);
+    renderHandoffQueue(handoffPageState.dashboard?.cases || []);
+    renderHandoffReadiness(detail, summary, governance);
+  }
+
+  async function submitHandoffReview() {
+    const invoiceId = handoffPageState.selectedId;
+    if (!invoiceId) return;
+    document.getElementById("handoff-review-result").textContent = "Recording handoff review...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/client-handoff/review`, "POST", {
+        reviewed_by: document.getElementById("handoff-reviewed-by").value,
+        ready_to_export: document.getElementById("handoff-ready-flag").value === "true",
+        notes: document.getElementById("handoff-review-notes").value
+      });
+      document.getElementById("handoff-review-result").textContent = `${result.invoice_id} reviewed by ${result.reviewed_by}`;
+      await loadHandoffsPage(invoiceId);
+    } catch (error) {
+      document.getElementById("handoff-review-result").textContent = error.message;
+    }
+  }
+
+  async function loadHandoffsPage(preferredInvoiceId) {
+    handoffPageState.dashboard = await fcdUi.request("/dashboard");
+    renderHandoffMetrics(handoffPageState.dashboard);
+    const ranked = renderHandoffQueue(handoffPageState.dashboard.cases || []);
+    const selected = preferredInvoiceId || fcdUi.queryParam("invoice") || ranked[0]?.invoice_id || null;
+    if (selected) {
+      await selectHandoffCase(selected);
+    }
+  }
+
+  document.getElementById("global-search").addEventListener("input", () => loadHandoffsPage(handoffPageState.selectedId));
+  document.getElementById("handoff-review-submit").addEventListener("click", submitHandoffReview);
+  window.addEventListener("load", () => loadHandoffsPage());
+</script>
+"""
+    return _render_shell(
+        title="Handoffs",
+        subtitle="Dedicated client handoff desk for reviewing evidence readiness, fee posture, and creditor decision gates.",
+        active_nav="handoffs",
+        content=content,
+        page_script=script,
+        search_placeholder="Search handoff cases, statuses, and destinations...",
+    )
+
+
+def render_portals_html() -> str:
+    content = """
+      <section class="cards-4" id="portal-metrics"></section>
+
+      <section class="split-layout">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Portal operations queue</h2>
+              <div class="panel-subtle">Register debtor verification and review neutral portal activity without mixing it into compliance detail.</div>
+            </div>
+            <a class="ghost-button" style="padding:11px 16px;" href="/ui/debtors">Open debtors</a>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Case</th>
+                  <th>Status</th>
+                  <th>Balance</th>
+                  <th>Next step</th>
+                </tr>
+              </thead>
+              <tbody id="portal-queue-table"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="spotlight">
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Portal detail</h2>
+                <div class="panel-subtle">Registration state, recent activity, and settlement destination visibility.</div>
+              </div>
+            </div>
+            <div id="portal-detail" class="empty-state">Select a case to review portal operations.</div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>Registration controls</h2>
+                <div class="panel-subtle">Register or refresh portal verification for a selected case.</div>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label class="field">Creditor name<input id="portal-creditor-name" value="First Cairn Digital Client" /></label>
+              <label class="field">Invoice reference<input id="portal-invoice-reference" value="" /></label>
+            </div>
+            <div class="inline-actions" style="margin-top: 14px;">
+              <button id="portal-register" type="button">Register portal case</button>
+            </div>
+            <div id="portal-register-result" class="status-line" style="margin-top: 12px;"></div>
+          </div>
+        </div>
+      </section>
+    """
+    script = """
+<script>
+  const portalPageState = { dashboard: null, selectedId: null, lastRegistration: null };
+
+  function renderPortalMetrics(payload) {
+    const metrics = payload.metrics || {};
+    const cases = payload.cases || [];
+    const cards = [
+      ["Active cases", metrics.active_cases || 0, "Tracked cases with portal potential", "var(--primary)"],
+      ["Overdue", metrics.overdue || 0, "Past-due queue for outreach", "var(--orange)"],
+      ["Blocked or paused", metrics.blocked_or_paused || 0, "Restrictions carried into portal posture", "var(--purple)"],
+      ["Visible cases", cases.length, "Cases shown in portal ops", "var(--green)"]
+    ];
+    document.getElementById("portal-metrics").innerHTML = cards.map(([label, value, hint, color]) =>
+      fcdUi.metricCard(label, value, hint, color, [value, value, value, value, value])
+    ).join("");
+  }
+
+  function renderPortalQueue(cases) {
+    const query = (document.getElementById("global-search").value || "").trim().toLowerCase();
+    const filtered = cases.filter((item) => {
+      if (!query) return true;
+      return [item.invoice_id, item.current_state, item.next_step, item.debtor_type].join(" ").toLowerCase().includes(query);
+    });
+    const target = document.getElementById("portal-queue-table");
+    if (!filtered.length) {
+      target.innerHTML = '<tr><td colspan="4"><div class="empty-state">No portal cases matched the current filter.</div></td></tr>';
+      return filtered;
+    }
+    target.innerHTML = filtered.map((item) => `
+      <tr class="clickable-row ${item.invoice_id === portalPageState.selectedId ? "selected-row" : ""}" data-portal-id="${fcdUi.escape(item.invoice_id)}">
+        <td><strong>${fcdUi.escape(item.invoice_id)}</strong></td>
+        <td><span class="pill ${fcdUi.stateTone(item.current_state)}">${fcdUi.escape(item.current_state)}</span></td>
+        <td>${fcdUi.escape(item.currency)} ${fcdUi.escape(item.outstanding_balance_gbp)}</td>
+        <td>${fcdUi.escape(item.next_step)}</td>
+      </tr>
+    `).join("");
+    target.querySelectorAll("[data-portal-id]").forEach((row) => {
+      row.addEventListener("click", () => selectPortalCase(row.getAttribute("data-portal-id")));
+    });
+    return filtered;
+  }
+
+  function renderPortalDetail(detail, summary) {
+    const registration = portalPageState.lastRegistration;
+    const currentRegistration = registration && registration.invoice_id === detail.invoice_id ? registration : null;
+    const verifyLink = currentRegistration
+      ? `/verify?case=${encodeURIComponent(currentRegistration.case_id)}&code=${encodeURIComponent(currentRegistration.verification_code)}`
+      : null;
+    const paymentLink = currentRegistration
+      ? `/portal/payment-link?case=${encodeURIComponent(currentRegistration.case_id)}&code=${encodeURIComponent(currentRegistration.verification_code)}`
+      : null;
+    document.getElementById("portal-detail").innerHTML = `
+      <div><strong>${fcdUi.escape(detail.invoice_id)}</strong> <span class="pill ${fcdUi.stateTone(detail.current_state)}">${fcdUi.escape(detail.current_state)}</span></div>
+      <div class="kv-list" style="margin-top: 14px;">
+        <div class="kv-row"><label>Registered</label><div>${fcdUi.escape(String(summary.registered || false))}</div></div>
+        <div class="kv-row"><label>Portal case ID</label><div>${fcdUi.escape(summary.case_id || "-")}</div></div>
+        <div class="kv-row"><label>Settlement destination</label><div>${fcdUi.escape(String(summary.settlement_destination_available || false))}</div></div>
+        <div class="kv-row"><label>Bank verification</label><div>${fcdUi.escape(summary.bank_verification_state || "Not configured")}</div></div>
+      </div>
+      <div class="action-list" style="margin-top: 14px;">
+        <div class="action-item"><strong>Recent activity</strong><span class="list-meta">${fcdUi.escape((summary.recent_activity || []).map((item) => item.event_type).join(" | ") || "None")}</span></div>
+        <div class="action-item"><strong>Current state</strong><span class="list-meta">${fcdUi.escape(summary.current_state || detail.current_state)}</span></div>
+        <div class="action-item"><strong>Verification links</strong><span class="list-meta">${fcdUi.escape(verifyLink ? "Fresh registration available below." : "Register a portal case in this session to generate links.")}</span></div>
+      </div>
+      <div class="inline-actions" style="margin-top: 14px;">
+        <a class="ghost-button" style="padding:11px 16px;" href="/ui/invoices/${encodeURIComponent(detail.invoice_id)}">Open workspace</a>
+        <a class="ghost-button" style="padding:11px 16px;" href="/ui/compliance?invoice=${encodeURIComponent(detail.invoice_id)}">Open compliance</a>
+        ${verifyLink ? `<a class="ghost-button" style="padding:11px 16px;" href="${verifyLink}">Open verify page</a>` : ""}
+        ${paymentLink ? `<a class="ghost-button" style="padding:11px 16px;" href="${paymentLink}">Open payment link</a>` : ""}
+      </div>
+    `;
+  }
+
+  async function selectPortalCase(invoiceId) {
+    portalPageState.selectedId = invoiceId;
+    fcdUi.updateQueryParam("invoice", invoiceId);
+    const [detail, summary] = await Promise.all([
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}`),
+      fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/debtor-portal-summary`)
+    ]);
+    document.getElementById("portal-invoice-reference").value = detail.invoice_id;
+    renderPortalQueue(portalPageState.dashboard?.cases || []);
+    renderPortalDetail(detail, summary);
+  }
+
+  async function registerPortalCase() {
+    const invoiceId = portalPageState.selectedId;
+    if (!invoiceId) return;
+    document.getElementById("portal-register-result").textContent = "Registering portal case...";
+    try {
+      const result = await fcdUi.request(`/invoices/${encodeURIComponent(invoiceId)}/debtor-verification/register`, "POST", {
+        creditor_name: document.getElementById("portal-creditor-name").value,
+        invoice_reference: document.getElementById("portal-invoice-reference").value || null
+      });
+      portalPageState.lastRegistration = result;
+      document.getElementById("portal-register-result").textContent = `Case ${result.case_id} registered with verification code ${result.verification_code}.`;
+      await selectPortalCase(invoiceId);
+    } catch (error) {
+      document.getElementById("portal-register-result").textContent = error.message;
+    }
+  }
+
+  async function loadPortalsPage(preferredInvoiceId) {
+    portalPageState.dashboard = await fcdUi.request("/dashboard");
+    renderPortalMetrics(portalPageState.dashboard);
+    const filtered = renderPortalQueue(portalPageState.dashboard.cases || []);
+    const selected = preferredInvoiceId || fcdUi.queryParam("invoice") || filtered[0]?.invoice_id || null;
+    if (selected) {
+      await selectPortalCase(selected);
+    }
+  }
+
+  document.getElementById("global-search").addEventListener("input", () => loadPortalsPage(portalPageState.selectedId));
+  document.getElementById("portal-register").addEventListener("click", registerPortalCase);
+  window.addEventListener("load", () => loadPortalsPage());
+</script>
+"""
+    return _render_shell(
+        title="Portal Operations",
+        subtitle="Dedicated workspace for debtor verification registration, neutral portal access, and activity review.",
+        active_nav="portals",
+        content=content,
+        page_script=script,
+        search_placeholder="Search portal cases, statuses, and next steps...",
     )
 
 
@@ -2023,6 +2624,9 @@ def render_operations_html() -> str:
           <div class="action-grid">
             <a class="card" href="/ui/cases"><strong>Review case board</strong><div class="metric-hint">Triage live cases and pick the next move.</div></a>
             <a class="card" href="/ui/compliance"><strong>Review compliance</strong><div class="metric-hint">Audit trail, rule state, and restrictions.</div></a>
+            <a class="card" href="/ui/retention"><strong>Run retention queue</strong><div class="metric-hint">Open legal hold, disposal, and retention review controls.</div></a>
+            <a class="card" href="/ui/handoffs"><strong>Review client handoffs</strong><div class="metric-hint">Check evidence readiness and sign off claim packs.</div></a>
+            <a class="card" href="/ui/portals"><strong>Manage portal access</strong><div class="metric-hint">Register debtor verification and share neutral resolution links.</div></a>
             <a class="card" id="bundle-link" href="#"><strong>Download evidence bundle</strong><div class="metric-hint">Generates the latest PDF bundle for a case.</div></a>
             <a class="card" href="/dashboard"><strong>Refresh engine data</strong><div class="metric-hint">Raw dashboard data feed for integrations.</div></a>
           </div>
@@ -3353,6 +3957,8 @@ def render_compliance_html() -> str:
 
 
 def render_invoice_workspace_html(invoice_id: str) -> str:
+    safe_invoice_id = html.escape(invoice_id, quote=True)
+    js_invoice_id = json.dumps(invoice_id).replace("</", "<\\/")
     content = f"""
       <section class="cards-4" id="workspace-metrics"></section>
 
@@ -3362,7 +3968,7 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
             <div class="panel-header">
               <div>
                 <h2>Workspace summary</h2>
-                <div class="panel-subtle">Focused case workspace for invoice {invoice_id} with Outstanding Balance, status, and audit context.</div>
+                <div class="panel-subtle">Focused case workspace for invoice {safe_invoice_id} with Outstanding Balance, status, and audit context.</div>
               </div>
             </div>
             <div id="workspace-summary" class="empty-state">Loading case summary...</div>
@@ -3375,9 +3981,9 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
               </div>
             </div>
             <div class="inline-actions">
-              <a class="ghost-button" style="padding:11px 16px;" href="/ui/cases?invoice={invoice_id}">Back to cases</a>
-              <a class="ghost-button" style="padding:11px 16px;" href="/ui/compliance?invoice={invoice_id}">Compliance view</a>
-              <a class="ghost-button" style="padding:11px 16px;" href="/invoices/{invoice_id}/evidence-bundle?output_filename={invoice_id}_bundle.pdf">Download bundle</a>
+              <a class="ghost-button" style="padding:11px 16px;" href="/ui/cases?invoice={safe_invoice_id}">Back to cases</a>
+              <a class="ghost-button" style="padding:11px 16px;" href="/ui/compliance?invoice={safe_invoice_id}">Compliance view</a>
+              <a class="ghost-button" style="padding:11px 16px;" href="/invoices/{safe_invoice_id}/evidence-bundle?output_filename={safe_invoice_id}_bundle.pdf">Download bundle</a>
             </div>
           </div>
         </div>
@@ -3418,9 +4024,9 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
           </div>
           <div class="form-grid">
             <label class="field">Payment plan<select id="workspace-plan-id"></select></label>
-            <label class="field">Promise filename<input id="workspace-plan-filename" value="{invoice_id}_promise_to_pay.pdf" /></label>
+            <label class="field">Promise filename<input id="workspace-plan-filename" value="{safe_invoice_id}_promise_to_pay.pdf" /></label>
             <label class="field">Settlement offer<select id="workspace-offer-id"></select></label>
-            <label class="field">Settlement filename<input id="workspace-offer-filename" value="{invoice_id}_settlement_agreement.pdf" /></label>
+            <label class="field">Settlement filename<input id="workspace-offer-filename" value="{safe_invoice_id}_settlement_agreement.pdf" /></label>
           </div>
           <div class="inline-actions" style="margin-top: 14px;">
             <button id="generate-promise-artifact" type="button">Generate promise to pay</button>
@@ -3491,8 +4097,8 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
                 <option value="pdf">PDF</option>
               </select>
             </label>
-            <label class="field">Manifest filename<input id="workspace-manifest-filename" value="{invoice_id}_manifest.json" /></label>
-            <label class="field">Verify filename<input id="workspace-manifest-verify-filename" value="{invoice_id}_manifest.json" /></label>
+            <label class="field">Manifest filename<input id="workspace-manifest-filename" value="{safe_invoice_id}_manifest.json" /></label>
+            <label class="field">Verify filename<input id="workspace-manifest-verify-filename" value="{safe_invoice_id}_manifest.json" /></label>
           </div>
           <div class="inline-actions" style="margin-top: 14px;">
             <button id="generate-manifest" type="button">Generate manifest</button>
@@ -3539,7 +4145,7 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
     """
     script = """
 <script>
-  const workspaceInvoiceId = "__INVOICE_ID__";
+  const workspaceInvoiceId = __INVOICE_ID_JSON__;
   const workspaceState = { plans: [], offers: [], reports: [], artifacts: [] };
 
   function displayWorkflowLabel(label) {
@@ -4067,9 +4673,9 @@ def render_invoice_workspace_html(invoice_id: str) -> str:
   document.getElementById("workspace-manifest-format").addEventListener("change", syncManifestFilename);
   window.addEventListener("load", loadWorkspace);
 </script>
-""".replace("__INVOICE_ID__", invoice_id)
+""".replace("__INVOICE_ID_JSON__", js_invoice_id)
     return _render_shell(
-        title=f"Invoice Workspace - {invoice_id}",
+        title=f"Invoice Workspace - {safe_invoice_id}",
         subtitle="A quieter, case-specific view so operators are not forced to work from one over-packed dashboard.",
         active_nav="cases",
         content=content,

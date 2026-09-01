@@ -1006,6 +1006,7 @@ def create_app(
     allowed_upload_extension_set = {token.lower() for token in effective_allowed_upload_extensions}
     effective_quarantine_dir = quarantine_dir or os.getenv("FCD_QUARANTINE_DIR", "data/quarantine")
     effective_data_retention_days = int(os.getenv("FCD_DATA_RETENTION_DAYS", "2190"))
+    effective_data_retention_cron_schedule = str(os.getenv("FCD_DATA_RETENTION_CRON_SCHEDULE", "") or "").strip()
     if effective_data_retention_days <= 0:
         raise ValueError("FCD_DATA_RETENTION_DAYS must be a positive integer.")
 
@@ -1159,6 +1160,16 @@ def create_app(
         f"Data retention days set to {effective_data_retention_days}.",
     )
     _append_check(
+        "data-retention-cron-schedule",
+        bool(effective_data_retention_cron_schedule),
+        "error" if effective_env == "production" else "warning",
+        (
+            f"Retention scheduler cron configured: {effective_data_retention_cron_schedule}."
+            if effective_data_retention_cron_schedule
+            else "Retention scheduler cron is not configured."
+        ),
+    )
+    _append_check(
         "manifest-key-id",
         bool(manifest_key_id.strip()),
         "error",
@@ -1281,6 +1292,7 @@ def create_app(
             "allowed_upload_content_types": list(effective_allowed_upload_content_types),
             "allowed_upload_extensions": list(effective_allowed_upload_extensions),
             "data_retention_days": effective_data_retention_days,
+            "data_retention_cron_schedule": effective_data_retention_cron_schedule,
             "quarantine_dir": str(quarantine_root),
             "checks": combined_checks,
             "errors": errors,
@@ -1330,6 +1342,13 @@ def create_app(
                 and check_map.get("allowed-upload-content-types", False)
                 and check_map.get("allowed-upload-extensions", False),
                 "detail": "Confirm upload size limits and request controls are active.",
+            },
+            {
+                "step": 5,
+                "title": "Validate retention automation schedule",
+                "completed": check_map.get("data-retention-days", False)
+                and check_map.get("data-retention-cron-schedule", False),
+                "detail": "Confirm retention thresholds and the scheduler cadence are configured.",
             },
         ]
         return {
@@ -4900,7 +4919,11 @@ def create_app(
             ReportedPaymentStatus.PAYMENT_NOT_VERIFIED,
         }:
             raise HTTPException(status_code=409, detail="Reported payment has already been decided.")
-        confirmed_amount = abs(payload.confirmed_amount_gbp if payload.confirmed_amount_gbp is not None else report.amount_gbp)
+        claimed_amount = abs(payload.confirmed_amount_gbp if payload.confirmed_amount_gbp is not None else report.amount_gbp)
+        outstanding_before = store.debtor_ledger_balance_for_invoice(invoice_id)
+        confirmed_amount = min(claimed_amount, outstanding_before)
+        if confirmed_amount <= Decimal("0.00"):
+            raise HTTPException(status_code=409, detail="No outstanding balance remains to confirm.")
         now = datetime.now(timezone.utc)
         ledger.append_event(
             invoice_id=invoice_id,
@@ -4910,6 +4933,7 @@ def create_app(
             data_payload={
                 "report_id": report_id,
                 "creditor_user_id": payload.creditor_user_id,
+                "claimed_amount_gbp": str(claimed_amount),
                 "confirmed_amount_gbp": str(confirmed_amount),
                 "notes": payload.notes,
             },
@@ -5039,6 +5063,7 @@ def create_app(
                 details={
                     "report_id": report_id,
                     "creditor_user_id": payload.creditor_user_id,
+                    "claimed_amount_gbp": str(claimed_amount),
                     "confirmed_amount_gbp": str(confirmed_amount),
                     "linked_debtor_entry_id": entry.entry_id,
                     "plan_id": report.plan_id,

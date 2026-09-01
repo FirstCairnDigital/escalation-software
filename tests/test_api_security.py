@@ -2,10 +2,12 @@ from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory, mkdtemp
 import unittest
+import json
 
 from fastapi.testclient import TestClient
 
 from unpaid_invoice_escalator.api import create_app
+from unpaid_invoice_escalator.ui import render_invoice_workspace_html
 
 
 class TestApiSecurity(unittest.TestCase):
@@ -272,7 +274,8 @@ class TestApiSecurity(unittest.TestCase):
                 self.assertEqual(runbook_resp.status_code, 200)
                 runbook_body = runbook_resp.json()
                 self.assertTrue(runbook_body["ready"])
-                self.assertEqual(len(runbook_body["steps"]), 4)
+                self.assertEqual(len(runbook_body["steps"]), 5)
+                self.assertTrue(any("retention" in json.dumps(step).lower() for step in runbook_body["steps"]))
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -295,6 +298,15 @@ class TestApiSecurity(unittest.TestCase):
                 self.assertEqual(portal_resp.status_code, 404)
                 payment_link_resp = client.get("/portal/payment-link?case=FCD-R-2026-000001&code=ABCDEFGH")
                 self.assertEqual(payment_link_resp.status_code, 404)
+
+    def test_invoice_workspace_escapes_hostile_invoice_id(self) -> None:
+        malicious_invoice_id = 'inv-"><script>alert(1)</script>'
+        html = render_invoice_workspace_html(malicious_invoice_id)
+        self.assertNotIn('</script><script>alert(1)</script>', html)
+        self.assertIn(
+            f'const workspaceInvoiceId = {json.dumps(malicious_invoice_id).replace("</", "<\\/")};',
+            html,
+        )
 
     def test_readiness_fails_with_invalid_upload_limit(self) -> None:
         tmp_dir = mkdtemp()

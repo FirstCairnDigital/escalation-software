@@ -1,7 +1,9 @@
 from datetime import date, timedelta
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from urllib.parse import quote
 
 from fastapi.testclient import TestClient
 
@@ -48,6 +50,7 @@ class TestApi(unittest.TestCase):
             self.assertIn("Environment checks", reports_page.text)
             self.assertIn("Policy controls", reports_page.text)
             self.assertIn("Retention queue", reports_page.text)
+            self.assertIn("Retention schedule", reports_page.text)
 
             create_resp = client.post(
                 "/invoices",
@@ -880,6 +883,11 @@ class TestApi(unittest.TestCase):
             self.assertEqual(paid_resp.json()["status"], "PAYMENT_VERIFICATION_PENDING")
             self.assertEqual(paid_resp.json()["outstanding_balance_gbp"], "1200.00")
             self.assertEqual(len(paid_resp.json()["cancelled_pending_communication_ids"]), 1)
+            ledger_events_before_confirm = client.get("/invoices/inv-api-portal/ledger-events")
+            self.assertEqual(ledger_events_before_confirm.status_code, 200)
+            event_types_before_confirm = {item["event_type"] for item in ledger_events_before_confirm.json()["events"]}
+            self.assertIn("DEBTOR_PAYMENT_REPORTED", event_types_before_confirm)
+            self.assertNotIn("PAYMENT_RECEIVED", event_types_before_confirm)
             debtor_ledger_resp = client.get("/invoices/inv-api-portal/debtor-ledger")
             self.assertEqual(debtor_ledger_resp.status_code, 200)
             self.assertEqual(debtor_ledger_resp.json()["balance_gbp"], "1200.00")
@@ -927,6 +935,61 @@ class TestApi(unittest.TestCase):
             self.assertIn("DEBTOR_PAYMENT_EVIDENCE_UPLOADED", events)
             self.assertIn("PAYMENT_EVIDENCE_REQUESTED", events)
             self.assertIn("PAYMENT_CONFIRMED_BY_CREDITOR", events)
+
+    def test_reported_payment_confirmation_caps_overreported_amount(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-overreported-payment.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-overreport",
+                    "currency": "GBP",
+                    "principal_amount": "100",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+            reg_resp = client.post(
+                "/invoices/inv-api-overreport/debtor-verification/register",
+                json={"creditor_name": "Creditor Ltd", "invoice_reference": "INV-OVER-1"},
+            )
+            self.assertEqual(reg_resp.status_code, 200)
+            case_id = reg_resp.json()["case_id"]
+            code = reg_resp.json()["verification_code"]
+            paid_resp = client.post(
+                "/portal/actions/confirm-paid",
+                json={
+                    "case": case_id,
+                    "code": code,
+                    "debtor_identifier": "debtor-overreport",
+                    "amount_gbp": "250",
+                    "payment_reference": "BANK-OVER",
+                    "payment_date": "2026-02-11",
+                    "details": "Reported amount exceeds balance.",
+                },
+            )
+            self.assertEqual(paid_resp.status_code, 200)
+            self.assertEqual(paid_resp.json()["status"], "PAYMENT_VERIFICATION_PENDING")
+            report_id = paid_resp.json()["report_id"]
+
+            confirm_resp = client.post(
+                f"/invoices/inv-api-overreport/reported-payments/{report_id}/confirm",
+                json={"creditor_user_id": "USER-1", "notes": "Matched to statement."},
+            )
+            self.assertEqual(confirm_resp.status_code, 200)
+            self.assertEqual(confirm_resp.json()["status"], "PAYMENT_CONFIRMED_BY_CREDITOR")
+            self.assertEqual(confirm_resp.json()["confirmed_amount_gbp"], "100.00")
+            self.assertEqual(confirm_resp.json()["outstanding_balance_gbp"], "0.00")
+            debtor_ledger_resp = client.get("/invoices/inv-api-overreport/debtor-ledger")
+            self.assertEqual(debtor_ledger_resp.status_code, 200)
+            self.assertEqual(debtor_ledger_resp.json()["balance_gbp"], "0.00")
 
     def test_escalation_blocked_while_reported_payment_awaits_creditor_verification(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -2488,7 +2551,50 @@ class TestApi(unittest.TestCase):
 
         invalid = validate_production_config({})
         self.assertFalse(invalid["valid"])
-        self.assertIn("DATABASE_URL", "\n".join(invalid["errors"]))
+        self.assertIn("FCD_MANIFEST_SIGNING_KEY", "\n".join(invalid["errors"]))
+
+    def test_validate_production_config_with_fcd_env_names(self) -> None:
+        valid = validate_production_config(
+            {
+                "FCD_APP_ENV": "production",
+                "FCD_MANIFEST_SIGNING_KEY": "A" * 32,
+                "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
+                "FCD_MANIFEST_VERIFY_KEYS": "fcd-kms-key-1:" + ("B" * 32),
+                "FCD_API_KEYS": "admin-key:admin,ops-key:operator,ro-key:viewer",
+                "FCD_RATE_LIMIT_PER_MINUTE": "120",
+                "FCD_AUTH_FAILURE_ALERT_THRESHOLD": "10",
+                "FCD_RATE_LIMIT_ALERT_THRESHOLD": "10",
+                "FCD_SERVER_ERROR_ALERT_THRESHOLD": "5",
+                "FCD_MAX_UPLOAD_BYTES": "5242880",
+                "FCD_ALLOWED_UPLOAD_CONTENT_TYPES": "application/pdf,text/plain",
+                "FCD_ALLOWED_UPLOAD_EXTENSIONS": ".pdf,.txt",
+                "FCD_QUARANTINE_DIR": "data/quarantine",
+                "FCD_DATA_RETENTION_DAYS": "2190",
+                "FCD_DATA_RETENTION_CRON_SCHEDULE": "0 2 * * *",
+            }
+        )
+        self.assertTrue(valid["valid"])
+        self.assertEqual(valid["manifest_key_id"], "fcd-kms-key-1")
+        self.assertEqual(valid["data_retention_cron_schedule"], "0 2 * * *")
+
+    def test_startup_report_exposes_retention_schedule(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-health-schedule.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            original_schedule = os.environ.get("FCD_DATA_RETENTION_CRON_SCHEDULE")
+            try:
+                os.environ["FCD_DATA_RETENTION_CRON_SCHEDULE"] = "0 2 * * *"
+                app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            finally:
+                if original_schedule is None:
+                    os.environ.pop("FCD_DATA_RETENTION_CRON_SCHEDULE", None)
+                else:
+                    os.environ["FCD_DATA_RETENTION_CRON_SCHEDULE"] = original_schedule
+            client = TestClient(app)
+            report = client.get("/deployment/startup-config-validation/report")
+            self.assertEqual(report.status_code, 200)
+            self.assertEqual(report.json()["data_retention_cron_schedule"], "0 2 * * *")
 
 
 if __name__ == "__main__":

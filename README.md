@@ -63,6 +63,7 @@ $env:FCD_ALLOWED_UPLOAD_CONTENT_TYPES="application/pdf,text/plain,image/png,imag
 $env:FCD_ALLOWED_UPLOAD_EXTENSIONS=".pdf,.txt,.png,.jpg,.jpeg"
 $env:FCD_QUARANTINE_DIR="data/quarantine"
 $env:FCD_DATA_RETENTION_DAYS="2190"
+$env:FCD_DATA_RETENTION_CRON_SCHEDULE="0 2 * * *"
 ```
 
 Notes:
@@ -75,6 +76,7 @@ Notes:
 - `FCD_ALLOWED_UPLOAD_EXTENSIONS` restricts evidence uploads by filename extension.
 - `FCD_QUARANTINE_DIR` stores rejected upload payloads and metadata for audit review.
 - `FCD_DATA_RETENTION_DAYS` sets minimum case age before controlled evidence-file disposal is permitted.
+- `FCD_DATA_RETENTION_CRON_SCHEDULE` declares the retention review cadence surfaced by startup validation and reporting.
 
 ### Web Interface
 - Open `http://127.0.0.1:8000/` for the overview dashboard.
@@ -92,6 +94,9 @@ Notes:
 ```powershell
 $env:PYTHONPATH="C:\Dev\projects\P26003-escalation-software\src"
 python -m unpaid_invoice_escalator.cli --invoice-id inv-1 --principal 1200 --issue-date 2026-01-01 --due-date 2026-01-31 --jurisdiction ENGLAND_WALES --debtor-type LIMITED --today 2026-02-15
+python -m unpaid_invoice_escalator.cli startup-config-report --db-path data\escalator.db
+python -m unpaid_invoice_escalator.cli retention-queue --db-path data\escalator.db
+python -m unpaid_invoice_escalator.cli company-status-check --db-path data\escalator.db --invoice-id inv-1 --checked-by USER-1 --company-status ACTIVE --source COMPANIES_HOUSE --evidence-summary "Register reviewed"
 ```
 
 ## Run workflow admin scripts
@@ -252,8 +257,9 @@ These limits and protocol timings are data-driven via JSON rule packs, not hard-
 ## Compliance and retention operations
 - The compliance workspace now exposes company-status checks, Breathing Space controls, insolvency review actions, and restricted-note summaries in the browser UI.
 - `GET /data-retention-queue` provides a portfolio view of eligible, legal-hold, and near-threshold retention cases for reports and ops scripts.
+- Startup validation and the reports UI now surface `FCD_DATA_RETENTION_CRON_SCHEDULE` so retention automation posture is visible before go-live.
 - [audit-retention-holds.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/audit-retention-holds.py) now calls the same retention-queue API logic used by the product, avoiding hard-coded retention thresholds in ops reporting.
-- [workflow-admin.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/workflow-admin.py) lets operators run compliance actions without standing up a separate HTTP server.
+- [workflow-admin.py](C:/Dev/projects/P26003-escalation-software/scripts/ops/workflow-admin.py) and [cli.py](C:/Dev/projects/P26003-escalation-software/src/unpaid_invoice_escalator/cli.py) let operators run compliance actions without standing up a separate HTTP server.
 
 ## Readiness & Deployment Validation
 - `GET /ready` returns:

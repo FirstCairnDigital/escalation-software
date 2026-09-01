@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import date
 from decimal import Decimal
+from typing import Sequence
 
 from unpaid_invoice_escalator.models import DebtorType, Invoice, InvoiceState, Jurisdiction
+from unpaid_invoice_escalator.ops_cli import ADMIN_COMMANDS, run_admin_cli
 from unpaid_invoice_escalator.services.escalation_runner import EscalationRunner
 from unpaid_invoice_escalator.services.jurisdiction_engine import JurisdictionFacts
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_legacy_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unpaid invoice escalation workflow runner.")
     parser.add_argument("--invoice-id", required=True)
     parser.add_argument("--currency", default="GBP")
@@ -51,9 +54,9 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    parser = _build_parser()
-    args = parser.parse_args()
+def _run_legacy_cli(argv: Sequence[str]) -> int:
+    parser = _build_legacy_parser()
+    args = parser.parse_args(list(argv))
 
     invoice = Invoice(
         invoice_id=args.invoice_id,
@@ -105,7 +108,23 @@ def main() -> None:
         "recorded_at": result.recorded_at.isoformat(),
     }
     print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _detect_admin_command(argv: Sequence[str]) -> str | None:
+    for token in argv:
+        if token.startswith("-"):
+            continue
+        return token if token in ADMIN_COMMANDS else None
+    return None
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if _detect_admin_command(effective_argv) is not None:
+        return run_admin_cli(effective_argv)
+    return _run_legacy_cli(effective_argv)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

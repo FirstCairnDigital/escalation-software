@@ -13,6 +13,8 @@ class TestFeePackLoader(unittest.TestCase):
         self.assertEqual(schedule.version, "v1.2-2026Q3")
         self.assertEqual(schedule.action_fees[ClientFeeAction.FORMAL_ESCALATION], Decimal("9.95"))
 
+        fee_ew_mid = loader.quote_court_fee(Jurisdiction.ENGLAND_WALES, Decimal("1250"), date(2026, 8, 15))
+        self.assertEqual(fee_ew_mid, Decimal("80"))
         fee_ew = loader.quote_court_fee(Jurisdiction.ENGLAND_WALES, Decimal("12000"), date(2026, 8, 15))
         self.assertEqual(fee_ew, Decimal("600.00"))
         fee_scotland = loader.quote_court_fee(Jurisdiction.SCOTLAND, Decimal("250"), date(2026, 8, 15))
