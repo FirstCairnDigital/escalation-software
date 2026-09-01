@@ -1,4 +1,7 @@
 from __future__ import annotations
+#
+# First Cairn Digital
+# P26003 settlement expiry enforcement
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -450,6 +453,9 @@ class ResolutionAndSettlementEngine:
         offer = self._store.settlement_offer_by_id(offer_id)
         if offer is None:
             raise ValueError("Settlement offer not found.")
+        now_date = datetime.now(timezone.utc).date()
+        if now_date > offer.expiry_date:
+            raise ValueError(f"Settlement offer expired on {offer.expiry_date.isoformat()} and cannot be accepted.")
         normalized_role = accepter_role.strip().upper()
         if normalized_role not in {"DEBTOR", "CREDITOR"}:
             raise ValueError("accepter_role must be DEBTOR or CREDITOR.")
@@ -517,6 +523,9 @@ class ResolutionAndSettlementEngine:
         existing_finalization = self._store.settlement_offer_finalization_by_offer_id(offer_id)
         if existing_finalization is not None:
             return existing_finalization
+        current_date = datetime.now(timezone.utc).date()
+        if current_date > offer.expiry_date:
+            raise ValueError(f"Settlement offer expired on {offer.expiry_date.isoformat()} and cannot be finalized.")
         acceptances = self._store.settlement_acceptances_for_offer(offer_id)
         accepted_roles = {item.accepter_role for item in acceptances}
         if accepted_roles != {"DEBTOR", "CREDITOR"}:
