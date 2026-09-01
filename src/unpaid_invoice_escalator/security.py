@@ -19,6 +19,8 @@ class RequestDecision:
     status_code: int | None = None
     detail: str | None = None
     identity: str = "anonymous"
+    role: str = "anonymous"
+    client_id: str = "DEFAULT_CLIENT"
 
 
 class ApiSecurityController:
@@ -27,6 +29,7 @@ class ApiSecurityController:
         *,
         enabled: bool,
         api_keys: dict[str, str],
+        api_clients: dict[str, str] | None = None,
         rate_limit_per_minute: int,
         auth_failure_alert_threshold: int = 10,
         rate_limit_alert_threshold: int = 10,
@@ -35,6 +38,7 @@ class ApiSecurityController:
     ) -> None:
         self.enabled = enabled
         self.api_keys = api_keys
+        self.api_clients = api_clients or {}
         self.rate_limit_per_minute = rate_limit_per_minute
         self.auth_failure_alert_threshold = auth_failure_alert_threshold
         self.rate_limit_alert_threshold = rate_limit_alert_threshold
@@ -76,9 +80,9 @@ class ApiSecurityController:
     ) -> RequestDecision:
         identity = api_key or client_host or "anonymous"
         if self.is_public_path(path):
-            return RequestDecision(allowed=True, identity=identity)
+            return RequestDecision(allowed=True, identity=identity, role="public")
         if not self.enabled:
-            return RequestDecision(allowed=True, identity=identity)
+            return RequestDecision(allowed=True, identity=identity, role="admin", client_id="DEFAULT_CLIENT")
 
         role = self.api_keys.get(api_key or "")
         if role is None:
@@ -97,8 +101,15 @@ class ApiSecurityController:
                 threshold=self.auth_failure_alert_threshold,
                 detail="Authentication failure threshold reached.",
             )
-            return RequestDecision(allowed=False, status_code=401, detail="Missing or invalid API key.", identity=identity)
+            return RequestDecision(
+                allowed=False,
+                status_code=401,
+                detail="Missing or invalid API key.",
+                identity=identity,
+                role="anonymous",
+            )
 
+        client_id = self.api_clients.get(api_key or "", "DEFAULT_CLIENT")
         required_role = self._required_role(method=method, path=path)
         if not self._role_allows(actual=role, required=required_role):
             self._forbidden_count += 1
@@ -115,8 +126,10 @@ class ApiSecurityController:
                 status_code=403,
                 detail=f"Insufficient role. Required: {required_role}.",
                 identity=identity,
+                role=role,
+                client_id=client_id,
             )
-        return RequestDecision(allowed=True, identity=identity)
+        return RequestDecision(allowed=True, identity=identity, role=role, client_id=client_id)
 
     def check_rate_limit(self, identity: str) -> RequestDecision:
         now = monotonic()

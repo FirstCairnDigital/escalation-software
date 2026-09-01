@@ -128,6 +128,7 @@ class Invoice:
     due_date: date
     jurisdiction: Jurisdiction
     debtor_type: DebtorType
+    client_id: str = "DEFAULT_CLIENT"
 
 
 @dataclass(frozen=True)

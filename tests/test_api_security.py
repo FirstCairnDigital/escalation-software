@@ -3,6 +3,7 @@ import shutil
 from tempfile import TemporaryDirectory, mkdtemp
 import unittest
 import json
+import sqlite3
 
 from fastapi.testclient import TestClient
 
@@ -227,6 +228,208 @@ class TestApiSecurity(unittest.TestCase):
                 },
             )
             self.assertEqual(absolute_bundle_resp.status_code, 400)
+
+    def test_tenant_isolation_blocks_cross_client_access(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "tenant.db")
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                bundles_dir=str(Path(tmp_dir) / "bundles"),
+                auth_enabled=True,
+                api_keys={
+                    "client-a-key": "operator",
+                    "client-b-key": "operator",
+                    "admin-key": "admin",
+                },
+                api_clients={
+                    "client-a-key": "CLIENT-A",
+                    "client-b-key": "CLIENT-B",
+                    "admin-key": "FCD-ADMIN",
+                },
+                rate_limit_per_minute=100,
+                manifest_signing_key="production-signing-key",
+                manifest_key_id="fcd-kms-key-1",
+            )
+            client = TestClient(app)
+
+            create_a = client.post(
+                "/invoices",
+                headers={"x-api-key": "client-a-key"},
+                json={
+                    "invoice_id": "inv-tenant-a",
+                    "currency": "GBP",
+                    "principal_amount": "250",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_a.status_code, 200)
+            create_b = client.post(
+                "/invoices",
+                headers={"x-api-key": "client-b-key"},
+                json={
+                    "invoice_id": "inv-tenant-b",
+                    "currency": "GBP",
+                    "principal_amount": "400",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_b.status_code, 200)
+
+            self.assertEqual(client.get("/invoices/inv-tenant-a", headers={"x-api-key": "client-a-key"}).status_code, 200)
+            self.assertEqual(client.get("/invoices/inv-tenant-b", headers={"x-api-key": "client-b-key"}).status_code, 200)
+            self.assertEqual(client.get("/invoices/inv-tenant-b", headers={"x-api-key": "client-a-key"}).status_code, 404)
+            self.assertEqual(
+                client.post(
+                    "/invoices/inv-tenant-b/communications",
+                    headers={"x-api-key": "client-a-key"},
+                    json={
+                        "channel": "EMAIL",
+                        "recipient": "b@example.com",
+                        "subject": "Cross-tenant attempt",
+                        "body_summary": "Should not be visible",
+                    },
+                ).status_code,
+                404,
+            )
+            self.assertEqual(
+                client.get(
+                    "/invoices/inv-tenant-b/evidence-bundle?output_filename=tenant.pdf",
+                    headers={"x-api-key": "client-a-key"},
+                ).status_code,
+                404,
+            )
+            self.assertEqual(client.get("/invoices/inv-tenant-b/debtor-ledger", headers={"x-api-key": "client-a-key"}).status_code, 404)
+            self.assertEqual(
+                client.post(
+                    "/invoices/inv-tenant-b/resolution/payment-plans",
+                    headers={"x-api-key": "client-a-key"},
+                    json={
+                        "proposed_by": "USER-A",
+                        "installment_amount_gbp": "50",
+                        "installment_count": 4,
+                        "first_due_date": "2026-02-15",
+                        "frequency_days": 30,
+                        "notes": "Cross tenant attempt",
+                    },
+                ).status_code,
+                404,
+            )
+            self.assertEqual(
+                client.post(
+                    "/invoices/inv-tenant-b/resolution/settlement-offers",
+                    headers={"x-api-key": "client-a-key"},
+                    json={
+                        "offered_by": "USER-A",
+                        "offered_amount_gbp": "300",
+                        "expiry_date": "2026-02-15",
+                        "notes": "Cross tenant attempt",
+                    },
+                ).status_code,
+                404,
+            )
+
+            client_fee_resp = client.post(
+                "/invoices/inv-tenant-a/client-fee-ledger/actions",
+                headers={"x-api-key": "client-a-key"},
+                json={
+                    "case_id": "CASE-A",
+                    "client_id": "CLIENT-B",
+                    "action_selected": "MONTHLY_SAAS_TIER",
+                    "accepted_by_user": "USER-A",
+                },
+            )
+            self.assertEqual(client_fee_resp.status_code, 200)
+            ledger_resp = client.get("/invoices/inv-tenant-a/client-fee-ledger", headers={"x-api-key": "client-a-key"})
+            self.assertEqual(ledger_resp.status_code, 200)
+            self.assertEqual(ledger_resp.json()["entries"][0]["client_id"], "CLIENT-A")
+
+            admin_invoice_a = client.get("/invoices/inv-tenant-a", headers={"x-api-key": "admin-key"})
+            admin_invoice_b = client.get("/invoices/inv-tenant-b", headers={"x-api-key": "admin-key"})
+            self.assertEqual(admin_invoice_a.status_code, 200)
+            self.assertEqual(admin_invoice_b.status_code, 200)
+            admin_list = client.get("/dashboard", headers={"x-api-key": "admin-key"})
+            self.assertEqual(admin_list.status_code, 200)
+            self.assertEqual(admin_list.json()["metrics"]["active_cases"], 2)
+
+    def test_existing_invoice_rows_are_migrated_with_default_client(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "legacy.db")
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE invoices (
+                        invoice_id TEXT PRIMARY KEY,
+                        currency TEXT NOT NULL,
+                        principal_amount TEXT NOT NULL,
+                        issue_date TEXT NOT NULL,
+                        due_date TEXT NOT NULL,
+                        jurisdiction TEXT NOT NULL,
+                        debtor_type TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE debtor_ledger_entries (
+                        entry_id TEXT PRIMARY KEY,
+                        invoice_id TEXT NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        entry_type TEXT NOT NULL,
+                        amount_gbp TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        recovery_cost_category TEXT,
+                        linked_client_fee_entry_id TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO invoices (
+                        invoice_id, currency, principal_amount, issue_date, due_date, jurisdiction, debtor_type, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("legacy-invoice", "GBP", "100.00", "2026-01-01", "2026-01-31", "ENGLAND_WALES", "LIMITED", "2026-01-01T00:00:00+00:00"),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO debtor_ledger_entries (
+                        entry_id, invoice_id, timestamp, entry_type, amount_gbp, description, recovery_cost_category, linked_client_fee_entry_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "legacy-invoice-principal",
+                        "legacy-invoice",
+                        "2026-01-01T00:00:00+00:00",
+                        "ORIGINAL_PRINCIPAL",
+                        "100.00",
+                        "Legacy principal",
+                        None,
+                        None,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                bundles_dir=str(Path(tmp_dir) / "bundles"),
+                auth_enabled=False,
+            )
+            client = TestClient(app)
+            resp = client.get("/invoices/legacy-invoice")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json()["invoice_id"], "legacy-invoice")
 
     def test_readiness_and_startup_validation_endpoint(self) -> None:
         tmp_dir = mkdtemp()

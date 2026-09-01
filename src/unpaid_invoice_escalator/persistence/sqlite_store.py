@@ -49,6 +49,7 @@ from unpaid_invoice_escalator.models import (
     SettlementOfferFinalization,
     SettlementOffer,
 )
+from unpaid_invoice_escalator.tenant_context import current_client_id, current_role
 
 
 class SQLiteStore:
@@ -60,6 +61,12 @@ class SQLiteStore:
     @property
     def db_path(self) -> str:
         return self._db_path
+
+    def _has_invoice_access(self, invoice_client_id: str) -> bool:
+        role = current_role.get()
+        if role == "admin":
+            return True
+        return invoice_client_id == current_client_id.get()
 
     @contextmanager
     def _connection(self) -> sqlite3.Connection:
@@ -82,10 +89,14 @@ class SQLiteStore:
                     due_date TEXT NOT NULL,
                     jurisdiction TEXT NOT NULL,
                     debtor_type TEXT NOT NULL,
+                    client_id TEXT NOT NULL DEFAULT 'DEFAULT_CLIENT',
                     created_at TEXT NOT NULL
                 )
                 """
             )
+            invoice_columns = {row["name"] for row in conn.execute("PRAGMA table_info(invoices)").fetchall()}
+            if "client_id" not in invoice_columns:
+                conn.execute("ALTER TABLE invoices ADD COLUMN client_id TEXT NOT NULL DEFAULT 'DEFAULT_CLIENT'")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS evidence_artifacts (
@@ -932,8 +943,8 @@ class SQLiteStore:
                 """
                 INSERT INTO invoices (
                     invoice_id, currency, principal_amount, issue_date, due_date,
-                    jurisdiction, debtor_type, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    jurisdiction, debtor_type, client_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     invoice.invoice_id,
@@ -943,6 +954,7 @@ class SQLiteStore:
                     invoice.due_date.isoformat(),
                     invoice.jurisdiction.value,
                     invoice.debtor_type.value,
+                    invoice.client_id,
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
@@ -970,13 +982,15 @@ class SQLiteStore:
         with self._connection() as conn:
             row = conn.execute(
                 """
-                SELECT invoice_id, currency, principal_amount, issue_date, due_date, jurisdiction, debtor_type
+                SELECT invoice_id, currency, principal_amount, issue_date, due_date, jurisdiction, debtor_type, client_id
                 FROM invoices
                 WHERE invoice_id = ?
                 """,
                 (invoice_id,),
             ).fetchone()
         if row is None:
+            return None
+        if not self._has_invoice_access(str(row["client_id"])):
             return None
         return Invoice(
             invoice_id=row["invoice_id"],
@@ -986,17 +1000,29 @@ class SQLiteStore:
             due_date=date.fromisoformat(row["due_date"]),
             jurisdiction=Jurisdiction(row["jurisdiction"]),
             debtor_type=DebtorType(row["debtor_type"]),
+            client_id=row["client_id"],
         )
 
     def list_invoices(self) -> tuple[dict[str, Any], ...]:
         with self._connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT invoice_id, currency, principal_amount, issue_date, due_date, jurisdiction, debtor_type, created_at
-                FROM invoices
-                ORDER BY created_at DESC, invoice_id ASC
-                """
-            ).fetchall()
+            if current_role.get() == "admin":
+                rows = conn.execute(
+                    """
+                    SELECT invoice_id, currency, principal_amount, issue_date, due_date, jurisdiction, debtor_type, client_id, created_at
+                    FROM invoices
+                    ORDER BY created_at DESC, invoice_id ASC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT invoice_id, currency, principal_amount, issue_date, due_date, jurisdiction, debtor_type, client_id, created_at
+                    FROM invoices
+                    WHERE client_id = ?
+                    ORDER BY created_at DESC, invoice_id ASC
+                    """,
+                    (current_client_id.get(),),
+                ).fetchall()
         return tuple(
             {
                 "invoice_id": row["invoice_id"],
@@ -1006,6 +1032,7 @@ class SQLiteStore:
                 "due_date": date.fromisoformat(row["due_date"]),
                 "jurisdiction": Jurisdiction(row["jurisdiction"]),
                 "debtor_type": DebtorType(row["debtor_type"]),
+                "client_id": row["client_id"],
                 "created_at": datetime.fromisoformat(row["created_at"]),
             }
             for row in rows

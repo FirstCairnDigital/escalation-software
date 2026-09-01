@@ -65,6 +65,7 @@ from unpaid_invoice_escalator.services.resolution_artifact_generator import Reso
 from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
 from unpaid_invoice_escalator.services.viability_proportionality_calculator import ViabilityProportionalityCalculator
 from unpaid_invoice_escalator.security import ApiSecurityController, ROLE_RANK
+from unpaid_invoice_escalator.tenant_context import current_client_id, current_role, reset_request_context, set_request_context
 from unpaid_invoice_escalator.ui import (
     render_cases_html,
     render_compliance_html,
@@ -591,6 +592,10 @@ def _parse_key_map(raw: str, *, field_name: str) -> dict[str, str]:
     return keys
 
 
+def _default_client_map(api_keys: dict[str, str]) -> dict[str, str]:
+    return {key: "DEFAULT_CLIENT" for key in api_keys}
+
+
 def _parse_csv_tokens(raw: str) -> tuple[str, ...]:
     return tuple(token.strip() for token in raw.split(",") if token.strip())
 
@@ -946,6 +951,7 @@ def create_app(
     api_keys: dict[str, str] | None = None,
     rate_limit_per_minute: int | None = None,
     manifest_verification_keys: dict[str, str] | None = None,
+    api_clients: dict[str, str] | None = None,
     auth_failure_alert_threshold: int | None = None,
     rate_limit_alert_threshold: int | None = None,
     server_error_alert_threshold: int | None = None,
@@ -966,6 +972,12 @@ def create_app(
     if configured_keys is None:
         raw_api_keys = os.getenv("FCD_API_KEYS", "")
         configured_keys = _parse_api_keys(raw_api_keys) if raw_api_keys.strip() else {}
+    configured_clients = api_clients
+    if configured_clients is None:
+        raw_api_clients = os.getenv("FCD_API_CLIENTS", "")
+        configured_clients = _parse_key_map(raw_api_clients, field_name="FCD_API_CLIENTS") if raw_api_clients.strip() else {}
+    if not configured_clients and configured_keys:
+        configured_clients = _default_client_map(configured_keys)
     if effective_auth_enabled and not configured_keys:
         raise ValueError("Authentication is enabled but no API keys were configured.")
 
@@ -1014,6 +1026,7 @@ def create_app(
     security = ApiSecurityController(
         enabled=effective_auth_enabled,
         api_keys=configured_keys,
+        api_clients=configured_clients,
         rate_limit_per_minute=effective_rate_limit,
         auth_failure_alert_threshold=effective_auth_failure_threshold,
         rate_limit_alert_threshold=effective_rate_limit_threshold,
@@ -2301,21 +2314,25 @@ def create_app(
                 JSONResponse(status_code=decision.status_code or 500, content={"detail": decision.detail})
             )
 
-        if not security.is_public_path(request.url.path):
-            limit_decision = security.check_rate_limit(decision.identity)
-            if not limit_decision.allowed:
-                security.record_response(limit_decision.status_code or 500)
-                return _harden_response(
-                    JSONResponse(
-                        status_code=limit_decision.status_code or 500,
-                        content={"detail": limit_decision.detail},
-                        headers={"Retry-After": "60"},
+        context_tokens = set_request_context(client_id=decision.client_id, role=decision.role, identity=decision.identity)
+        try:
+            if not security.is_public_path(request.url.path):
+                limit_decision = security.check_rate_limit(decision.identity)
+                if not limit_decision.allowed:
+                    security.record_response(limit_decision.status_code or 500)
+                    return _harden_response(
+                        JSONResponse(
+                            status_code=limit_decision.status_code or 500,
+                            content={"detail": limit_decision.detail},
+                            headers={"Retry-After": "60"},
+                        )
                     )
-                )
 
-        response = await call_next(request)
-        security.record_response(response.status_code)
-        return _harden_response(response)
+            response = await call_next(request)
+            security.record_response(response.status_code)
+            return _harden_response(response)
+        finally:
+            reset_request_context(context_tokens)
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -3327,6 +3344,7 @@ def create_app(
             due_date=payload.due_date,
             jurisdiction=payload.jurisdiction,
             debtor_type=payload.debtor_type,
+            client_id=current_client_id.get(),
         )
         store.create_invoice(invoice)
         ledger.append_event(
@@ -6041,9 +6059,14 @@ def create_app(
         invoice = store.get_invoice(invoice_id)
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found.")
+        authenticated_client_id = current_client_id.get()
+        authenticated_role = current_role.get()
+        effective_client_id = payload.client_id.strip() or authenticated_client_id
+        if authenticated_role != "admin":
+            effective_client_id = authenticated_client_id
         entry = dual_ledger_engine.add_client_action_fee(
             case_id=payload.case_id,
-            client_id=payload.client_id,
+            client_id=effective_client_id,
             invoice_id=invoice_id,
             action_selected=payload.action_selected,
             accepted_by_user=payload.accepted_by_user,
