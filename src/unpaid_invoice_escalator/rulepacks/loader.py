@@ -1,6 +1,10 @@
 from __future__ import annotations
+#
+# First Cairn Digital
+# P26003 rulepack selection safety
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -25,6 +29,40 @@ class RulePack:
 
 class RulePackValidationError(ValueError):
     pass
+
+
+def _version_sort_key(value: str) -> tuple[tuple[int, object], ...]:
+    tokens: list[tuple[int, object]] = []
+    for fragment in re.split(r"[^0-9A-Za-z]+", str(value).strip()):
+        if not fragment:
+            continue
+        if fragment.isdigit():
+            tokens.append((0, int(fragment)))
+        else:
+            tokens.append((1, fragment.lower()))
+    return tuple(tokens)
+
+
+def _candidate_status_rank(raw: dict[str, object]) -> int:
+    if raw.get("active") is False:
+        return -1
+    if raw.get("approved") is False:
+        return -1
+    status = str(raw.get("status", "ACTIVE")).upper()
+    if status not in {"ACTIVE", "APPROVED"}:
+        return -1
+    return 1
+
+
+def _select_single_candidate(candidates: list[RulePack], *, label: str) -> RulePack:
+    if not candidates:
+        raise ValueError(f"No active {label} for the requested date/context")
+    best_score = max((candidate.effective_from, _version_sort_key(candidate.rule_version), 1) for candidate in candidates)
+    tied = [candidate for candidate in candidates if (candidate.effective_from, _version_sort_key(candidate.rule_version), 1) == best_score]
+    if len(tied) > 1:
+        names = ", ".join(candidate.rule_id for candidate in tied)
+        raise RulePackValidationError(f"Ambiguous {label} selection for the requested date/context: {names}")
+    return tied[0]
 
 
 class RulePackLoader:
@@ -53,13 +91,15 @@ class RulePackLoader:
             raw = self._load_raw(path)
             if raw["jurisdiction"] != jurisdiction.value:
                 continue
+            if _candidate_status_rank(raw) < 0:
+                continue
             pack = self._to_rule_pack(raw)
             if pack.effective_from <= on_date and (pack.effective_to is None or on_date <= pack.effective_to):
                 candidates.append(pack)
 
         if not candidates:
             raise ValueError(f"No active rule pack for {jurisdiction.value} on {on_date.isoformat()}")
-        return candidates[-1]
+        return _select_single_candidate(candidates, label=f"rule pack for {jurisdiction.value} on {on_date.isoformat()}")
 
     def describe_active(self, jurisdiction: Jurisdiction, on_date: date) -> dict[str, Any]:
         pack = self.load_for(jurisdiction, on_date)

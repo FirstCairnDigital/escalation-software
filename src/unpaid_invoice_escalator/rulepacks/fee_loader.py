@@ -1,12 +1,54 @@
 from __future__ import annotations
+#
+# First Cairn Digital
+# P26003 rulepack selection safety
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
 from unpaid_invoice_escalator.models import ClientFeeAction, Jurisdiction
+
+
+def _version_sort_key(value: str) -> tuple[tuple[int, object], ...]:
+    tokens: list[tuple[int, object]] = []
+    for fragment in re.split(r"[^0-9A-Za-z]+", str(value).strip()):
+        if not fragment:
+            continue
+        if fragment.isdigit():
+            tokens.append((0, int(fragment)))
+        else:
+            tokens.append((1, fragment.lower()))
+    return tuple(tokens)
+
+
+def _candidate_status_rank(raw: dict[str, object]) -> int:
+    if raw.get("active") is False:
+        return -1
+    if raw.get("approved") is False:
+        return -1
+    status = str(raw.get("status", "ACTIVE")).upper()
+    if status not in {"ACTIVE", "APPROVED"}:
+        return -1
+    return 1
+
+
+def _select_single_candidate(candidates: list[object], *, label: str) -> object:
+    if not candidates:
+        raise ValueError(f"No active {label} for the requested date/context")
+    best_rank = max((candidate.effective_from, _version_sort_key(candidate.version if hasattr(candidate, "version") else candidate.rule_version), 1) for candidate in candidates)
+    tied = [
+        candidate
+        for candidate in candidates
+        if (candidate.effective_from, _version_sort_key(candidate.version if hasattr(candidate, "version") else candidate.rule_version), 1) == best_rank
+    ]
+    if len(tied) > 1:
+        names = ", ".join(getattr(candidate, "schedule_id", getattr(candidate, "rule_id", "unknown")) for candidate in tied)
+        raise ValueError(f"Ambiguous {label} selection for the requested date/context: {names}")
+    return tied[0]
 
 
 @dataclass(frozen=True)
@@ -50,6 +92,8 @@ class FeePackLoader:
         schedules: list[PricingSchedule] = []
         for path in sorted(self._base_path.glob("pricing_schedule*.json")):
             raw = json.loads(path.read_text(encoding="utf-8"))
+            if _candidate_status_rank(raw) < 0:
+                continue
             effective_from = date.fromisoformat(raw["effective_from"])
             effective_to = date.fromisoformat(raw["effective_to"]) if raw.get("effective_to") else None
             if not (effective_from <= on_date and (effective_to is None or on_date <= effective_to)):
@@ -67,13 +111,15 @@ class FeePackLoader:
             )
         if not schedules:
             raise ValueError(f"No active pricing schedule for {on_date.isoformat()}")
-        return schedules[-1]
+        return _select_single_candidate(schedules, label=f"pricing schedule on {on_date.isoformat()}")
 
     def load_court_fee_schedule(self, jurisdiction: Jurisdiction, on_date: date) -> CourtFeeSchedule:
         schedules: list[CourtFeeSchedule] = []
         for path in sorted(self._base_path.glob("court_fees*.json")):
             raw = json.loads(path.read_text(encoding="utf-8"))
             if raw["jurisdiction"] != jurisdiction.value:
+                continue
+            if _candidate_status_rank(raw) < 0:
                 continue
             effective_from = date.fromisoformat(raw["effective_from"])
             effective_to = date.fromisoformat(raw["effective_to"]) if raw.get("effective_to") else None
@@ -102,7 +148,7 @@ class FeePackLoader:
             )
         if not schedules:
             raise ValueError(f"No active court fee schedule for {jurisdiction.value} on {on_date.isoformat()}")
-        return schedules[-1]
+        return _select_single_candidate(schedules, label=f"court fee schedule for {jurisdiction.value} on {on_date.isoformat()}")
 
     def quote_court_fee(self, jurisdiction: Jurisdiction, claim_value: Decimal, on_date: date) -> Decimal:
         schedule = self.load_court_fee_schedule(jurisdiction, on_date)
