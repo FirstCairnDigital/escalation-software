@@ -44,7 +44,7 @@ jobs:
       - name: Dependency vulnerability scan
         run: |
           python -m pip install pip-audit
-          pip-audit --requirement requirements.txt --constraint constraints.txt --desc
+          pip-audit --requirement requirements.txt --desc
 
       - name: Check for committed secrets
         uses: gitleaks/gitleaks-action@v2
