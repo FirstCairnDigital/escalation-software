@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from unpaid_invoice_escalator.api import create_app
 from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
+from unpaid_invoice_escalator.security import ApiSecurityController
 from unpaid_invoice_escalator.services.debtor_verification_portal import DebtorVerificationPortal
 from unpaid_invoice_escalator.ui import render_invoice_workspace_html
 
@@ -141,6 +142,107 @@ class TestApiSecurity(unittest.TestCase):
             self.assertEqual(admin_metrics.status_code, 200)
             self.assertIn("rate_limited_total", admin_metrics.json()["active_alerts"])
 
+    def test_production_request_without_client_mapping_is_rejected(self) -> None:
+        security = ApiSecurityController(
+            enabled=True,
+            api_keys={"mapped-key": "viewer"},
+            api_clients={},
+            require_explicit_client_mapping=True,
+            rate_limit_per_minute=100,
+        )
+
+        decision = security.evaluate_request(
+            method="GET",
+            path="/invoices/inv-sec-1",
+            api_key="mapped-key",
+            client_host="127.0.0.1",
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.status_code, 403)
+        self.assertEqual(decision.detail, "Authenticated credential is not mapped to a client.")
+        self.assertEqual(decision.client_id, "")
+
+    def test_production_explicit_client_mapping_preserves_cross_client_isolation(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-prod-tenant.db")
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                bundles_dir=str(Path(tmp_dir) / "bundles"),
+                app_env="production",
+                auth_enabled=True,
+                api_keys={
+                    "client-a-key": "operator",
+                    "client-b-key": "operator",
+                    "admin-key": "admin",
+                },
+                api_clients={
+                    "client-a-key": "CLIENT-A",
+                    "client-b-key": "CLIENT-B",
+                    "admin-key": "FCD-ADMIN",
+                },
+                rate_limit_per_minute=100,
+                manifest_signing_key="production-signing-key",
+                manifest_key_id="fcd-kms-key-1",
+            )
+            client = TestClient(app)
+
+            create_a = client.post(
+                "/invoices",
+                headers={"x-api-key": "client-a-key"},
+                json={
+                    "invoice_id": "inv-prod-tenant-a",
+                    "currency": "GBP",
+                    "principal_amount": "250",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_a.status_code, 200)
+
+            create_b = client.post(
+                "/invoices",
+                headers={"x-api-key": "client-b-key"},
+                json={
+                    "invoice_id": "inv-prod-tenant-b",
+                    "currency": "GBP",
+                    "principal_amount": "400",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_b.status_code, 200)
+
+            self.assertEqual(client.get("/invoices/inv-prod-tenant-a", headers={"x-api-key": "client-a-key"}).status_code, 200)
+            self.assertEqual(client.get("/invoices/inv-prod-tenant-b", headers={"x-api-key": "client-b-key"}).status_code, 200)
+            self.assertEqual(client.get("/invoices/inv-prod-tenant-b", headers={"x-api-key": "client-a-key"}).status_code, 404)
+
+    def test_production_create_app_rejects_missing_or_stale_client_mappings(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-prod-mapping.db")
+            kwargs = {
+                "db_path": db_path,
+                "artifacts_dir": str(Path(tmp_dir) / "artifacts"),
+                "bundles_dir": str(Path(tmp_dir) / "bundles"),
+                "app_env": "production",
+                "auth_enabled": True,
+                "api_keys": {"mapped-key": "admin"},
+                "rate_limit_per_minute": 100,
+                "manifest_signing_key": "production-signing-key",
+                "manifest_key_id": "fcd-kms-key-1",
+            }
+
+            with self.assertRaisesRegex(ValueError, "missing explicit client mappings"):
+                create_app(api_clients={}, **kwargs)
+
+            with self.assertRaisesRegex(ValueError, "do not match configured API credentials"):
+                create_app(api_clients={"mapped-key": "CLIENT-A", "stale-key": "CLIENT-B"}, **kwargs)
+
     def test_public_portal_abuse_protection_scopes_by_case_and_action(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "portal-rate-limit.db")
@@ -222,6 +324,7 @@ class TestApiSecurity(unittest.TestCase):
                 app_env="production",
                 auth_enabled=True,
                 api_keys={"admin-key": "admin"},
+                api_clients={"admin-key": "FCD-ADMIN"},
                 manifest_signing_key="production-signing-key",
                 manifest_key_id="fcd-kms-key-1",
             )

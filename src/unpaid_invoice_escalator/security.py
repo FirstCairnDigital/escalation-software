@@ -33,6 +33,7 @@ class ApiSecurityController:
         enabled: bool,
         api_keys: dict[str, str],
         api_clients: dict[str, str] | None = None,
+        require_explicit_client_mapping: bool = False,
         rate_limit_per_minute: int,
         auth_failure_alert_threshold: int = 10,
         rate_limit_alert_threshold: int = 10,
@@ -42,6 +43,7 @@ class ApiSecurityController:
         self.enabled = enabled
         self.api_keys = api_keys
         self.api_clients = api_clients or {}
+        self.require_explicit_client_mapping = require_explicit_client_mapping
         self.rate_limit_per_minute = rate_limit_per_minute
         self.auth_failure_alert_threshold = auth_failure_alert_threshold
         self.rate_limit_alert_threshold = rate_limit_alert_threshold
@@ -113,7 +115,27 @@ class ApiSecurityController:
                 role="anonymous",
             )
 
-        client_id = self.api_clients.get(api_key or "", "DEFAULT_CLIENT")
+        client_id = self.api_clients.get(api_key or "", "").strip()
+        if self.require_explicit_client_mapping and not client_id:
+            self._forbidden_count += 1
+            self._record_audit_event(
+                event_type="TENANT_MAPPING_FORBIDDEN",
+                severity="ERROR",
+                method=method,
+                path=path,
+                identity=identity,
+                detail="Authenticated credential has no explicit client mapping.",
+            )
+            return RequestDecision(
+                allowed=False,
+                status_code=403,
+                detail="Authenticated credential is not mapped to a client.",
+                identity=identity,
+                role=role,
+                client_id="",
+            )
+        if not client_id:
+            client_id = "DEFAULT_CLIENT"
         required_role = self._required_role(method=method, path=path)
         if not self._role_allows(actual=role, required=required_role):
             self._forbidden_count += 1

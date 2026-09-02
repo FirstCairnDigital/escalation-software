@@ -67,7 +67,7 @@ from unpaid_invoice_escalator.services.resolution_settlement_engine import Resol
 from unpaid_invoice_escalator.services.resolution_artifact_generator import ResolutionArtifactGenerator
 from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
 from unpaid_invoice_escalator.services.viability_proportionality_calculator import ViabilityProportionalityCalculator
-from unpaid_invoice_escalator.production_config import resolve_runtime_config
+from unpaid_invoice_escalator.production_config import resolve_runtime_config, validate_api_client_mappings
 from unpaid_invoice_escalator.security import ApiSecurityController, ROLE_RANK
 from unpaid_invoice_escalator.tenant_context import current_client_id, current_identity, current_role, reset_request_context, set_request_context
 from unpaid_invoice_escalator.ui import (
@@ -1009,12 +1009,30 @@ def create_app(
     effective_auth_enabled = runtime_cfg["auth_enabled"]
     configured_keys = api_keys if api_keys is not None else runtime_cfg["api_keys"]
     configured_clients = api_clients if api_clients is not None else runtime_cfg["api_clients"]
-    if not configured_clients and configured_keys:
-        configured_clients = _default_client_map(configured_keys)
     if effective_auth_enabled and not configured_keys:
         raise ValueError("Authentication is enabled but no API keys were configured.")
     if effective_env == "production" and manifest_signing_key == "dev-only-signing-key":
         raise ValueError("Production mode requires FCD_MANIFEST_SIGNING_KEY or explicit manifest_signing_key.")
+    require_explicit_client_mapping = effective_env == "production" and effective_auth_enabled
+    client_mapping_validation = validate_api_client_mappings(configured_keys, configured_clients)
+    if require_explicit_client_mapping:
+        mapping_errors: list[str] = []
+        if client_mapping_validation["missing_credentials"]:
+            mapping_errors.append(
+                f"{len(client_mapping_validation['missing_credentials'])} API credential(s) are missing explicit client mappings."
+            )
+        if client_mapping_validation["stale_credentials"]:
+            mapping_errors.append(
+                f"{len(client_mapping_validation['stale_credentials'])} client mapping entry/entries do not match configured API credentials."
+            )
+        if mapping_errors:
+            raise ValueError("Production API client mapping is invalid: " + " ".join(mapping_errors))
+    effective_clients = dict(configured_clients)
+    if not effective_clients and configured_keys:
+        effective_clients = _default_client_map(configured_keys)
+    elif configured_keys:
+        for key in configured_keys:
+            effective_clients.setdefault(key, "DEFAULT_CLIENT")
 
     effective_rate_limit = runtime_cfg["rate_limit_per_minute"]
     verification_keys = dict(manifest_verification_keys or {})
@@ -1042,7 +1060,8 @@ def create_app(
     security = ApiSecurityController(
         enabled=effective_auth_enabled,
         api_keys=configured_keys,
-        api_clients=configured_clients,
+        api_clients=effective_clients,
+        require_explicit_client_mapping=require_explicit_client_mapping,
         rate_limit_per_minute=effective_rate_limit,
         auth_failure_alert_threshold=effective_auth_failure_threshold,
         rate_limit_alert_threshold=effective_rate_limit_threshold,
@@ -1118,6 +1137,26 @@ def create_app(
         (not effective_auth_enabled) or bool(configured_keys),
         "error",
         "API keys configured for secured mode." if configured_keys else "No API keys configured.",
+    )
+    _append_check(
+        "api-client-mappings",
+        (not require_explicit_client_mapping)
+        or (
+            len(client_mapping_validation["missing_credentials"]) == 0
+            and len(client_mapping_validation["stale_credentials"]) == 0
+        ),
+        "error" if require_explicit_client_mapping else "warning",
+        (
+            "Every production API credential maps to one explicit client."
+            if require_explicit_client_mapping
+            and len(client_mapping_validation["missing_credentials"]) == 0
+            and len(client_mapping_validation["stale_credentials"]) == 0
+            else (
+                "Non-production mode allows DEFAULT_CLIENT compatibility for unmapped credentials."
+                if not require_explicit_client_mapping
+                else "Production API client mappings are incomplete or contain stale entries."
+            )
+        ),
     )
     _append_check(
         "manifest-verification-keys",
@@ -1318,6 +1357,7 @@ def create_app(
             "auth_enabled": effective_auth_enabled,
             "manifest_key_id": manifest_key_id,
             "verification_key_ids": sorted(verification_keys.keys()),
+            "api_client_mapping_count": client_mapping_validation["mapped_count"],
             "rate_limit_per_minute": effective_rate_limit,
             "max_upload_bytes": effective_max_upload_bytes,
             "allowed_upload_content_types": list(effective_allowed_upload_content_types),
@@ -1354,8 +1394,9 @@ def create_app(
                 "step": 2,
                 "title": "Validate auth and RBAC configuration",
                 "completed": check_map.get("auth-enabled-in-production", False)
-                and check_map.get("api-keys-configured", False),
-                "detail": "Ensure API keys are present and role model is enforceable.",
+                and check_map.get("api-keys-configured", False)
+                and check_map.get("api-client-mappings", False),
+                "detail": "Ensure API keys are present, explicitly mapped to clients in production, and role model is enforceable.",
             },
             {
                 "step": 3,

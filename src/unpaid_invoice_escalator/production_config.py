@@ -26,6 +26,22 @@ def _key_map(value: str) -> dict[str, str]:
     return mapping
 
 
+def validate_api_client_mappings(api_keys: Mapping[str, Any], api_clients: Mapping[str, Any]) -> dict[str, Any]:
+    normalized_keys = {str(key).strip() for key in api_keys if str(key).strip()}
+    normalized_clients = {
+        str(key).strip(): str(value).strip()
+        for key, value in api_clients.items()
+        if str(key).strip() and str(value).strip()
+    }
+    missing_credentials = sorted(key for key in normalized_keys if key not in normalized_clients)
+    stale_credentials = sorted(key for key in normalized_clients if key not in normalized_keys)
+    return {
+        "missing_credentials": missing_credentials,
+        "stale_credentials": stale_credentials,
+        "mapped_count": len(normalized_clients),
+    }
+
+
 def _env_value(env: Mapping[str, Any], primary: str, *aliases: str, default: str = "") -> tuple[str, str | None, bool]:
     for key in (primary, *aliases):
         if key not in env:
@@ -63,6 +79,7 @@ def resolve_runtime_config(
     manifest_key_id, _, _ = _env_value(effective_env, "FCD_MANIFEST_KEY_ID", default="fcd-local-key")
     manifest_verification_keys_raw, _, _ = _env_value(effective_env, "FCD_MANIFEST_VERIFY_KEYS")
     api_keys_raw, api_keys_alias, api_keys_primary = _env_value(effective_env, "FCD_API_KEYS", "SBC_API_KEY")
+    api_clients_raw, _, _ = _env_value(effective_env, "FCD_API_CLIENTS")
     rate_limit_raw, _, _ = _env_value(effective_env, "FCD_RATE_LIMIT_PER_MINUTE", default="120")
     auth_failure_raw, _, _ = _env_value(effective_env, "FCD_AUTH_FAILURE_ALERT_THRESHOLD", default="10")
     rate_limit_alert_raw, _, _ = _env_value(effective_env, "FCD_RATE_LIMIT_ALERT_THRESHOLD", default="10")
@@ -139,6 +156,7 @@ def resolve_runtime_config(
             api_keys = {"legacy-credential": api_keys_raw}
     else:
         api_keys = {}
+    api_clients = _key_map(api_clients_raw) if api_clients_raw else {}
 
     legacy_aliases: dict[str, str] = {}
     if str(effective_env.get("CRYPTO_SIGNING_KEY") or "").strip():
@@ -161,7 +179,7 @@ def resolve_runtime_config(
         "manifest_key_id": manifest_key_id,
         "manifest_verification_keys": verification_keys,
         "api_keys": api_keys,
-        "api_clients": {},
+        "api_clients": api_clients,
         "rate_limit_per_minute": rate_limit_per_minute,
         "auth_failure_alert_threshold": auth_failure_threshold,
         "rate_limit_alert_threshold": rate_limit_alert_threshold,
@@ -199,6 +217,7 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
     manifest_key_id = runtime["manifest_key_id"]
     verification_keys = runtime["manifest_verification_keys"]
     api_keys = runtime["api_keys"]
+    api_clients = runtime["api_clients"]
     rate_limit_per_minute = runtime["rate_limit_per_minute"]
     auth_failure_threshold = runtime["auth_failure_alert_threshold"]
     rate_limit_alert_threshold = runtime["rate_limit_alert_threshold"]
@@ -264,6 +283,37 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
             "warning",
             f"{legacy_aliases['api_keys']} is present, but production API auth should migrate to FCD_API_KEYS.",
         )
+    mapping_validation = validate_api_client_mappings(api_keys, api_clients)
+    record(
+        "api-client-mappings-configured",
+        bool(api_clients),
+        "error",
+        (
+            f"Explicit client mappings configured for {mapping_validation['mapped_count']} API credential(s)."
+            if api_clients
+            else "FCD_API_CLIENTS is required so every production API credential maps to one explicit client."
+        ),
+    )
+    record(
+        "api-client-mappings-complete",
+        len(mapping_validation["missing_credentials"]) == 0,
+        "error",
+        (
+            "Every configured API credential has an explicit client mapping."
+            if len(mapping_validation["missing_credentials"]) == 0
+            else f"{len(mapping_validation['missing_credentials'])} configured API credential(s) lack an explicit client mapping."
+        ),
+    )
+    record(
+        "api-client-mappings-known-credentials",
+        len(mapping_validation["stale_credentials"]) == 0,
+        "error",
+        (
+            "All configured client mappings match current API credentials."
+            if len(mapping_validation["stale_credentials"]) == 0
+            else f"{len(mapping_validation['stale_credentials'])} client mapping entry/entries do not match configured API credentials."
+        ),
+    )
 
     for check_name, env_name, raw_value, severity in (
         ("rate-limit-per-minute", "FCD_RATE_LIMIT_PER_MINUTE", rate_limit_per_minute, "error"),
@@ -337,6 +387,7 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
         "auth_enabled": runtime["auth_enabled"],
         "manifest_key_id": manifest_key_id,
         "verification_key_ids": sorted(verification_keys.keys()),
+        "api_client_mapping_count": mapping_validation["mapped_count"],
         "rate_limit_per_minute": rate_limit_per_minute,
         "max_upload_bytes": max_upload_bytes,
         "allowed_upload_content_types": list(upload_types),

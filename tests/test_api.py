@@ -2575,6 +2575,7 @@ class TestApi(unittest.TestCase):
             {
                 "DATABASE_URL": "postgresql://user:pass@example.com:5432/app?sslmode=require",
                 "SBC_API_KEY": "sbc-key-123",
+                "FCD_API_CLIENTS": "legacy-credential:CLIENT-LEGACY",
                 "SBC_ENDPOINT": "https://sbc.example.com",
                 "CRYPTO_SIGNING_KEY": "A" * 32,
                 "DATA_RETENTION_CRON_SCHEDULE": "0 2 * * *",
@@ -2594,6 +2595,7 @@ class TestApi(unittest.TestCase):
                 "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
                 "FCD_MANIFEST_VERIFY_KEYS": "fcd-kms-key-1:" + ("B" * 32),
                 "FCD_API_KEYS": "admin-key:admin,ops-key:operator,ro-key:viewer",
+                "FCD_API_CLIENTS": "admin-key:FCD-ADMIN,ops-key:CLIENT-OPS,ro-key:CLIENT-RO",
                 "FCD_RATE_LIMIT_PER_MINUTE": "120",
                 "FCD_AUTH_FAILURE_ALERT_THRESHOLD": "10",
                 "FCD_RATE_LIMIT_ALERT_THRESHOLD": "10",
@@ -2618,6 +2620,7 @@ class TestApi(unittest.TestCase):
                 "CRYPTO_SIGNING_KEY": "LEGACY-SECRET",
                 "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
                 "FCD_API_KEYS": "admin-key:admin",
+                "FCD_API_CLIENTS": "admin-key:FCD-ADMIN",
                 "SBC_API_KEY": "legacy-key",
                 "FCD_DATA_RETENTION_CRON_SCHEDULE": "0 2 * * *",
                 "DATA_RETENTION_CRON_SCHEDULE": "0 3 * * *",
@@ -2640,6 +2643,51 @@ class TestApi(unittest.TestCase):
         self.assertIn("FCD_API_KEYS", warning_text)
         self.assertIn("FCD_DATA_RETENTION_CRON_SCHEDULE", warning_text)
 
+    def test_validate_production_config_rejects_incomplete_or_stale_client_mappings(self) -> None:
+        missing_mapping = validate_production_config(
+            {
+                "FCD_APP_ENV": "production",
+                "FCD_MANIFEST_SIGNING_KEY": "A" * 32,
+                "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
+                "FCD_API_KEYS": "admin-key:admin,ops-key:operator",
+                "FCD_API_CLIENTS": "admin-key:FCD-ADMIN",
+                "FCD_RATE_LIMIT_PER_MINUTE": "120",
+                "FCD_AUTH_FAILURE_ALERT_THRESHOLD": "10",
+                "FCD_RATE_LIMIT_ALERT_THRESHOLD": "10",
+                "FCD_SERVER_ERROR_ALERT_THRESHOLD": "5",
+                "FCD_MAX_UPLOAD_BYTES": "5242880",
+                "FCD_ALLOWED_UPLOAD_CONTENT_TYPES": "application/pdf,text/plain",
+                "FCD_ALLOWED_UPLOAD_EXTENSIONS": ".pdf,.txt",
+                "FCD_QUARANTINE_DIR": "data/quarantine",
+                "FCD_DATA_RETENTION_DAYS": "2190",
+                "FCD_DATA_RETENTION_CRON_SCHEDULE": "0 2 * * *",
+            }
+        )
+        self.assertFalse(missing_mapping["valid"])
+        self.assertIn("lack an explicit client mapping", "\n".join(missing_mapping["errors"]))
+
+        stale_mapping = validate_production_config(
+            {
+                "FCD_APP_ENV": "production",
+                "FCD_MANIFEST_SIGNING_KEY": "A" * 32,
+                "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
+                "FCD_API_KEYS": "admin-key:admin",
+                "FCD_API_CLIENTS": "admin-key:FCD-ADMIN,stale-key:CLIENT-B",
+                "FCD_RATE_LIMIT_PER_MINUTE": "120",
+                "FCD_AUTH_FAILURE_ALERT_THRESHOLD": "10",
+                "FCD_RATE_LIMIT_ALERT_THRESHOLD": "10",
+                "FCD_SERVER_ERROR_ALERT_THRESHOLD": "5",
+                "FCD_MAX_UPLOAD_BYTES": "5242880",
+                "FCD_ALLOWED_UPLOAD_CONTENT_TYPES": "application/pdf,text/plain",
+                "FCD_ALLOWED_UPLOAD_EXTENSIONS": ".pdf,.txt",
+                "FCD_QUARANTINE_DIR": "data/quarantine",
+                "FCD_DATA_RETENTION_DAYS": "2190",
+                "FCD_DATA_RETENTION_CRON_SCHEDULE": "0 2 * * *",
+            }
+        )
+        self.assertFalse(stale_mapping["valid"])
+        self.assertIn("do not match configured API credentials", "\n".join(stale_mapping["errors"]))
+
     def test_ready_report_uses_runtime_configuration_without_exposing_secrets(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             previous_schedule = os.environ.get("FCD_DATA_RETENTION_CRON_SCHEDULE")
@@ -2654,6 +2702,7 @@ class TestApi(unittest.TestCase):
                     manifest_key_id="fcd-ready-key",
                     auth_enabled=True,
                     api_keys={"admin-key": "admin"},
+                    api_clients={"admin-key": "FCD-ADMIN"},
                     rate_limit_per_minute=77,
                     max_upload_bytes=4321,
                     allowed_upload_content_types=("application/pdf",),
@@ -2670,10 +2719,39 @@ class TestApi(unittest.TestCase):
             self.assertEqual(ready.status_code, 200)
             payload = ready.json()
             self.assertEqual(payload["manifest_key_id"], "fcd-ready-key")
+            self.assertEqual(payload["api_client_mapping_count"], 1)
             self.assertEqual(payload["rate_limit_per_minute"], 77)
             self.assertEqual(payload["max_upload_bytes"], 4321)
             self.assertNotIn("A" * 32, str(payload))
             self.assertNotIn("manifest_signing_key", str(payload))
+            self.assertNotIn("admin-key", str(payload))
+
+    def test_development_auth_retains_default_client_compatibility(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            app = create_app(
+                db_path=str(Path(tmp_dir) / "api-dev-client-map.db"),
+                artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                bundles_dir=str(Path(tmp_dir) / "bundles"),
+                app_env="development",
+                auth_enabled=True,
+                api_keys={"operator-key": "operator"},
+                rate_limit_per_minute=100,
+            )
+            client = TestClient(app)
+            create_resp = client.post(
+                "/invoices",
+                headers={"x-api-key": "operator-key"},
+                json={
+                    "invoice_id": "inv-dev-client-map",
+                    "currency": "GBP",
+                    "principal_amount": "100",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
 
     def test_data_retention_disposal_partial_failure_is_audited_and_retryable(self) -> None:
         with TemporaryDirectory() as tmp_dir:
