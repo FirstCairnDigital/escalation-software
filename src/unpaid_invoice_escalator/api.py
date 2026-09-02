@@ -1,8 +1,9 @@
 from __future__ import annotations
 #
 # First Cairn Digital
-# P26003 bank-detail authentication hardening
+# P26003 bounded hostile upload handling
 
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from html import escape as html_escape
@@ -83,6 +84,33 @@ from unpaid_invoice_escalator.ui import (
 )
 
 SAFE_UPLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+UPLOAD_READ_CHUNK_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class UploadReadResult:
+    content: bytes
+    limit_exceeded: bool
+
+
+async def _read_upload_content_bounded(
+    file: UploadFile,
+    *,
+    max_bytes: int,
+    chunk_size: int = UPLOAD_READ_CHUNK_BYTES,
+) -> UploadReadResult:
+    if max_bytes < 0:
+        raise ValueError("max_bytes must not be negative.")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than zero.")
+    content = bytearray()
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            return UploadReadResult(content=bytes(content), limit_exceeded=False)
+        content.extend(chunk)
+        if len(content) > max_bytes:
+            return UploadReadResult(content=bytes(content), limit_exceeded=True)
 
 
 class InvoiceCreateRequest(BaseModel):
@@ -1837,7 +1865,9 @@ def create_app(
         invoice_dir = artifacts_root / invoice_id
         invoice_dir.mkdir(parents=True, exist_ok=True)
         original_filename = Path(file.filename or "").name
-        content = await file.read()
+        content_type = (file.content_type or "").strip()
+        upload_read = await _read_upload_content_bounded(file, max_bytes=effective_max_upload_bytes)
+        content = upload_read.content
 
         def quarantine_and_raise(*, status_code: int, reason: str) -> None:
             quarantine_id = str(uuid4())
@@ -1847,34 +1877,34 @@ def create_app(
             quarantine_name = f"{quarantine_id}_{Path(fallback_name).name}"
             quarantine_path = quarantine_invoice_dir / quarantine_name
             metadata_path = quarantine_invoice_dir / f"{quarantine_id}.json"
+            truncated = upload_read.limit_exceeded
+            metadata: dict[str, object] = {
+                "quarantine_id": quarantine_id,
+                "invoice_id": invoice_id,
+                "reason": reason,
+                "filename": fallback_name,
+                "content_type": content_type,
+                "captured_bytes": len(content),
+                "truncated": truncated,
+                "original_size_known": not truncated,
+            }
+            if truncated:
+                metadata["truncation_reason"] = "Captured upload content was truncated after the application size limit was exceeded."
+            else:
+                metadata["size_bytes"] = len(content)
             try:
                 quarantine_path.write_bytes(content)
                 metadata_path.write_text(
-                    json.dumps(
-                        {
-                            "quarantine_id": quarantine_id,
-                            "invoice_id": invoice_id,
-                            "reason": reason,
-                            "filename": fallback_name,
-                            "content_type": (file.content_type or "").strip(),
-                            "size_bytes": len(content),
-                        },
-                        ensure_ascii=True,
-                    ),
+                    json.dumps(metadata, ensure_ascii=True),
                     encoding="utf-8",
                 )
+                event_payload = dict(metadata)
+                event_payload["quarantine_path"] = str(quarantine_path)
                 ledger.append_event(
                     invoice_id=invoice_id,
                     actor=Actor.SYSTEM,
                     event_type="EVIDENCE_UPLOAD_QUARANTINED",
-                    data_payload={
-                        "quarantine_id": quarantine_id,
-                        "reason": reason,
-                        "filename": fallback_name,
-                        "content_type": (file.content_type or "").strip(),
-                        "size_bytes": len(content),
-                        "quarantine_path": str(quarantine_path),
-                    },
+                    data_payload=event_payload,
                 )
                 security.record_upload_rejection(reason=reason, quarantined=True)
                 raise HTTPException(
@@ -1887,13 +1917,7 @@ def create_app(
                     invoice_id=invoice_id,
                     actor=Actor.SYSTEM,
                     event_type="EVIDENCE_UPLOAD_REJECTED",
-                    data_payload={
-                        "reason": reason,
-                        "filename": fallback_name,
-                        "content_type": (file.content_type or "").strip(),
-                        "size_bytes": len(content),
-                        "quarantine_error": str(exc),
-                    },
+                    data_payload={**metadata, "quarantine_error": str(exc)},
                 )
                 raise HTTPException(
                     status_code=status_code,
@@ -1910,13 +1934,12 @@ def create_app(
                 reason=("Unsupported file extension. Allowed extensions: " + ", ".join(effective_allowed_upload_extensions)),
             )
 
-        if len(content) > effective_max_upload_bytes:
+        if upload_read.limit_exceeded:
             quarantine_and_raise(
                 status_code=413,
                 reason=f"Uploaded file exceeds max allowed size ({effective_max_upload_bytes} bytes).",
             )
-        content_type = (file.content_type or "").strip().lower()
-        if content_type not in allowed_upload_content_type_set:
+        if content_type.lower() not in allowed_upload_content_type_set:
             quarantine_and_raise(
                 status_code=415,
                 reason=("Unsupported file content type. Allowed types: " + ", ".join(effective_allowed_upload_content_types)),

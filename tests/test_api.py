@@ -1,7 +1,9 @@
 #
 # First Cairn Digital
-# P26003 bank-detail authentication hardening
+# P26003 bounded hostile upload handling
+import asyncio
 from datetime import date, timedelta
+import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,7 +13,7 @@ from urllib.parse import quote
 
 from fastapi.testclient import TestClient
 
-from unpaid_invoice_escalator.api import create_app
+from unpaid_invoice_escalator.api import UPLOAD_READ_CHUNK_BYTES, _read_upload_content_bounded, create_app
 from unpaid_invoice_escalator.production_config import validate_production_config
 
 
@@ -538,12 +540,98 @@ class TestApi(unittest.TestCase):
             )
             self.assertEqual(create_resp.status_code, 200)
 
-            upload_resp = client.post(
+            below_limit_resp = client.post(
+                "/invoices/inv-api-limit/evidence-artifacts",
+                data={"user_id": "client-1", "artifact_type": "CONTRACT"},
+                files={"file": ("below.txt", b"1234567", "text/plain")},
+            )
+            self.assertEqual(below_limit_resp.status_code, 200)
+            self.assertEqual(Path(below_limit_resp.json()["file_path"]).read_bytes(), b"1234567")
+
+            exact_limit_resp = client.post(
+                "/invoices/inv-api-limit/evidence-artifacts",
+                data={"user_id": "client-1", "artifact_type": "CONTRACT"},
+                files={"file": ("exact.txt", b"12345678", "text/plain")},
+            )
+            self.assertEqual(exact_limit_resp.status_code, 200)
+            self.assertEqual(Path(exact_limit_resp.json()["file_path"]).read_bytes(), b"12345678")
+
+            over_limit_resp = client.post(
                 "/invoices/inv-api-limit/evidence-artifacts",
                 data={"user_id": "client-1", "artifact_type": "CONTRACT"},
                 files={"file": ("contract.txt", b"123456789", "text/plain")},
             )
+            self.assertEqual(over_limit_resp.status_code, 413)
+
+    def test_bounded_upload_reader_stops_after_limit_exceeded(self) -> None:
+        class RecordingUpload:
+            def __init__(self, payload: bytes) -> None:
+                self._payload = payload
+                self._offset = 0
+                self.read_sizes: list[int] = []
+
+            async def read(self, size: int = -1) -> bytes:
+                self.read_sizes.append(size)
+                if size < 0:
+                    raise AssertionError("unbounded read requested")
+                chunk = self._payload[self._offset : self._offset + size]
+                self._offset += len(chunk)
+                return chunk
+
+        upload = RecordingUpload(b"x" * 100)
+        result = asyncio.run(_read_upload_content_bounded(upload, max_bytes=8, chunk_size=4))
+
+        self.assertTrue(result.limit_exceeded)
+        self.assertEqual(upload.read_sizes, [4, 4, 4])
+        self.assertLessEqual(len(result.content), 12)
+
+    def test_oversized_upload_quarantine_is_bounded_and_truncated(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-limit-quarantine.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            quarantine_dir = str(Path(tmp_dir) / "quarantine")
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=artifacts_dir,
+                bundles_dir=bundles_dir,
+                quarantine_dir=quarantine_dir,
+                max_upload_bytes=8,
+            )
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-limit-quarantine",
+                    "currency": "GBP",
+                    "principal_amount": "100",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            upload_resp = client.post(
+                "/invoices/inv-api-limit-quarantine/evidence-artifacts",
+                data={"user_id": "client-1", "artifact_type": "CONTRACT"},
+                files={"file": ("large.txt", b"x" * (UPLOAD_READ_CHUNK_BYTES + 100), "text/plain")},
+            )
             self.assertEqual(upload_resp.status_code, 413)
+            self.assertIn("Quarantine reference:", upload_resp.json()["detail"])
+
+            quarantine_invoice_dir = Path(quarantine_dir) / "inv-api-limit-quarantine"
+            metadata_path = next(path for path in quarantine_invoice_dir.glob("*.json"))
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            quarantine_blob = next(path for path in quarantine_invoice_dir.iterdir() if path.suffix != ".json")
+            self.assertTrue(payload["truncated"])
+            self.assertFalse(payload["original_size_known"])
+            self.assertEqual(payload["captured_bytes"], quarantine_blob.stat().st_size)
+            self.assertLessEqual(payload["captured_bytes"], 8 + UPLOAD_READ_CHUNK_BYTES)
+            self.assertNotIn("size_bytes", payload)
+            self.assertIn("truncation_reason", payload)
 
     def test_upload_content_type_allowlist_enforced(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -1679,6 +1767,12 @@ class TestApi(unittest.TestCase):
 
             quarantine_files = list((Path(quarantine_dir) / "inv-api-quarantine").glob("*"))
             self.assertGreaterEqual(len(quarantine_files), 2)
+            metadata_path = next(path for path in quarantine_files if path.suffix == ".json")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["size_bytes"], len(b"malicious"))
+            self.assertEqual(metadata["captured_bytes"], len(b"malicious"))
+            self.assertFalse(metadata["truncated"])
+            self.assertTrue(metadata["original_size_known"])
 
     def test_data_retention_disposal_workflow(self) -> None:
         with TemporaryDirectory() as tmp_dir:
