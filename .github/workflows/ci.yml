@@ -60,4 +60,4 @@ jobs:
           grep " ${GITLEAKS_ARCHIVE}$" "${GITLEAKS_CHECKSUMS}" | sha256sum --check --status --
           tar -xzf "${GITLEAKS_ARCHIVE}" gitleaks
           chmod +x ./gitleaks
-          ./gitleaks git --source . --no-banner
+          ./gitleaks git . --no-banner
