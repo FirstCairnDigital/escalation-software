@@ -45,6 +45,28 @@ python -m unpaid_invoice_escalator.api
 
 Server default: `http://127.0.0.1:8000`
 
+## Run the live customer shell
+
+```powershell
+$env:PYTHONPATH="C:\Dev\projects\P26003-escalation-software\src"
+python -m unpaid_invoice_escalator.live_app
+```
+
+The live shell serves:
+
+- `/` public customer home
+- `/creditor` public creditor journey
+- `/debtor` public notice-verification journey
+
+The mounted core application still serves existing routes such as:
+
+- `/health`
+- `/ready`
+- `/verify`
+- `/portal`
+- `/ui/*`
+- `/invoices/*`
+
 ### Production Security Configuration
 Set these before startup in production:
 
@@ -54,6 +76,8 @@ $env:FCD_MANIFEST_SIGNING_KEY="<strong-secret-or-kms-material>"
 $env:FCD_MANIFEST_KEY_ID="fcd-kms-key-1"
 $env:FCD_MANIFEST_VERIFY_KEYS="fcd-kms-key-1:<current-key>,fcd-kms-key-0:<previous-key>"
 $env:FCD_API_KEYS="admin-key:admin,ops-key:operator,ro-key:viewer"
+$env:FCD_API_CLIENTS="admin-key:FCD-ADMIN,ops-key:CLIENT-OPS,ro-key:CLIENT-RO"
+$env:FCD_API_IDENTITIES="admin-key:ADMIN-ACTOR,ops-key:OPS-ACTOR,ro-key:RO-ACTOR"
 $env:FCD_RATE_LIMIT_PER_MINUTE="120"
 $env:FCD_AUTH_FAILURE_ALERT_THRESHOLD="10"
 $env:FCD_RATE_LIMIT_ALERT_THRESHOLD="10"
@@ -70,6 +94,8 @@ Notes:
 - `FCD_APP_ENV=production` enforces non-default signing keys.
 - API keys are supplied via `x-api-key` header.
 - Role levels: `viewer` (read), `operator` (write), `admin` (metrics/ops).
+- `FCD_API_CLIENTS` maps each API credential to one explicit client.
+- `FCD_API_IDENTITIES` maps each API credential to one non-secret actor identity.
 - `FCD_MANIFEST_VERIFY_KEYS` enables key-rotation verification windows.
 - `FCD_MAX_UPLOAD_BYTES` enforces maximum uploaded artifact size.
 - `FCD_ALLOWED_UPLOAD_CONTENT_TYPES` restricts evidence uploads by MIME type.
@@ -79,7 +105,10 @@ Notes:
 - `FCD_DATA_RETENTION_CRON_SCHEDULE` declares the retention review cadence surfaced by startup validation and reporting.
 
 ### Web Interface
-- Open `http://127.0.0.1:8000/` for the overview dashboard.
+- Live public shell: `http://127.0.0.1:8000/`
+- Public creditor page: `http://127.0.0.1:8000/creditor`
+- Public debtor page: `http://127.0.0.1:8000/debtor`
+- Open `http://127.0.0.1:8000/ui/dashboard` for the overview dashboard.
 - Open `http://127.0.0.1:8000/ui/cases` for the dedicated case board.
 - Open `http://127.0.0.1:8000/ui/debtors` for debtor-oriented segmentation and portal review.
 - Open `http://127.0.0.1:8000/ui/creditors` for creditor-facing exposure and formal-stage review.
@@ -98,6 +127,22 @@ python -m unpaid_invoice_escalator.cli startup-config-report --db-path data\esca
 python -m unpaid_invoice_escalator.cli retention-queue --db-path data\escalator.db
 python -m unpaid_invoice_escalator.cli company-status-check --db-path data\escalator.db --invoice-id inv-1 --checked-by USER-1 --company-status ACTIVE --source COMPANIES_HOUSE --evidence-summary "Register reviewed"
 ```
+
+## Docker build and run
+
+```powershell
+docker build -t p26003-live-shell .
+docker run --rm -p 8000:8000 p26003-live-shell
+```
+
+Container entry point:
+
+- `uvicorn unpaid_invoice_escalator.live_app:app --host 0.0.0.0 --port 8000`
+
+Important warning:
+
+- the current container is suitable for pre-deployment validation of the live shell and mounted core app;
+- PostgreSQL, Blob/object storage, and human authentication are still required before real customer production data should be used.
 
 ## Run workflow admin scripts
 

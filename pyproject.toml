@@ -19,6 +19,7 @@ dependencies = [
 [project.scripts]
 invoice-escalator = "unpaid_invoice_escalator.cli:main"
 invoice-escalator-api = "unpaid_invoice_escalator.api:main"
+invoice-escalator-live = "unpaid_invoice_escalator.live_app:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
