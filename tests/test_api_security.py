@@ -258,42 +258,48 @@ class TestApiSecurity(unittest.TestCase):
             )
             self.assertEqual(create_resp.status_code, 200)
 
-            manifest_resp = client.post(
+            for manifest_filename in (
+                "..\\evil.json",
+                "../evil.json",
+                "nested\\path.json",
+                "nested/path.json",
+                "C:\\evil.json",
+                "/tmp/evil.json",
+            ):
+                manifest_resp = client.post(
+                    "/invoices/inv-sec-path/ledger-manifests",
+                    headers={"x-api-key": "operator-key"},
+                    json={"output_filename": manifest_filename},
+                )
+                self.assertEqual(manifest_resp.status_code, 400)
+                self.assertIn("simple filename", manifest_resp.json()["detail"])
+
+            for bundle_filename in (
+                "..\\evil.pdf",
+                "../evil.pdf",
+                "nested\\path.pdf",
+                "nested/path.pdf",
+                "C:\\evil.pdf",
+                "/tmp/evil.pdf",
+            ):
+                bundle_resp = client.post(
+                    "/invoices/inv-sec-path/evidence-bundles",
+                    headers={"x-api-key": "operator-key"},
+                    json={
+                        "communications": ["Reminder"],
+                        "formal_notices": ["Letter"],
+                        "output_filename": bundle_filename,
+                    },
+                )
+                self.assertEqual(bundle_resp.status_code, 400)
+                self.assertIn("simple filename", bundle_resp.json()["detail"])
+
+            valid_manifest_resp = client.post(
                 "/invoices/inv-sec-path/ledger-manifests",
                 headers={"x-api-key": "operator-key"},
-                json={"output_filename": "..\\evil.json"},
+                json={"output_filename": "ledger_manifest.json"},
             )
-            self.assertEqual(manifest_resp.status_code, 400)
-            self.assertIn("simple filename", manifest_resp.json()["detail"])
-
-            absolute_manifest_resp = client.post(
-                "/invoices/inv-sec-path/ledger-manifests",
-                headers={"x-api-key": "operator-key"},
-                json={"output_filename": "C:\\evil.json"},
-            )
-            self.assertEqual(absolute_manifest_resp.status_code, 400)
-
-            bundle_resp = client.post(
-                "/invoices/inv-sec-path/evidence-bundles",
-                headers={"x-api-key": "operator-key"},
-                json={
-                    "communications": ["Reminder"],
-                    "formal_notices": ["Letter"],
-                    "output_filename": "..\\evil.pdf",
-                },
-            )
-            self.assertEqual(bundle_resp.status_code, 400)
-
-            absolute_bundle_resp = client.post(
-                "/invoices/inv-sec-path/evidence-bundles",
-                headers={"x-api-key": "operator-key"},
-                json={
-                    "communications": ["Reminder"],
-                    "formal_notices": ["Letter"],
-                    "output_filename": "C:\\evil.pdf",
-                },
-            )
-            self.assertEqual(absolute_bundle_resp.status_code, 400)
+            self.assertEqual(valid_manifest_resp.status_code, 200)
 
     def test_bank_detail_dual_control_requires_distinct_authenticated_identities(self) -> None:
         with TemporaryDirectory() as tmp_dir:

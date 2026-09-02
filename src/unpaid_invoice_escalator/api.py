@@ -940,7 +940,13 @@ def _validate_export_filename(filename: str, *, field_name: str) -> str:
     candidate = filename.strip()
     if not candidate:
         raise HTTPException(status_code=400, detail=f"{field_name} must not be empty.")
-    if Path(candidate).name != candidate or candidate.startswith(("/", "\\")):
+    if (
+        "/" in candidate
+        or "\\" in candidate
+        or re.match(r"^[A-Za-z]:", candidate)
+        or candidate in {".", ".."}
+        or Path(candidate).name != candidate
+    ):
         raise HTTPException(status_code=400, detail=f"{field_name} must be a simple filename.")
     if not SAFE_UPLOAD_FILENAME_RE.match(candidate):
         raise HTTPException(
