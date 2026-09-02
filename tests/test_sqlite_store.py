@@ -200,6 +200,59 @@ class TestSQLiteStore(unittest.TestCase):
             self.assertEqual(len(store.events_for_invoice(invoice.invoice_id)), 1)
             self.assertTrue(store.verify_chain(invoice.invoice_id))
 
+    def test_foreign_key_pragmas_are_enabled_for_app_connections(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "fk-pragmas.db")
+            store = SQLiteStore(db_path)
+            conn = store._connection()
+            try:
+                first = conn.__enter__()
+                self.assertEqual(first.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            finally:
+                conn.__exit__(None, None, None)
+
+            direct_conn = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(direct_conn.execute("PRAGMA foreign_keys").fetchone()[0], 0)
+                direct_conn.execute("PRAGMA foreign_keys = ON")
+                self.assertEqual(direct_conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            finally:
+                direct_conn.close()
+
+    def test_foreign_key_constraints_are_enforced(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "fk-enforced.db")
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)")
+                conn.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))")
+                conn.execute("INSERT INTO parent (id, name) VALUES (1, 'parent')")
+                conn.execute("INSERT INTO child (id, parent_id) VALUES (1, 1)")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute("INSERT INTO child (id, parent_id) VALUES (2, 99)")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute("DELETE FROM parent WHERE id = 1")
+            finally:
+                conn.close()
+
+    def test_foreign_key_delete_and_update_rejections_follow_schema_rules(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "fk-behaviour.db")
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)")
+                conn.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE RESTRICT ON UPDATE RESTRICT)")
+                conn.execute("INSERT INTO parent (id, name) VALUES (1, 'parent')")
+                conn.execute("INSERT INTO child (id, parent_id) VALUES (1, 1)")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute("DELETE FROM parent WHERE id = 1")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute("UPDATE parent SET id = 10 WHERE id = 1")
+            finally:
+                conn.close()
+
     def test_invoice_balance_reaches_zero_after_full_payment(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "escalator-settled.db")

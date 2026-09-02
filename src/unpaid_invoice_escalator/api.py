@@ -1207,6 +1207,7 @@ def create_app(
         try:
             conn = sqlite3.connect(db_path)
             try:
+                conn.execute("PRAGMA foreign_keys = ON")
                 conn.execute("SELECT 1").fetchone()
             finally:
                 conn.close()
@@ -1276,6 +1277,7 @@ def create_app(
         try:
             conn = sqlite3.connect(db_path)
             try:
+                conn.execute("PRAGMA foreign_keys = ON")
                 rows = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_%'"
                 ).fetchall()
