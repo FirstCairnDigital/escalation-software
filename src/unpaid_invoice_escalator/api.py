@@ -67,6 +67,7 @@ from unpaid_invoice_escalator.services.resolution_settlement_engine import Resol
 from unpaid_invoice_escalator.services.resolution_artifact_generator import ResolutionArtifactGenerator
 from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
 from unpaid_invoice_escalator.services.viability_proportionality_calculator import ViabilityProportionalityCalculator
+from unpaid_invoice_escalator.production_config import resolve_runtime_config
 from unpaid_invoice_escalator.security import ApiSecurityController, ROLE_RANK
 from unpaid_invoice_escalator.tenant_context import current_client_id, current_identity, current_role, reset_request_context, set_request_context
 from unpaid_invoice_escalator.ui import (
@@ -969,65 +970,64 @@ def create_app(
     allowed_upload_extensions: tuple[str, ...] | None = None,
     quarantine_dir: str | None = None,
 ) -> FastAPI:
-    effective_env = (app_env or os.getenv("FCD_APP_ENV", "development")).strip().lower()
-    if manifest_signing_key == "dev-only-signing-key":
-        manifest_signing_key = os.getenv("FCD_MANIFEST_SIGNING_KEY", manifest_signing_key)
-    manifest_key_id = os.getenv("FCD_MANIFEST_KEY_ID", manifest_key_id)
-    if effective_env == "production" and manifest_signing_key == "dev-only-signing-key":
-        raise ValueError("Production mode requires FCD_MANIFEST_SIGNING_KEY or explicit manifest_signing_key.")
+    configured_env = dict(os.environ)
+    if app_env is not None:
+        configured_env["FCD_APP_ENV"] = app_env
+    if manifest_signing_key != "dev-only-signing-key":
+        configured_env["FCD_MANIFEST_SIGNING_KEY"] = manifest_signing_key
+    if manifest_key_id != "fcd-local-key":
+        configured_env["FCD_MANIFEST_KEY_ID"] = manifest_key_id
+    if rate_limit_per_minute is not None:
+        configured_env["FCD_RATE_LIMIT_PER_MINUTE"] = str(rate_limit_per_minute)
+    if auth_failure_alert_threshold is not None:
+        configured_env["FCD_AUTH_FAILURE_ALERT_THRESHOLD"] = str(auth_failure_alert_threshold)
+    if rate_limit_alert_threshold is not None:
+        configured_env["FCD_RATE_LIMIT_ALERT_THRESHOLD"] = str(rate_limit_alert_threshold)
+    if server_error_alert_threshold is not None:
+        configured_env["FCD_SERVER_ERROR_ALERT_THRESHOLD"] = str(server_error_alert_threshold)
+    if max_upload_bytes is not None:
+        configured_env["FCD_MAX_UPLOAD_BYTES"] = str(max_upload_bytes)
+    if allowed_upload_content_types is not None:
+        configured_env["FCD_ALLOWED_UPLOAD_CONTENT_TYPES"] = ",".join(allowed_upload_content_types)
+    if allowed_upload_extensions is not None:
+        configured_env["FCD_ALLOWED_UPLOAD_EXTENSIONS"] = ",".join(allowed_upload_extensions)
+    if quarantine_dir is not None:
+        configured_env["FCD_QUARANTINE_DIR"] = quarantine_dir
+    configured_env["DATABASE_URL"] = db_path
 
-    effective_auth_enabled = auth_enabled if auth_enabled is not None else effective_env == "production"
-    configured_keys = api_keys
-    if configured_keys is None:
-        raw_api_keys = os.getenv("FCD_API_KEYS", "")
-        configured_keys = _parse_api_keys(raw_api_keys) if raw_api_keys.strip() else {}
-    configured_clients = api_clients
-    if configured_clients is None:
-        raw_api_clients = os.getenv("FCD_API_CLIENTS", "")
-        configured_clients = _parse_key_map(raw_api_clients, field_name="FCD_API_CLIENTS") if raw_api_clients.strip() else {}
+    runtime_cfg = resolve_runtime_config(configured_env, default_app_env="development", auth_enabled=auth_enabled)
+    effective_env = runtime_cfg["app_env"].lower()
+    manifest_signing_key = runtime_cfg["manifest_signing_key"]
+    manifest_key_id = runtime_cfg["manifest_key_id"]
+    effective_auth_enabled = runtime_cfg["auth_enabled"]
+    configured_keys = api_keys if api_keys is not None else runtime_cfg["api_keys"]
+    configured_clients = api_clients if api_clients is not None else runtime_cfg["api_clients"]
     if not configured_clients and configured_keys:
         configured_clients = _default_client_map(configured_keys)
     if effective_auth_enabled and not configured_keys:
         raise ValueError("Authentication is enabled but no API keys were configured.")
+    if effective_env == "production" and manifest_signing_key == "dev-only-signing-key":
+        raise ValueError("Production mode requires FCD_MANIFEST_SIGNING_KEY or explicit manifest_signing_key.")
 
-    effective_rate_limit = rate_limit_per_minute
-    if effective_rate_limit is None:
-        effective_rate_limit = int(os.getenv("FCD_RATE_LIMIT_PER_MINUTE", "120"))
+    effective_rate_limit = runtime_cfg["rate_limit_per_minute"]
     verification_keys = dict(manifest_verification_keys or {})
     if not verification_keys:
-        raw_verification_keys = os.getenv("FCD_MANIFEST_VERIFY_KEYS", "")
-        if raw_verification_keys.strip():
-            verification_keys = _parse_key_map(raw_verification_keys, field_name="FCD_MANIFEST_VERIFY_KEYS")
+        verification_keys = dict(runtime_cfg["manifest_verification_keys"])
+    if not verification_keys:
+        verification_keys = {manifest_key_id: manifest_signing_key}
     verification_keys.setdefault(manifest_key_id, manifest_signing_key)
 
-    effective_auth_failure_threshold = auth_failure_alert_threshold
-    if effective_auth_failure_threshold is None:
-        effective_auth_failure_threshold = int(os.getenv("FCD_AUTH_FAILURE_ALERT_THRESHOLD", "10"))
-    effective_rate_limit_threshold = rate_limit_alert_threshold
-    if effective_rate_limit_threshold is None:
-        effective_rate_limit_threshold = int(os.getenv("FCD_RATE_LIMIT_ALERT_THRESHOLD", "10"))
-    effective_server_error_threshold = server_error_alert_threshold
-    if effective_server_error_threshold is None:
-        effective_server_error_threshold = int(os.getenv("FCD_SERVER_ERROR_ALERT_THRESHOLD", "5"))
-    effective_max_upload_bytes = max_upload_bytes
-    if effective_max_upload_bytes is None:
-        effective_max_upload_bytes = int(os.getenv("FCD_MAX_UPLOAD_BYTES", "5242880"))
-    effective_allowed_upload_content_types = allowed_upload_content_types
-    if effective_allowed_upload_content_types is None:
-        raw_upload_types = os.getenv(
-            "FCD_ALLOWED_UPLOAD_CONTENT_TYPES",
-            "application/pdf,text/plain,image/png,image/jpeg",
-        )
-        effective_allowed_upload_content_types = _parse_csv_tokens(raw_upload_types)
+    effective_auth_failure_threshold = runtime_cfg["auth_failure_alert_threshold"]
+    effective_rate_limit_threshold = runtime_cfg["rate_limit_alert_threshold"]
+    effective_server_error_threshold = runtime_cfg["server_error_alert_threshold"]
+    effective_max_upload_bytes = runtime_cfg["max_upload_bytes"]
+    effective_allowed_upload_content_types = runtime_cfg["allowed_upload_content_types"]
     allowed_upload_content_type_set = {item.lower() for item in effective_allowed_upload_content_types}
-    effective_allowed_upload_extensions = allowed_upload_extensions
-    if effective_allowed_upload_extensions is None:
-        raw_upload_extensions = os.getenv("FCD_ALLOWED_UPLOAD_EXTENSIONS", ".pdf,.txt,.png,.jpg,.jpeg")
-        effective_allowed_upload_extensions = tuple(token.lower() for token in _parse_csv_tokens(raw_upload_extensions))
+    effective_allowed_upload_extensions = runtime_cfg["allowed_upload_extensions"]
     allowed_upload_extension_set = {token.lower() for token in effective_allowed_upload_extensions}
-    effective_quarantine_dir = quarantine_dir or os.getenv("FCD_QUARANTINE_DIR", "data/quarantine")
-    effective_data_retention_days = int(os.getenv("FCD_DATA_RETENTION_DAYS", "2190"))
-    effective_data_retention_cron_schedule = str(os.getenv("FCD_DATA_RETENTION_CRON_SCHEDULE", "") or "").strip()
+    effective_quarantine_dir = runtime_cfg["quarantine_dir"]
+    effective_data_retention_days = runtime_cfg["data_retention_days"]
+    effective_data_retention_cron_schedule = str(runtime_cfg["data_retention_cron_schedule"] or "").strip()
     if effective_data_retention_days <= 0:
         raise ValueError("FCD_DATA_RETENTION_DAYS must be a positive integer.")
 

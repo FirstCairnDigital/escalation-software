@@ -2610,6 +2610,71 @@ class TestApi(unittest.TestCase):
         self.assertEqual(valid["manifest_key_id"], "fcd-kms-key-1")
         self.assertEqual(valid["data_retention_cron_schedule"], "0 2 * * *")
 
+    def test_validate_production_config_prefers_canonical_over_legacy_aliases(self) -> None:
+        config = validate_production_config(
+            {
+                "FCD_APP_ENV": "production",
+                "FCD_MANIFEST_SIGNING_KEY": "C" * 32,
+                "CRYPTO_SIGNING_KEY": "LEGACY-SECRET",
+                "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
+                "FCD_API_KEYS": "admin-key:admin",
+                "SBC_API_KEY": "legacy-key",
+                "FCD_DATA_RETENTION_CRON_SCHEDULE": "0 2 * * *",
+                "DATA_RETENTION_CRON_SCHEDULE": "0 3 * * *",
+                "FCD_RATE_LIMIT_PER_MINUTE": "60",
+                "FCD_AUTH_FAILURE_ALERT_THRESHOLD": "8",
+                "FCD_RATE_LIMIT_ALERT_THRESHOLD": "6",
+                "FCD_SERVER_ERROR_ALERT_THRESHOLD": "4",
+                "FCD_MAX_UPLOAD_BYTES": "1048576",
+                "FCD_ALLOWED_UPLOAD_CONTENT_TYPES": "application/pdf",
+                "FCD_ALLOWED_UPLOAD_EXTENSIONS": ".pdf",
+                "FCD_QUARANTINE_DIR": "data/quarantine",
+                "FCD_DATA_RETENTION_DAYS": "365",
+            }
+        )
+        self.assertTrue(config["valid"])
+        self.assertEqual(config["crypto_signing_key_present"], True)
+        self.assertEqual(config["data_retention_cron_schedule"], "0 2 * * *")
+        warning_text = "\n".join(config["warnings"])
+        self.assertIn("legacy alias", warning_text)
+        self.assertIn("FCD_API_KEYS", warning_text)
+        self.assertIn("FCD_DATA_RETENTION_CRON_SCHEDULE", warning_text)
+
+    def test_ready_report_uses_runtime_configuration_without_exposing_secrets(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            previous_schedule = os.environ.get("FCD_DATA_RETENTION_CRON_SCHEDULE")
+            os.environ["FCD_DATA_RETENTION_CRON_SCHEDULE"] = "0 2 * * *"
+            try:
+                db_path = str(Path(tmp_dir) / "api-config-ready.db")
+                app = create_app(
+                    db_path=db_path,
+                    artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                    bundles_dir=str(Path(tmp_dir) / "bundles"),
+                    manifest_signing_key="A" * 32,
+                    manifest_key_id="fcd-ready-key",
+                    auth_enabled=True,
+                    api_keys={"admin-key": "admin"},
+                    rate_limit_per_minute=77,
+                    max_upload_bytes=4321,
+                    allowed_upload_content_types=("application/pdf",),
+                    allowed_upload_extensions=(".pdf",),
+                    quarantine_dir=str(Path(tmp_dir) / "quarantine"),
+                    app_env="production",
+                )
+                ready = TestClient(app).get("/ready")
+            finally:
+                if previous_schedule is None:
+                    os.environ.pop("FCD_DATA_RETENTION_CRON_SCHEDULE", None)
+                else:
+                    os.environ["FCD_DATA_RETENTION_CRON_SCHEDULE"] = previous_schedule
+            self.assertEqual(ready.status_code, 200)
+            payload = ready.json()
+            self.assertEqual(payload["manifest_key_id"], "fcd-ready-key")
+            self.assertEqual(payload["rate_limit_per_minute"], 77)
+            self.assertEqual(payload["max_upload_bytes"], 4321)
+            self.assertNotIn("A" * 32, str(payload))
+            self.assertNotIn("manifest_signing_key", str(payload))
+
     def test_data_retention_disposal_partial_failure_is_audited_and_retryable(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "api-retention-partial.db")

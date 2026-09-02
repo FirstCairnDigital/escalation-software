@@ -1,4 +1,7 @@
 from __future__ import annotations
+#
+# First Cairn Digital
+# P26003 production configuration consolidation
 
 import os
 from typing import Any, Mapping
@@ -23,16 +26,159 @@ def _key_map(value: str) -> dict[str, str]:
     return mapping
 
 
-def _env_value(env: Mapping[str, Any], primary: str, *aliases: str, default: str = "") -> tuple[str, str | None]:
+def _env_value(env: Mapping[str, Any], primary: str, *aliases: str, default: str = "") -> tuple[str, str | None, bool]:
     for key in (primary, *aliases):
+        if key not in env:
+            continue
         raw = env.get(key)
-        value = str(raw or "").strip()
-        if value:
-            return value, None if key == primary else key
-    return default, None
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if value or key == primary or len((primary, *aliases)) == 1:
+            return value, None if key == primary else key, key == primary
+    return default, None, False
 
 
-def validate_production_config(env: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def resolve_runtime_config(
+    env: Mapping[str, Any] | None = None,
+    *,
+    default_app_env: str = "development",
+    auth_enabled: bool | None = None,
+    database_url: str | None = None,
+) -> dict[str, Any]:
+    effective_env = dict(env or os.environ)
+    if database_url is not None:
+        effective_env["DATABASE_URL"] = database_url
+
+    app_env, _, _ = _env_value(effective_env, "FCD_APP_ENV", default=default_app_env)
+    app_env = (app_env or default_app_env).strip() or default_app_env
+    effective_auth_enabled = auth_enabled if auth_enabled is not None else app_env.lower() == "production"
+
+    manifest_signing_key, signing_key_alias, primary_manifest_key = _env_value(
+        effective_env,
+        "FCD_MANIFEST_SIGNING_KEY",
+        "CRYPTO_SIGNING_KEY",
+        default="dev-only-signing-key",
+    )
+    manifest_key_id, _, _ = _env_value(effective_env, "FCD_MANIFEST_KEY_ID", default="fcd-local-key")
+    manifest_verification_keys_raw, _, _ = _env_value(effective_env, "FCD_MANIFEST_VERIFY_KEYS")
+    api_keys_raw, api_keys_alias, api_keys_primary = _env_value(effective_env, "FCD_API_KEYS", "SBC_API_KEY")
+    rate_limit_raw, _, _ = _env_value(effective_env, "FCD_RATE_LIMIT_PER_MINUTE", default="120")
+    auth_failure_raw, _, _ = _env_value(effective_env, "FCD_AUTH_FAILURE_ALERT_THRESHOLD", default="10")
+    rate_limit_alert_raw, _, _ = _env_value(effective_env, "FCD_RATE_LIMIT_ALERT_THRESHOLD", default="10")
+    server_error_alert_raw, _, _ = _env_value(effective_env, "FCD_SERVER_ERROR_ALERT_THRESHOLD", default="5")
+    max_upload_raw, _, _ = _env_value(effective_env, "FCD_MAX_UPLOAD_BYTES", default="5242880")
+    upload_types_raw, _, _ = _env_value(
+        effective_env,
+        "FCD_ALLOWED_UPLOAD_CONTENT_TYPES",
+        default="application/pdf,text/plain,image/png,image/jpeg",
+    )
+    upload_extensions_raw, _, _ = _env_value(
+        effective_env,
+        "FCD_ALLOWED_UPLOAD_EXTENSIONS",
+        default=".pdf,.txt,.png,.jpg,.jpeg",
+    )
+    quarantine_dir, _, _ = _env_value(effective_env, "FCD_QUARANTINE_DIR", default="data/quarantine")
+    data_retention_days_raw, _, _ = _env_value(effective_env, "FCD_DATA_RETENTION_DAYS", default="2190")
+    data_retention_cron_schedule, cron_alias, cron_primary = _env_value(
+        effective_env,
+        "FCD_DATA_RETENTION_CRON_SCHEDULE",
+        "DATA_RETENTION_CRON_SCHEDULE",
+    )
+    database_url_value, _, _ = _env_value(effective_env, "DATABASE_URL")
+    sbc_endpoint, _, _ = _env_value(effective_env, "SBC_ENDPOINT")
+
+    def parse_positive_int(raw: str, *, field_name: str) -> int:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be an integer.") from exc
+        if value <= 0:
+            raise ValueError(f"{field_name} must be greater than zero.")
+        return value
+
+    try:
+        rate_limit_per_minute = parse_positive_int(rate_limit_raw, field_name="FCD_RATE_LIMIT_PER_MINUTE")
+    except ValueError:
+        rate_limit_per_minute = 0
+    try:
+        auth_failure_threshold = parse_positive_int(auth_failure_raw, field_name="FCD_AUTH_FAILURE_ALERT_THRESHOLD")
+    except ValueError:
+        auth_failure_threshold = 0
+    try:
+        rate_limit_alert_threshold = parse_positive_int(rate_limit_alert_raw, field_name="FCD_RATE_LIMIT_ALERT_THRESHOLD")
+    except ValueError:
+        rate_limit_alert_threshold = 0
+    try:
+        server_error_threshold = parse_positive_int(server_error_alert_raw, field_name="FCD_SERVER_ERROR_ALERT_THRESHOLD")
+    except ValueError:
+        server_error_threshold = 0
+    try:
+        max_upload_bytes = parse_positive_int(max_upload_raw, field_name="FCD_MAX_UPLOAD_BYTES")
+    except ValueError:
+        max_upload_bytes = 0
+    try:
+        data_retention_days = parse_positive_int(data_retention_days_raw, field_name="FCD_DATA_RETENTION_DAYS")
+    except ValueError:
+        data_retention_days = 0
+
+    upload_content_types = tuple(token.lower() for token in _csv_tokens(upload_types_raw))
+    upload_extensions = tuple(token.lower() for token in _csv_tokens(upload_extensions_raw))
+
+    if manifest_verification_keys_raw:
+        verification_keys = _key_map(manifest_verification_keys_raw)
+    else:
+        verification_keys = {}
+        if manifest_key_id and manifest_signing_key:
+            verification_keys[manifest_key_id] = manifest_signing_key
+
+    if api_keys_raw:
+        if api_keys_primary:
+            api_keys = _key_map(api_keys_raw)
+        else:
+            api_keys = {"legacy-credential": api_keys_raw}
+    else:
+        api_keys = {}
+
+    legacy_aliases: dict[str, str] = {}
+    if str(effective_env.get("CRYPTO_SIGNING_KEY") or "").strip():
+        legacy_aliases["manifest_signing_key"] = "CRYPTO_SIGNING_KEY"
+    if str(effective_env.get("SBC_API_KEY") or "").strip():
+        legacy_aliases["api_keys"] = "SBC_API_KEY"
+    if str(effective_env.get("DATA_RETENTION_CRON_SCHEDULE") or "").strip():
+        legacy_aliases["data_retention_cron_schedule"] = "DATA_RETENTION_CRON_SCHEDULE"
+    if signing_key_alias is not None and not primary_manifest_key and not legacy_aliases.get("manifest_signing_key"):
+        legacy_aliases["manifest_signing_key"] = signing_key_alias
+    if api_keys_alias is not None and not api_keys_primary and not legacy_aliases.get("api_keys"):
+        legacy_aliases["api_keys"] = api_keys_alias
+    if cron_alias is not None and not cron_primary and not legacy_aliases.get("data_retention_cron_schedule"):
+        legacy_aliases["data_retention_cron_schedule"] = cron_alias
+
+    return {
+        "app_env": app_env,
+        "auth_enabled": effective_auth_enabled,
+        "manifest_signing_key": manifest_signing_key,
+        "manifest_key_id": manifest_key_id,
+        "manifest_verification_keys": verification_keys,
+        "api_keys": api_keys,
+        "api_clients": {},
+        "rate_limit_per_minute": rate_limit_per_minute,
+        "auth_failure_alert_threshold": auth_failure_threshold,
+        "rate_limit_alert_threshold": rate_limit_alert_threshold,
+        "server_error_alert_threshold": server_error_threshold,
+        "max_upload_bytes": max_upload_bytes,
+        "allowed_upload_content_types": upload_content_types,
+        "allowed_upload_extensions": upload_extensions,
+        "quarantine_dir": quarantine_dir,
+        "data_retention_days": data_retention_days,
+        "data_retention_cron_schedule": data_retention_cron_schedule,
+        "database_url": database_url_value or "",
+        "sbc_endpoint": sbc_endpoint,
+        "legacy_aliases": legacy_aliases,
+    }
+
+
+def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_enabled: bool | None = None) -> dict[str, Any]:
     effective_env = dict(env or os.environ)
     errors: list[str] = []
     warnings: list[str] = []
@@ -47,40 +193,25 @@ def validate_production_config(env: Mapping[str, Any] | None = None) -> dict[str
         else:
             warnings.append(detail)
 
-    app_env, _ = _env_value(effective_env, "FCD_APP_ENV", default="production")
-    manifest_signing_key, signing_key_alias = _env_value(
-        effective_env,
-        "FCD_MANIFEST_SIGNING_KEY",
-        "CRYPTO_SIGNING_KEY",
-        default="dev-only-signing-key",
-    )
-    manifest_key_id, _ = _env_value(effective_env, "FCD_MANIFEST_KEY_ID", default="fcd-local-key")
-    manifest_verify_keys, _ = _env_value(effective_env, "FCD_MANIFEST_VERIFY_KEYS")
-    api_keys_raw, api_keys_alias = _env_value(effective_env, "FCD_API_KEYS", "SBC_API_KEY")
-    rate_limit_raw, _ = _env_value(effective_env, "FCD_RATE_LIMIT_PER_MINUTE", default="120")
-    auth_failure_raw, _ = _env_value(effective_env, "FCD_AUTH_FAILURE_ALERT_THRESHOLD", default="10")
-    rate_limit_alert_raw, _ = _env_value(effective_env, "FCD_RATE_LIMIT_ALERT_THRESHOLD", default="10")
-    server_error_alert_raw, _ = _env_value(effective_env, "FCD_SERVER_ERROR_ALERT_THRESHOLD", default="5")
-    max_upload_raw, _ = _env_value(effective_env, "FCD_MAX_UPLOAD_BYTES", default="5242880")
-    upload_types_raw, _ = _env_value(
-        effective_env,
-        "FCD_ALLOWED_UPLOAD_CONTENT_TYPES",
-        default="application/pdf,text/plain,image/png,image/jpeg",
-    )
-    upload_extensions_raw, _ = _env_value(
-        effective_env,
-        "FCD_ALLOWED_UPLOAD_EXTENSIONS",
-        default=".pdf,.txt,.png,.jpg,.jpeg",
-    )
-    quarantine_dir, _ = _env_value(effective_env, "FCD_QUARANTINE_DIR", default="data/quarantine")
-    data_retention_days_raw, _ = _env_value(effective_env, "FCD_DATA_RETENTION_DAYS", default="2190")
-    data_retention_cron_schedule, cron_alias = _env_value(
-        effective_env,
-        "FCD_DATA_RETENTION_CRON_SCHEDULE",
-        "DATA_RETENTION_CRON_SCHEDULE",
-    )
-    database_url, _ = _env_value(effective_env, "DATABASE_URL")
-    sbc_endpoint, _ = _env_value(effective_env, "SBC_ENDPOINT")
+    runtime = resolve_runtime_config(effective_env, default_app_env="production", auth_enabled=auth_enabled)
+    app_env = runtime["app_env"]
+    manifest_signing_key = runtime["manifest_signing_key"]
+    manifest_key_id = runtime["manifest_key_id"]
+    verification_keys = runtime["manifest_verification_keys"]
+    api_keys = runtime["api_keys"]
+    rate_limit_per_minute = runtime["rate_limit_per_minute"]
+    auth_failure_threshold = runtime["auth_failure_alert_threshold"]
+    rate_limit_alert_threshold = runtime["rate_limit_alert_threshold"]
+    server_error_threshold = runtime["server_error_alert_threshold"]
+    max_upload_bytes = runtime["max_upload_bytes"]
+    upload_types = runtime["allowed_upload_content_types"]
+    upload_extensions = runtime["allowed_upload_extensions"]
+    quarantine_dir = runtime["quarantine_dir"]
+    data_retention_days = runtime["data_retention_days"]
+    data_retention_cron_schedule = runtime["data_retention_cron_schedule"]
+    database_url = runtime["database_url"]
+    sbc_endpoint = runtime["sbc_endpoint"]
+    legacy_aliases = runtime["legacy_aliases"]
 
     record(
         "environment",
@@ -98,86 +229,52 @@ def validate_production_config(env: Mapping[str, Any] | None = None) -> dict[str
         if manifest_signing_key == "dev-only-signing-key"
         else "Manifest signing key configured.",
     )
-    if signing_key_alias is not None:
+    if "manifest_signing_key" in legacy_aliases:
         record(
             "manifest-signing-key-legacy-alias",
             False,
             "warning",
-            f"{signing_key_alias} was used as a legacy alias; migrate to FCD_MANIFEST_SIGNING_KEY.",
+            f"{legacy_aliases['manifest_signing_key']} was used as a legacy alias; migrate to FCD_MANIFEST_SIGNING_KEY.",
         )
     record(
         "manifest-key-id",
         bool(manifest_key_id),
         "error",
-        "FCD_MANIFEST_KEY_ID is required."
-        if not manifest_key_id
-        else "Manifest key ID configured.",
+        "FCD_MANIFEST_KEY_ID is required." if not manifest_key_id else "Manifest key ID configured.",
     )
-    if manifest_verify_keys:
-        try:
-            verification_keys = _key_map(manifest_verify_keys)
-        except ValueError as exc:
-            verification_keys = {}
-            record("manifest-verification-keys", False, "error", f"FCD_MANIFEST_VERIFY_KEYS invalid: {exc}")
-        else:
-            record("manifest-verification-keys", True, "warning", "Manifest verification key ring configured.")
+    if verification_keys:
+        record("manifest-verification-keys", True, "warning", "Manifest verification key ring configured.")
     else:
-        verification_keys = {manifest_key_id: manifest_signing_key} if manifest_key_id and manifest_signing_key else {}
         record(
             "manifest-verification-keys",
-            bool(verification_keys),
+            False,
             "warning",
-            "No explicit FCD_MANIFEST_VERIFY_KEYS configured; active signing key will be the only verifier."
-            if verification_keys
-            else "Manifest verification keys are unavailable.",
+            "No explicit FCD_MANIFEST_VERIFY_KEYS configured; active signing key will be the only verifier.",
         )
-    if api_keys_raw:
-        if api_keys_alias is None:
-            try:
-                api_keys = _key_map(api_keys_raw)
-            except ValueError as exc:
-                api_keys = {}
-                record("api-keys-configured", False, "error", f"FCD_API_KEYS invalid: {exc}")
-            else:
-                record("api-keys-configured", True, "error", "API keys configured for secured mode.")
-        else:
-            api_keys = {"legacy-credential": api_keys_raw}
-            record(
-                "api-keys-configured",
-                True,
-                "warning",
-                f"{api_keys_alias} is present, but production API auth should migrate to FCD_API_KEYS.",
-            )
-    else:
-        api_keys = {}
-        record("api-keys-configured", False, "error", "FCD_API_KEYS is required for secured production operation.")
+    record(
+        "api-keys-configured",
+        bool(api_keys),
+        "error",
+        "API keys configured for secured mode." if api_keys else "FCD_API_KEYS is required for secured production operation.",
+    )
+    if "api_keys" in legacy_aliases:
+        record(
+            "api-keys-configured-legacy-alias",
+            False,
+            "warning",
+            f"{legacy_aliases['api_keys']} is present, but production API auth should migrate to FCD_API_KEYS.",
+        )
 
-    def parse_positive_int(raw: str, *, field_name: str) -> int:
-        try:
-            value = int(raw)
-        except ValueError as exc:
-            raise ValueError(f"{field_name} must be an integer.") from exc
-        if value <= 0:
-            raise ValueError(f"{field_name} must be greater than zero.")
-        return value
-
-    parsed_values: dict[str, int] = {}
     for check_name, env_name, raw_value, severity in (
-        ("rate-limit-per-minute", "FCD_RATE_LIMIT_PER_MINUTE", rate_limit_raw, "error"),
-        ("auth-failure-alert-threshold", "FCD_AUTH_FAILURE_ALERT_THRESHOLD", auth_failure_raw, "warning"),
-        ("rate-limit-alert-threshold", "FCD_RATE_LIMIT_ALERT_THRESHOLD", rate_limit_alert_raw, "warning"),
-        ("server-error-alert-threshold", "FCD_SERVER_ERROR_ALERT_THRESHOLD", server_error_alert_raw, "warning"),
-        ("max-upload-bytes", "FCD_MAX_UPLOAD_BYTES", max_upload_raw, "error"),
-        ("data-retention-days", "FCD_DATA_RETENTION_DAYS", data_retention_days_raw, "error"),
+        ("rate-limit-per-minute", "FCD_RATE_LIMIT_PER_MINUTE", rate_limit_per_minute, "error"),
+        ("auth-failure-alert-threshold", "FCD_AUTH_FAILURE_ALERT_THRESHOLD", auth_failure_threshold, "warning"),
+        ("rate-limit-alert-threshold", "FCD_RATE_LIMIT_ALERT_THRESHOLD", rate_limit_alert_threshold, "warning"),
+        ("server-error-alert-threshold", "FCD_SERVER_ERROR_ALERT_THRESHOLD", server_error_threshold, "warning"),
+        ("max-upload-bytes", "FCD_MAX_UPLOAD_BYTES", max_upload_bytes, "error"),
+        ("data-retention-days", "FCD_DATA_RETENTION_DAYS", data_retention_days, "error"),
     ):
-        try:
-            parsed_values[check_name] = parse_positive_int(raw_value, field_name=env_name)
-        except ValueError as exc:
-            record(check_name, False, severity, str(exc))
-        else:
-            record(check_name, True, severity, f"{env_name} set to {parsed_values[check_name]}.")
+        record(check_name, raw_value > 0, severity, f"{env_name} set to {raw_value}.")
 
-    upload_types = _csv_tokens(upload_types_raw)
     record(
         "allowed-upload-content-types",
         len(upload_types) > 0,
@@ -186,7 +283,6 @@ def validate_production_config(env: Mapping[str, Any] | None = None) -> dict[str
         if not upload_types
         else "Allowed upload content types configured.",
     )
-    upload_extensions = tuple(token.lower() for token in _csv_tokens(upload_extensions_raw))
     record(
         "allowed-upload-extensions",
         len(upload_extensions) > 0,
@@ -199,9 +295,7 @@ def validate_production_config(env: Mapping[str, Any] | None = None) -> dict[str
         "quarantine-dir",
         bool(quarantine_dir),
         "error",
-        "FCD_QUARANTINE_DIR is required."
-        if not quarantine_dir
-        else "Quarantine directory configured.",
+        "FCD_QUARANTINE_DIR is required." if not quarantine_dir else "Quarantine directory configured.",
     )
     record(
         "data-retention-cron-schedule",
@@ -211,31 +305,27 @@ def validate_production_config(env: Mapping[str, Any] | None = None) -> dict[str
         if not data_retention_cron_schedule
         else "Retention scheduler cron is configured.",
     )
-    if cron_alias is not None:
+    if "data_retention_cron_schedule" in legacy_aliases:
         record(
             "data-retention-cron-schedule-legacy-alias",
             False,
             "warning",
-            f"{cron_alias} was used as a legacy alias; migrate to FCD_DATA_RETENTION_CRON_SCHEDULE.",
+            f"{legacy_aliases['data_retention_cron_schedule']} was used as a legacy alias; migrate to FCD_DATA_RETENTION_CRON_SCHEDULE.",
         )
-
     if database_url:
+        database_tls_ok = _is_ssl_url(database_url)
         record(
             "database-url",
-            _is_ssl_url(database_url),
+            database_tls_ok,
             "warning",
-            "DATABASE_URL is configured with TLS/SSL."
-            if _is_ssl_url(database_url)
-            else "DATABASE_URL is present but does not enforce TLS/SSL.",
+            "DATABASE_URL is configured with TLS/SSL." if database_tls_ok else "DATABASE_URL is present but does not enforce TLS/SSL.",
         )
     if sbc_endpoint:
         record(
             "sbc-endpoint",
             sbc_endpoint.startswith(("http://", "https://")),
             "warning",
-            "SBC_ENDPOINT is configured."
-            if sbc_endpoint.startswith(("http://", "https://"))
-            else "SBC_ENDPOINT must be a valid HTTP(S) URL.",
+            "SBC_ENDPOINT is configured." if sbc_endpoint.startswith(("http://", "https://")) else "SBC_ENDPOINT must be a valid HTTP(S) URL.",
         )
 
     return {
@@ -244,18 +334,18 @@ def validate_production_config(env: Mapping[str, Any] | None = None) -> dict[str
         "errors": errors,
         "warnings": warnings,
         "checks": checks,
-        "auth_enabled": True,
+        "auth_enabled": runtime["auth_enabled"],
         "manifest_key_id": manifest_key_id,
         "verification_key_ids": sorted(verification_keys.keys()),
-        "rate_limit_per_minute": parsed_values.get("rate-limit-per-minute", 0),
-        "max_upload_bytes": parsed_values.get("max-upload-bytes", 0),
+        "rate_limit_per_minute": rate_limit_per_minute,
+        "max_upload_bytes": max_upload_bytes,
         "allowed_upload_content_types": list(upload_types),
         "allowed_upload_extensions": list(upload_extensions),
         "quarantine_dir": quarantine_dir,
-        "data_retention_days": parsed_values.get("data-retention-days", 0),
+        "data_retention_days": data_retention_days,
         "data_retention_cron_schedule": data_retention_cron_schedule,
         "database_url": database_url,
-        "sbc_api_key_present": bool(api_keys_raw),
+        "sbc_api_key_present": bool(api_keys),
         "sbc_endpoint": sbc_endpoint,
         "crypto_signing_key_present": bool(manifest_signing_key),
     }
