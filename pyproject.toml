@@ -1,3 +1,6 @@
+# First Cairn Digital
+# P26003 CI/CD and reproducible dependency checks
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -19,6 +22,16 @@ invoice-escalator-api = "unpaid_invoice_escalator.api:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+unpaid_invoice_escalator = [
+    "*.json",
+    "reference_data/*.json",
+    "rulepacks/*.json",
+    "rulepacks/packs/*.json",
+    "rulepacks/fee_packs/*.json",
+]
