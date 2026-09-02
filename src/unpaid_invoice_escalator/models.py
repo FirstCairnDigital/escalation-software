@@ -1,4 +1,7 @@
 from __future__ import annotations
+#
+# First Cairn Digital
+# P26003 retention disposal failure safety
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -27,6 +30,7 @@ class Actor(str, Enum):
 
 
 class ArtifactType(str, Enum):
+    INVOICE = "INVOICE"
     CONTRACT = "CONTRACT"
     PROOF_OF_DELIVERY = "PROOF_OF_DELIVERY"
     PAYMENT_EVIDENCE = "PAYMENT_EVIDENCE"

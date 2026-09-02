@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 from urllib.parse import quote
 
 from fastapi.testclient import TestClient
@@ -2608,6 +2609,87 @@ class TestApi(unittest.TestCase):
         self.assertTrue(valid["valid"])
         self.assertEqual(valid["manifest_key_id"], "fcd-kms-key-1")
         self.assertEqual(valid["data_retention_cron_schedule"], "0 2 * * *")
+
+    def test_data_retention_disposal_partial_failure_is_audited_and_retryable(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "api-retention-partial.db")
+            artifacts_dir = str(Path(tmp_dir) / "artifacts")
+            bundles_dir = str(Path(tmp_dir) / "bundles")
+            app = create_app(db_path=db_path, artifacts_dir=artifacts_dir, bundles_dir=bundles_dir)
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                json={
+                    "invoice_id": "inv-api-retention-partial",
+                    "currency": "GBP",
+                    "principal_amount": "150",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            first_upload = client.post(
+                "/invoices/inv-api-retention-partial/evidence-artifacts",
+                data={"user_id": "client-1", "artifact_type": "CONTRACT"},
+                files={"file": ("contract-a.txt", b"first file", "text/plain")},
+            )
+            second_upload = client.post(
+                "/invoices/inv-api-retention-partial/evidence-artifacts",
+                data={"user_id": "client-1", "artifact_type": "INVOICE"},
+                files={"file": ("contract-b.txt", b"second file", "text/plain")},
+            )
+            self.assertEqual(first_upload.status_code, 200)
+            self.assertEqual(second_upload.status_code, 200)
+
+            artifact_paths = [
+                Path(first_upload.json()["file_path"]),
+                Path(second_upload.json()["file_path"]),
+            ]
+            self.assertTrue(artifact_paths[0].exists())
+            self.assertTrue(artifact_paths[1].exists())
+
+            original_unlink = Path.unlink
+
+            def fail_second_delete(path_obj: Path, *args, **kwargs):
+                if str(path_obj) == str(artifact_paths[1]):
+                    raise OSError("simulated filesystem deletion failure")
+                return original_unlink(path_obj, *args, **kwargs)
+
+            with patch("pathlib.Path.unlink", autospec=True, side_effect=lambda self, *args, **kwargs: fail_second_delete(self, *args, **kwargs)):
+                partial_resp = client.post(
+                    "/invoices/inv-api-retention-partial/data-retention-disposals",
+                    json={"approved_by": "USER-1", "reason": "Scheduled retention cleanup", "as_of_date": "2035-01-01"},
+                )
+            self.assertEqual(partial_resp.status_code, 200)
+            self.assertEqual(partial_resp.json()["status"], "PARTIAL_FAILURE")
+            self.assertEqual(partial_resp.json()["deleted_file_count"], 1)
+            self.assertEqual(partial_resp.json()["failed_file_count"], 1)
+            self.assertEqual(partial_resp.json()["remaining_paths"], [str(artifact_paths[1])])
+            self.assertTrue(artifact_paths[1].exists())
+
+            compliance_resp = client.get("/invoices/inv-api-retention-partial/compliance-ledger")
+            self.assertEqual(compliance_resp.status_code, 200)
+            events = compliance_resp.json()["entries"]
+            event_types = {entry["event_type"] for entry in events}
+            self.assertIn("DATA_RETENTION_DISPOSAL_PARTIAL_FAILURE", event_types)
+            self.assertNotIn("DATA_RETENTION_DISPOSAL_EXECUTED", event_types)
+            partial_event = next(item for item in events if item["event_type"] == "DATA_RETENTION_DISPOSAL_PARTIAL_FAILURE")
+            self.assertEqual(partial_event["details"]["status"], "PARTIAL_FAILURE")
+            self.assertEqual(partial_event["details"]["remaining_paths"], [str(artifact_paths[1])])
+
+            retry_resp = client.post(
+                "/invoices/inv-api-retention-partial/data-retention-disposals",
+                json={"approved_by": "USER-1", "reason": "Retry remaining files", "as_of_date": "2035-01-01"},
+            )
+            self.assertEqual(retry_resp.status_code, 200)
+            self.assertEqual(retry_resp.json()["status"], "SUCCESS")
+            self.assertEqual(retry_resp.json()["deleted_file_count"], 1)
+            self.assertEqual(retry_resp.json()["failed_file_count"], 0)
+            self.assertFalse(artifact_paths[1].exists())
 
     def test_startup_report_exposes_retention_schedule(self) -> None:
         with TemporaryDirectory() as tmp_dir:

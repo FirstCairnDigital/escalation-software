@@ -4974,42 +4974,64 @@ def create_app(
             )
         artifacts = store.artifacts_for_invoice(invoice_id)
         deleted_paths: list[str] = []
+        failed_paths: list[dict[str, str]] = []
         missing_paths: list[str] = []
         for artifact in artifacts:
             path = Path(artifact.file_path)
             _ensure_managed_storage_path(path)
-            if path.exists():
+            if not path.exists():
+                missing_paths.append(str(path))
+                continue
+            try:
                 path.unlink()
                 deleted_paths.append(str(path))
-            else:
-                missing_paths.append(str(path))
+            except OSError as exc:
+                failed_paths.append({"path": str(path), "error": str(exc)})
+
         now = datetime.now(timezone.utc)
+        if failed_paths and not deleted_paths:
+            status = "FAILED"
+            event_type = "DATA_RETENTION_DISPOSAL_FAILED"
+        elif failed_paths:
+            status = "PARTIAL_FAILURE"
+            event_type = "DATA_RETENTION_DISPOSAL_PARTIAL_FAILURE"
+        else:
+            status = "SUCCESS"
+            event_type = "DATA_RETENTION_DISPOSAL_EXECUTED"
+
         details = {
             "approved_by": payload.approved_by,
             "reason": payload.reason,
             "as_of_date": review["as_of_date"],
             "retention_days_required": review["retention_days_required"],
+            "status": status,
             "deleted_file_count": len(deleted_paths),
+            "failed_file_count": len(failed_paths),
             "missing_file_count": len(missing_paths),
             "deleted_paths": deleted_paths,
+            "failed_paths": failed_paths,
+            "remaining_paths": [item["path"] for item in failed_paths],
             "missing_paths": missing_paths,
         }
+
         store.append_compliance_entry(
             ComplianceLedgerEntry(
                 entry_id=str(uuid4()),
                 invoice_id=invoice_id,
                 timestamp=now,
-                event_type="DATA_RETENTION_DISPOSAL_EXECUTED",
+                event_type=event_type,
                 details=details,
             )
         )
         _record_audit_trail(
             invoice_id,
             category="RETENTION",
-            action="DATA_RETENTION_DISPOSAL_EXECUTED",
+            action=event_type,
             actor=Actor.SYSTEM.value,
             details={
+                "status": status,
                 "deleted_file_count": len(deleted_paths),
+                "failed_file_count": len(failed_paths),
                 "missing_file_count": len(missing_paths),
                 "approved_by": payload.approved_by,
             },
@@ -5017,15 +5039,19 @@ def create_app(
         ledger.append_event(
             invoice_id=invoice_id,
             actor=Actor.SYSTEM,
-            event_type="DATA_RETENTION_DISPOSAL_EXECUTED",
+            event_type=event_type,
             timestamp=now,
             data_payload=details,
         )
         return {
             "invoice_id": invoice_id,
+            "status": status,
             "deleted_file_count": len(deleted_paths),
+            "failed_file_count": len(failed_paths),
             "missing_file_count": len(missing_paths),
             "deleted_paths": deleted_paths,
+            "failed_paths": failed_paths,
+            "remaining_paths": [item["path"] for item in failed_paths],
             "missing_paths": missing_paths,
         }
 
