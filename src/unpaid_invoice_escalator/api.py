@@ -626,6 +626,7 @@ def _portal_legal_advice_links() -> list[dict[str, str]]:
 def _render_verify_html(case_id: str | None, verification_code: str | None, valid: bool, message: str) -> str:
     title = "Verification check" if valid else "Verification failed"
     status = "Valid verification" if valid else "Verification failed"
+    meta_html = f'<div class="meta">Case ID: {case_id}</div>' if case_id else ""
     return f"""<!doctype html>
 <html lang=\"en\">
 <head>
@@ -649,7 +650,7 @@ def _render_verify_html(case_id: str | None, verification_code: str | None, vali
     <div class=\"badge {('error' if not valid else '')}\">{status}</div>
     <h1>First Cairn Digital case verification</h1>
     <p>{message}</p>
-    {f'<div class=\"meta\">Case ID: {case_id}</div>' if case_id else ''}
+    {meta_html}
     <div class=\"actions\">
       <a class=\"button\" href=\"/portal?case={case_id or ''}&code={verification_code or ''}\">Open debtor portal</a>
       <a class=\"button\" href=\"/\">Return to dashboard</a>
