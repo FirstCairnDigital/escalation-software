@@ -1,9 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 
 from unpaid_invoice_escalator.models import (
@@ -24,6 +26,7 @@ from unpaid_invoice_escalator.models import (
     DebtorType,
     Invoice,
     Jurisdiction,
+    LedgerEvent,
     PaymentPlanAgreement,
     PaymentPlanDecision,
     PaymentPlanDecisionStatus,
@@ -70,6 +73,131 @@ class TestSQLiteStore(unittest.TestCase):
             self.assertEqual(loaded.invoice_id, invoice.invoice_id)
             self.assertEqual(store.debtor_ledger_balance_for_invoice(invoice.invoice_id), Decimal("999.99"))
             self.assertEqual(store.debtor_ledger_entries_for_invoice(invoice.invoice_id)[0].entry_type, DebtorLedgerEntryType.ORIGINAL_PRINCIPAL)
+            self.assertTrue(store.verify_chain(invoice.invoice_id))
+
+    def test_ledger_events_remain_linear_during_concurrent_same_invoice_appends(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "ledger-concurrent-same.db")
+            store = SQLiteStore(db_path)
+            ledger = SQLiteInvoiceLedger(store)
+            invoice = Invoice(
+                invoice_id="inv-db-concurrent-same",
+                currency="GBP",
+                principal_amount=Decimal("1000"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            barrier = threading.Barrier(2)
+
+            def append_one(tag: str) -> None:
+                barrier.wait()
+                ledger.append_event(
+                    invoice_id=invoice.invoice_id,
+                    actor=Actor.SYSTEM,
+                    event_type=f"CONCURRENT_EVENT_{tag}",
+                    data_payload={"tag": tag},
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(append_one, str(index)) for index in range(2)]
+                for future in futures:
+                    future.result()
+
+            events = store.events_for_invoice(invoice.invoice_id)
+            self.assertEqual(len(events), 2)
+            self.assertTrue(store.verify_chain(invoice.invoice_id))
+            previous = "GENESIS"
+            for event in events:
+                self.assertEqual(event.previous_hash, previous)
+                previous = event.hash
+
+    def test_ledger_events_remain_linear_during_concurrent_different_invoice_appends(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "ledger-concurrent-different.db")
+            store = SQLiteStore(db_path)
+            ledger = SQLiteInvoiceLedger(store)
+            invoice_a = Invoice(
+                invoice_id="inv-db-concurrent-a",
+                currency="GBP",
+                principal_amount=Decimal("500"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            invoice_b = Invoice(
+                invoice_id="inv-db-concurrent-b",
+                currency="GBP",
+                principal_amount=Decimal("700"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice_a)
+            store.create_invoice(invoice_b)
+            barrier = threading.Barrier(2)
+
+            def append_for_invoice(invoice_id: str, tag: str) -> None:
+                barrier.wait()
+                ledger.append_event(
+                    invoice_id=invoice_id,
+                    actor=Actor.SYSTEM,
+                    event_type=f"CONCURRENT_EVENT_{tag}",
+                    data_payload={"tag": tag},
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(append_for_invoice, invoice_a.invoice_id, "A"),
+                    executor.submit(append_for_invoice, invoice_b.invoice_id, "B"),
+                ]
+                for future in futures:
+                    future.result()
+
+            self.assertTrue(store.verify_chain(invoice_a.invoice_id))
+            self.assertTrue(store.verify_chain(invoice_b.invoice_id))
+            self.assertEqual(len(store.events_for_invoice(invoice_a.invoice_id)), 1)
+            self.assertEqual(len(store.events_for_invoice(invoice_b.invoice_id)), 1)
+
+    def test_failed_ledger_append_rolls_back_without_partial_event(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "ledger-failed-append.db")
+            store = SQLiteStore(db_path)
+            ledger = SQLiteInvoiceLedger(store)
+            invoice = Invoice(
+                invoice_id="inv-db-failed-append",
+                currency="GBP",
+                principal_amount=Decimal("200"),
+                issue_date=date(2026, 1, 1),
+                due_date=date(2026, 1, 31),
+                jurisdiction=Jurisdiction.ENGLAND_WALES,
+                debtor_type=DebtorType.LIMITED,
+            )
+            store.create_invoice(invoice)
+            first = ledger.append_event(
+                invoice_id=invoice.invoice_id,
+                actor=Actor.SYSTEM,
+                event_type="FIRST_EVENT",
+                data_payload={"step": 1},
+            )
+            duplicate = first
+            duplicate_event = LedgerEvent(
+                event_id=first.event_id,
+                invoice_id=first.invoice_id,
+                timestamp=first.timestamp,
+                actor=first.actor,
+                event_type=first.event_type,
+                data_payload={"step": 2},
+                previous_hash=first.hash,
+                hash="duplicate-hash",
+            )
+            with self.assertRaises((sqlite3.IntegrityError, ValueError)):
+                store.append_ledger_event(duplicate_event)
+            self.assertEqual(len(store.events_for_invoice(invoice.invoice_id)), 1)
             self.assertTrue(store.verify_chain(invoice.invoice_id))
 
     def test_invoice_balance_reaches_zero_after_full_payment(self) -> None:

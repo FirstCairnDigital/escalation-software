@@ -1,4 +1,7 @@
 from __future__ import annotations
+#
+# First Cairn Digital
+# P26003 ledger concurrency safety
 
 import hashlib
 import json
@@ -1040,25 +1043,40 @@ class SQLiteStore:
 
     def append_ledger_event(self, event: LedgerEvent) -> None:
         with self._connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO ledger_events (
-                    event_id, invoice_id, timestamp, actor, event_type,
-                    data_payload, previous_hash, hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event.event_id,
-                    event.invoice_id,
-                    event.timestamp.isoformat(),
-                    event.actor.value,
-                    event.event_type,
-                    json.dumps(event.data_payload, sort_keys=True, separators=(",", ":"), default=str),
-                    event.previous_hash,
-                    event.hash,
-                ),
-            )
-            conn.commit()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                latest = conn.execute(
+                    "SELECT hash FROM ledger_events WHERE invoice_id = ? ORDER BY rowid DESC LIMIT 1",
+                    (event.invoice_id,),
+                ).fetchone()
+                expected_previous_hash = latest["hash"] if latest is not None else "GENESIS"
+                if event.previous_hash != expected_previous_hash:
+                    raise ValueError(
+                        f"Concurrent ledger mutation detected for invoice {event.invoice_id}: "
+                        f"expected previous hash {expected_previous_hash!r}, got {event.previous_hash!r}."
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO ledger_events (
+                        event_id, invoice_id, timestamp, actor, event_type,
+                        data_payload, previous_hash, hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.event_id,
+                        event.invoice_id,
+                        event.timestamp.isoformat(),
+                        event.actor.value,
+                        event.event_type,
+                        json.dumps(event.data_payload, sort_keys=True, separators=(",", ":"), default=str),
+                        event.previous_hash,
+                        event.hash,
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     def events_for_invoice(self, invoice_id: str) -> tuple[LedgerEvent, ...]:
         with self._connection() as conn:
@@ -1067,7 +1085,7 @@ class SQLiteStore:
                 SELECT event_id, invoice_id, timestamp, actor, event_type, data_payload, previous_hash, hash
                 FROM ledger_events
                 WHERE invoice_id = ?
-                ORDER BY timestamp ASC, rowid ASC
+                ORDER BY rowid ASC
                 """,
                 (invoice_id,),
             ).fetchall()

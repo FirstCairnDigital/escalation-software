@@ -1,6 +1,10 @@
 from __future__ import annotations
+#
+# First Cairn Digital
+# P26003 ledger concurrency safety
 
 import hashlib
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,30 +32,57 @@ class SQLiteInvoiceLedger:
     ) -> LedgerEvent:
         now = timestamp or datetime.now(timezone.utc)
         payload = data_payload or {}
-        previous_events = self._store.events_for_invoice(invoice_id)
-        previous_hash = previous_events[-1].hash if previous_events else "GENESIS"
-        event_id = str(uuid4())
-        hash_value = InvoiceLedger._hash_event(
-            event_id=event_id,
-            invoice_id=invoice_id,
-            timestamp=now,
-            actor=actor,
-            event_type=event_type,
-            data_payload=payload,
-            previous_hash=previous_hash,
-        )
-        event = LedgerEvent(
-            event_id=event_id,
-            invoice_id=invoice_id,
-            timestamp=now,
-            actor=actor,
-            event_type=event_type,
-            data_payload=payload,
-            previous_hash=previous_hash,
-            hash=hash_value,
-        )
-        self._store.append_ledger_event(event)
-        return event
+        with self._store._connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT hash FROM ledger_events WHERE invoice_id = ? ORDER BY rowid DESC LIMIT 1",
+                    (invoice_id,),
+                ).fetchone()
+                previous_hash = row["hash"] if row is not None else "GENESIS"
+                event_id = str(uuid4())
+                hash_value = InvoiceLedger._hash_event(
+                    event_id=event_id,
+                    invoice_id=invoice_id,
+                    timestamp=now,
+                    actor=actor,
+                    event_type=event_type,
+                    data_payload=payload,
+                    previous_hash=previous_hash,
+                )
+                event = LedgerEvent(
+                    event_id=event_id,
+                    invoice_id=invoice_id,
+                    timestamp=now,
+                    actor=actor,
+                    event_type=event_type,
+                    data_payload=payload,
+                    previous_hash=previous_hash,
+                    hash=hash_value,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO ledger_events (
+                        event_id, invoice_id, timestamp, actor, event_type,
+                        data_payload, previous_hash, hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.event_id,
+                        event.invoice_id,
+                        event.timestamp.isoformat(),
+                        event.actor.value,
+                        event.event_type,
+                        json.dumps(event.data_payload, sort_keys=True, separators=(",", ":"), default=str),
+                        event.previous_hash,
+                        event.hash,
+                    ),
+                )
+                conn.commit()
+                return event
+            except Exception:
+                conn.rollback()
+                raise
 
     def record_evidence_artifact(
         self,
