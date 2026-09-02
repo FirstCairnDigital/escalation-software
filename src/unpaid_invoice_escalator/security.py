@@ -1,4 +1,7 @@
 from __future__ import annotations
+#
+# First Cairn Digital
+# P26003 public portal abuse protection
 
 from collections import deque
 from dataclasses import dataclass
@@ -44,6 +47,7 @@ class ApiSecurityController:
         self.rate_limit_alert_threshold = rate_limit_alert_threshold
         self.server_error_alert_threshold = server_error_alert_threshold
         self._request_timestamps: dict[str, deque[float]] = {}
+        self._public_request_timestamps: dict[str, deque[float]] = {}
         self._request_count = 0
         self._status_counts: dict[str, int] = {}
         self._rate_limited_count = 0
@@ -161,6 +165,57 @@ class ApiSecurityController:
             )
         entries.append(now)
         return RequestDecision(allowed=True, identity=identity)
+
+    def public_bucket_key(self, *, client_host: str | None, path: str, case_id: str | None = None) -> str:
+        host = (client_host or "unknown").strip() or "unknown"
+        normalized_path = (path or "/").split("?", 1)[0].strip() or "/"
+        case_ref = (case_id or "").strip()
+        if case_ref:
+            return f"public:{host}:{normalized_path}:case={case_ref}"
+        return f"public:{host}:{normalized_path}"
+
+    def check_public_rate_limit(
+        self,
+        *,
+        client_host: str | None,
+        path: str,
+        case_id: str | None = None,
+    ) -> RequestDecision:
+        key = self.public_bucket_key(client_host=client_host, path=path, case_id=case_id)
+        now = monotonic()
+        window_start = now - 60.0
+        entries = self._public_request_timestamps.setdefault(key, deque())
+        while entries and entries[0] < window_start:
+            entries.popleft()
+        if len(entries) >= self.rate_limit_per_minute:
+            self._rate_limited_count += 1
+            identity = f"public:{client_host or 'unknown'}:{path}"
+            self._record_audit_event(
+                event_type="PUBLIC_RATE_LIMIT_EXCEEDED",
+                severity="WARN",
+                method=None,
+                path=path,
+                identity=identity,
+                detail=(
+                    "Public portal abuse protection triggered."
+                    if case_id
+                    else "Public endpoint rate limit exceeded."
+                ),
+            )
+            self._trigger_threshold_alert(
+                metric_name="rate_limited_total",
+                count=self._rate_limited_count,
+                threshold=self.rate_limit_alert_threshold,
+                detail="Rate limit threshold reached.",
+            )
+            return RequestDecision(
+                allowed=False,
+                status_code=429,
+                detail="Rate limit exceeded. Retry after 60 seconds.",
+                identity=identity,
+            )
+        entries.append(now)
+        return RequestDecision(allowed=True, identity=f"public:{client_host or 'unknown'}")
 
     def record_response(self, status_code: int) -> None:
         self._request_count += 1

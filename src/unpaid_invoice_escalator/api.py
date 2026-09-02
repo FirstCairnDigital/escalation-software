@@ -2315,6 +2315,18 @@ def create_app(
     @app.middleware("http")
     async def security_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
         request_id = request.headers.get("x-request-id") or str(uuid4())
+        client_host = request.client.host if request.client else None
+        public_case_id = request.query_params.get("case")
+
+        if not public_case_id and request.method.upper() == "POST":
+            try:
+                body = await request.body()
+                if body:
+                    parsed_json = json.loads(body.decode("utf-8", errors="strict"))
+                    if isinstance(parsed_json, dict):
+                        public_case_id = str(parsed_json.get("case") or parsed_json.get("case_id") or "").strip() or None
+            except (TypeError, ValueError, UnicodeDecodeError):
+                public_case_id = None
 
         def _harden_response(response):  # type: ignore[no-untyped-def]
             response.headers["x-request-id"] = request_id
@@ -2328,7 +2340,7 @@ def create_app(
             method=request.method,
             path=request.url.path,
             api_key=request.headers.get("x-api-key"),
-            client_host=request.client.host if request.client else None,
+            client_host=client_host,
         )
         if not decision.allowed:
             security.record_response(decision.status_code or 500)
@@ -2338,7 +2350,22 @@ def create_app(
 
         context_tokens = set_request_context(client_id=decision.client_id, role=decision.role, identity=decision.identity)
         try:
-            if not security.is_public_path(request.url.path):
+            if security.is_public_path(request.url.path):
+                public_limit_decision = security.check_public_rate_limit(
+                    client_host=client_host,
+                    path=request.url.path,
+                    case_id=public_case_id,
+                )
+                if not public_limit_decision.allowed:
+                    security.record_response(public_limit_decision.status_code or 500)
+                    return _harden_response(
+                        JSONResponse(
+                            status_code=public_limit_decision.status_code or 500,
+                            content={"detail": public_limit_decision.detail},
+                            headers={"Retry-After": "60"},
+                        )
+                    )
+            else:
                 limit_decision = security.check_rate_limit(decision.identity)
                 if not limit_decision.allowed:
                     security.record_response(limit_decision.status_code or 500)

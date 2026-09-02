@@ -11,6 +11,8 @@ import sqlite3
 from fastapi.testclient import TestClient
 
 from unpaid_invoice_escalator.api import create_app
+from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
+from unpaid_invoice_escalator.services.debtor_verification_portal import DebtorVerificationPortal
 from unpaid_invoice_escalator.ui import render_invoice_workspace_html
 
 
@@ -138,6 +140,67 @@ class TestApiSecurity(unittest.TestCase):
             admin_metrics = client.get("/metrics", headers={"x-api-key": "admin-key"})
             self.assertEqual(admin_metrics.status_code, 200)
             self.assertIn("rate_limited_total", admin_metrics.json()["active_alerts"])
+
+    def test_public_portal_abuse_protection_scopes_by_case_and_action(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "portal-rate-limit.db")
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                bundles_dir=str(Path(tmp_dir) / "bundles"),
+                auth_enabled=True,
+                api_keys={"operator-key": "operator"},
+                rate_limit_per_minute=2,
+                rate_limit_alert_threshold=1,
+            )
+            client = TestClient(app)
+            store = SQLiteStore(db_path)
+            portal = DebtorVerificationPortal(store=store)
+
+            for invoice_id, ref in (("inv-public-1", "INV-PUBLIC-1"), ("inv-public-2", "INV-PUBLIC-2")):
+                create_resp = client.post(
+                    "/invoices",
+                    headers={"x-api-key": "operator-key"},
+                    json={
+                        "invoice_id": invoice_id,
+                        "currency": "GBP",
+                        "principal_amount": "200",
+                        "issue_date": "2026-01-01",
+                        "due_date": "2026-02-01",
+                        "jurisdiction": "ENGLAND_WALES",
+                        "debtor_type": "LIMITED",
+                    },
+                )
+                self.assertEqual(create_resp.status_code, 200)
+
+            case_one = portal.register_case(invoice_id="inv-public-1", creditor_name="Acme Ltd", invoice_reference="INV-PUBLIC-1")
+            case_two = portal.register_case(invoice_id="inv-public-2", creditor_name="Beta Ltd", invoice_reference="INV-PUBLIC-2")
+
+            first_invalid = client.get(f"/verify?case={case_one.case_id}&code=BADCODE")
+            second_invalid = client.get(f"/verify?case={case_one.case_id}&code=BADCODE")
+            third_invalid = client.get(f"/verify?case={case_one.case_id}&code=BADCODE")
+            self.assertEqual(first_invalid.status_code, 404)
+            self.assertEqual(second_invalid.status_code, 404)
+            self.assertEqual(third_invalid.status_code, 429)
+
+            other_case_valid = client.get(f"/verify?case={case_two.case_id}&code={case_two.verification_code}")
+            self.assertEqual(other_case_valid.status_code, 200)
+
+            question_payload = {
+                "case": case_one.case_id,
+                "code": case_one.verification_code,
+                "debtor_identifier": "debtor-public-1",
+                "question": "Please clarify the invoice terms.",
+            }
+            first_action = client.post("/portal/actions/questions", json=question_payload)
+            second_action = client.post("/portal/actions/questions", json=question_payload)
+            third_action = client.post("/portal/actions/questions", json=question_payload)
+            self.assertEqual(first_action.status_code, 200)
+            self.assertEqual(second_action.status_code, 200)
+            self.assertEqual(third_action.status_code, 429)
+
+            portal_page = client.get(f"/portal?case={case_two.case_id}&code={case_two.verification_code}")
+            self.assertEqual(portal_page.status_code, 200)
 
     def test_production_requires_strong_signing_key(self) -> None:
         with TemporaryDirectory() as tmp_dir:
