@@ -738,10 +738,8 @@ class TestApiSecurity(unittest.TestCase):
         malicious_invoice_id = 'inv-"><script>alert(1)</script>'
         html = render_invoice_workspace_html(malicious_invoice_id)
         self.assertNotIn('</script><script>alert(1)</script>', html)
-        self.assertIn(
-            f'const workspaceInvoiceId = {json.dumps(malicious_invoice_id).replace("</", "<\\/")};',
-            html,
-        )
+        escaped_id = json.dumps(malicious_invoice_id).replace("</", "<\\/")
+        self.assertIn(f'const workspaceInvoiceId = {escaped_id};', html)
 
     def test_readiness_fails_with_invalid_upload_limit(self) -> None:
         tmp_dir = mkdtemp()
