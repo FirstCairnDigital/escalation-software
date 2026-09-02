@@ -1,7 +1,7 @@
 from __future__ import annotations
 #
 # First Cairn Digital
-# P26003 bounded hostile upload handling
+# P26003 separate API credentials from actor identities
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -68,7 +68,11 @@ from unpaid_invoice_escalator.services.resolution_settlement_engine import Resol
 from unpaid_invoice_escalator.services.resolution_artifact_generator import ResolutionArtifactGenerator
 from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
 from unpaid_invoice_escalator.services.viability_proportionality_calculator import ViabilityProportionalityCalculator
-from unpaid_invoice_escalator.production_config import resolve_runtime_config, validate_api_client_mappings
+from unpaid_invoice_escalator.production_config import (
+    resolve_runtime_config,
+    validate_api_client_mappings,
+    validate_api_identity_mappings,
+)
 from unpaid_invoice_escalator.security import ApiSecurityController, ROLE_RANK
 from unpaid_invoice_escalator.tenant_context import current_client_id, current_identity, current_role, reset_request_context, set_request_context
 from unpaid_invoice_escalator.ui import (
@@ -997,6 +1001,7 @@ def create_app(
     rate_limit_per_minute: int | None = None,
     manifest_verification_keys: dict[str, str] | None = None,
     api_clients: dict[str, str] | None = None,
+    api_identities: dict[str, str] | None = None,
     auth_failure_alert_threshold: int | None = None,
     rate_limit_alert_threshold: int | None = None,
     server_error_alert_threshold: int | None = None,
@@ -1037,24 +1042,35 @@ def create_app(
     effective_auth_enabled = runtime_cfg["auth_enabled"]
     configured_keys = api_keys if api_keys is not None else runtime_cfg["api_keys"]
     configured_clients = api_clients if api_clients is not None else runtime_cfg["api_clients"]
+    configured_identities = api_identities if api_identities is not None else runtime_cfg["api_identities"]
     if effective_auth_enabled and not configured_keys:
         raise ValueError("Authentication is enabled but no API keys were configured.")
     if effective_env == "production" and manifest_signing_key == "dev-only-signing-key":
         raise ValueError("Production mode requires FCD_MANIFEST_SIGNING_KEY or explicit manifest_signing_key.")
     require_explicit_client_mapping = effective_env == "production" and effective_auth_enabled
+    require_explicit_identity_mapping = effective_env == "production" and effective_auth_enabled
     client_mapping_validation = validate_api_client_mappings(configured_keys, configured_clients)
-    if require_explicit_client_mapping:
+    identity_mapping_validation = validate_api_identity_mappings(configured_keys, configured_identities)
+    if require_explicit_client_mapping or require_explicit_identity_mapping:
         mapping_errors: list[str] = []
-        if client_mapping_validation["missing_credentials"]:
+        if require_explicit_client_mapping and client_mapping_validation["missing_credentials"]:
             mapping_errors.append(
                 f"{len(client_mapping_validation['missing_credentials'])} API credential(s) are missing explicit client mappings."
             )
-        if client_mapping_validation["stale_credentials"]:
+        if require_explicit_client_mapping and client_mapping_validation["stale_credentials"]:
             mapping_errors.append(
                 f"{len(client_mapping_validation['stale_credentials'])} client mapping entry/entries do not match configured API credentials."
             )
+        if require_explicit_identity_mapping and identity_mapping_validation["missing_credentials"]:
+            mapping_errors.append(
+                f"{len(identity_mapping_validation['missing_credentials'])} API credential(s) are missing explicit actor identities."
+            )
+        if require_explicit_identity_mapping and identity_mapping_validation["stale_credentials"]:
+            mapping_errors.append(
+                f"{len(identity_mapping_validation['stale_credentials'])} identity mapping entry/entries do not match configured API credentials."
+            )
         if mapping_errors:
-            raise ValueError("Production API client mapping is invalid: " + " ".join(mapping_errors))
+            raise ValueError("Production API credential mappings are invalid: " + " ".join(mapping_errors))
     effective_clients = dict(configured_clients)
     if not effective_clients and configured_keys:
         effective_clients = _default_client_map(configured_keys)
@@ -1089,7 +1105,9 @@ def create_app(
         enabled=effective_auth_enabled,
         api_keys=configured_keys,
         api_clients=effective_clients,
+        api_identities=configured_identities,
         require_explicit_client_mapping=require_explicit_client_mapping,
+        require_explicit_identity_mapping=require_explicit_identity_mapping,
         rate_limit_per_minute=effective_rate_limit,
         auth_failure_alert_threshold=effective_auth_failure_threshold,
         rate_limit_alert_threshold=effective_rate_limit_threshold,
@@ -1148,6 +1166,26 @@ def create_app(
             "Strong manifest signing key configured."
             if manifest_signing_key != "dev-only-signing-key"
             else "Default development signing key is in use."
+        ),
+    )
+    _append_check(
+        "api-identity-mappings",
+        (not require_explicit_identity_mapping)
+        or (
+            len(identity_mapping_validation["missing_credentials"]) == 0
+            and len(identity_mapping_validation["stale_credentials"]) == 0
+        ),
+        "error" if require_explicit_identity_mapping else "warning",
+        (
+            "Every production API credential maps to one explicit actor identity."
+            if require_explicit_identity_mapping
+            and len(identity_mapping_validation["missing_credentials"]) == 0
+            and len(identity_mapping_validation["stale_credentials"]) == 0
+            else (
+                "Non-production mode derives safe actor identities for mapped credentials."
+                if not require_explicit_identity_mapping
+                else "Production API actor identity mappings are incomplete or contain stale entries."
+            )
         ),
     )
     _append_check(
@@ -1386,6 +1424,7 @@ def create_app(
             "manifest_key_id": manifest_key_id,
             "verification_key_ids": sorted(verification_keys.keys()),
             "api_client_mapping_count": client_mapping_validation["mapped_count"],
+            "api_identity_mapping_count": identity_mapping_validation["mapped_count"],
             "rate_limit_per_minute": effective_rate_limit,
             "max_upload_bytes": effective_max_upload_bytes,
             "allowed_upload_content_types": list(effective_allowed_upload_content_types),
@@ -1423,8 +1462,9 @@ def create_app(
                 "title": "Validate auth and RBAC configuration",
                 "completed": check_map.get("auth-enabled-in-production", False)
                 and check_map.get("api-keys-configured", False)
-                and check_map.get("api-client-mappings", False),
-                "detail": "Ensure API keys are present, explicitly mapped to clients in production, and role model is enforceable.",
+                and check_map.get("api-client-mappings", False)
+                and check_map.get("api-identity-mappings", False),
+                "detail": "Ensure API keys are present, explicitly mapped to clients and actor identities in production, and role model is enforceable.",
             },
             {
                 "step": 3,

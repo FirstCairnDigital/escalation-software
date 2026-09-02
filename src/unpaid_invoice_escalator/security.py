@@ -1,11 +1,12 @@
 from __future__ import annotations
 #
 # First Cairn Digital
-# P26003 public portal abuse protection
+# P26003 separate API credentials from actor identities
 
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 from time import monotonic
 
 
@@ -33,7 +34,9 @@ class ApiSecurityController:
         enabled: bool,
         api_keys: dict[str, str],
         api_clients: dict[str, str] | None = None,
+        api_identities: dict[str, str] | None = None,
         require_explicit_client_mapping: bool = False,
+        require_explicit_identity_mapping: bool = False,
         rate_limit_per_minute: int,
         auth_failure_alert_threshold: int = 10,
         rate_limit_alert_threshold: int = 10,
@@ -43,7 +46,13 @@ class ApiSecurityController:
         self.enabled = enabled
         self.api_keys = api_keys
         self.api_clients = api_clients or {}
+        self.api_identities = {
+            str(key).strip(): str(value).strip()
+            for key, value in (api_identities or {}).items()
+            if str(key).strip() and str(value).strip()
+        }
         self.require_explicit_client_mapping = require_explicit_client_mapping
+        self.require_explicit_identity_mapping = require_explicit_identity_mapping
         self.rate_limit_per_minute = rate_limit_per_minute
         self.auth_failure_alert_threshold = auth_failure_alert_threshold
         self.rate_limit_alert_threshold = rate_limit_alert_threshold
@@ -76,6 +85,29 @@ class ApiSecurityController:
     def _role_allows(self, *, actual: str, required: str) -> bool:
         return ROLE_RANK.get(actual, 0) >= ROLE_RANK.get(required, 99)
 
+    def _safe_client_host_identity(self, client_host: str | None) -> str:
+        host = (client_host or "").strip()
+        return host or "anonymous"
+
+    def _public_identity(self, client_host: str | None) -> str:
+        host = (client_host or "").strip() or "unknown"
+        return f"public:{host}"
+
+    def _derived_actor_identity(self, api_key: str) -> str:
+        digest = sha256(api_key.encode("utf-8")).hexdigest()[:16]
+        return f"credential:{digest}"
+
+    def _authenticated_identity(self, api_key: str) -> str:
+        configured_identity = self.api_identities.get(api_key, "").strip()
+        if configured_identity:
+            return configured_identity
+        return self._derived_actor_identity(api_key)
+
+    def _non_production_identity(self, api_key: str | None, client_host: str | None) -> str:
+        if api_key:
+            return self._derived_actor_identity(api_key)
+        return self._safe_client_host_identity(client_host)
+
     def evaluate_request(
         self,
         *,
@@ -84,14 +116,19 @@ class ApiSecurityController:
         api_key: str | None,
         client_host: str | None,
     ) -> RequestDecision:
-        identity = api_key or client_host or "anonymous"
         if self.is_public_path(path):
-            return RequestDecision(allowed=True, identity=identity, role="public")
+            return RequestDecision(allowed=True, identity=self._public_identity(client_host), role="public")
         if not self.enabled:
-            return RequestDecision(allowed=True, identity=identity, role="admin", client_id="DEFAULT_CLIENT")
+            return RequestDecision(
+                allowed=True,
+                identity=self._non_production_identity(api_key, client_host),
+                role="admin",
+                client_id="DEFAULT_CLIENT",
+            )
 
         role = self.api_keys.get(api_key or "")
         if role is None:
+            identity = self._safe_client_host_identity(client_host)
             self._auth_fail_count += 1
             self._record_audit_event(
                 event_type="AUTH_FAILURE",
@@ -113,6 +150,27 @@ class ApiSecurityController:
                 detail="Missing or invalid API key.",
                 identity=identity,
                 role="anonymous",
+            )
+
+        identity = self._authenticated_identity(api_key or "")
+        configured_identity = self.api_identities.get(api_key or "", "").strip()
+        if self.require_explicit_identity_mapping and not configured_identity:
+            self._forbidden_count += 1
+            self._record_audit_event(
+                event_type="IDENTITY_MAPPING_FORBIDDEN",
+                severity="ERROR",
+                method=method,
+                path=path,
+                identity=identity,
+                detail="Authenticated credential has no explicit actor identity mapping.",
+            )
+            return RequestDecision(
+                allowed=False,
+                status_code=403,
+                detail="Authenticated credential is not mapped to an actor identity.",
+                identity=identity,
+                role=role,
+                client_id="",
             )
 
         client_id = self.api_clients.get(api_key or "", "").strip()
@@ -237,7 +295,7 @@ class ApiSecurityController:
                 identity=identity,
             )
         entries.append(now)
-        return RequestDecision(allowed=True, identity=f"public:{client_host or 'unknown'}")
+        return RequestDecision(allowed=True, identity=self._public_identity(client_host))
 
     def record_response(self, status_code: int) -> None:
         self._request_count += 1

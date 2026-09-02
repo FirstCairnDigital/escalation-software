@@ -1,7 +1,7 @@
 from __future__ import annotations
 #
 # First Cairn Digital
-# P26003 production configuration consolidation
+# P26003 separate API credentials from actor identities
 
 import os
 from typing import Any, Mapping
@@ -26,20 +26,28 @@ def _key_map(value: str) -> dict[str, str]:
     return mapping
 
 
-def validate_api_client_mappings(api_keys: Mapping[str, Any], api_clients: Mapping[str, Any]) -> dict[str, Any]:
+def _validate_api_credential_mappings(api_keys: Mapping[str, Any], credential_map: Mapping[str, Any]) -> dict[str, Any]:
     normalized_keys = {str(key).strip() for key in api_keys if str(key).strip()}
-    normalized_clients = {
+    normalized_map = {
         str(key).strip(): str(value).strip()
-        for key, value in api_clients.items()
+        for key, value in credential_map.items()
         if str(key).strip() and str(value).strip()
     }
-    missing_credentials = sorted(key for key in normalized_keys if key not in normalized_clients)
-    stale_credentials = sorted(key for key in normalized_clients if key not in normalized_keys)
+    missing_credentials = sorted(key for key in normalized_keys if key not in normalized_map)
+    stale_credentials = sorted(key for key in normalized_map if key not in normalized_keys)
     return {
         "missing_credentials": missing_credentials,
         "stale_credentials": stale_credentials,
-        "mapped_count": len(normalized_clients),
+        "mapped_count": len(normalized_map),
     }
+
+
+def validate_api_client_mappings(api_keys: Mapping[str, Any], api_clients: Mapping[str, Any]) -> dict[str, Any]:
+    return _validate_api_credential_mappings(api_keys, api_clients)
+
+
+def validate_api_identity_mappings(api_keys: Mapping[str, Any], api_identities: Mapping[str, Any]) -> dict[str, Any]:
+    return _validate_api_credential_mappings(api_keys, api_identities)
 
 
 def _env_value(env: Mapping[str, Any], primary: str, *aliases: str, default: str = "") -> tuple[str, str | None, bool]:
@@ -80,6 +88,7 @@ def resolve_runtime_config(
     manifest_verification_keys_raw, _, _ = _env_value(effective_env, "FCD_MANIFEST_VERIFY_KEYS")
     api_keys_raw, api_keys_alias, api_keys_primary = _env_value(effective_env, "FCD_API_KEYS", "SBC_API_KEY")
     api_clients_raw, _, _ = _env_value(effective_env, "FCD_API_CLIENTS")
+    api_identities_raw, _, _ = _env_value(effective_env, "FCD_API_IDENTITIES")
     rate_limit_raw, _, _ = _env_value(effective_env, "FCD_RATE_LIMIT_PER_MINUTE", default="120")
     auth_failure_raw, _, _ = _env_value(effective_env, "FCD_AUTH_FAILURE_ALERT_THRESHOLD", default="10")
     rate_limit_alert_raw, _, _ = _env_value(effective_env, "FCD_RATE_LIMIT_ALERT_THRESHOLD", default="10")
@@ -157,6 +166,7 @@ def resolve_runtime_config(
     else:
         api_keys = {}
     api_clients = _key_map(api_clients_raw) if api_clients_raw else {}
+    api_identities = _key_map(api_identities_raw) if api_identities_raw else {}
 
     legacy_aliases: dict[str, str] = {}
     if str(effective_env.get("CRYPTO_SIGNING_KEY") or "").strip():
@@ -180,6 +190,7 @@ def resolve_runtime_config(
         "manifest_verification_keys": verification_keys,
         "api_keys": api_keys,
         "api_clients": api_clients,
+        "api_identities": api_identities,
         "rate_limit_per_minute": rate_limit_per_minute,
         "auth_failure_alert_threshold": auth_failure_threshold,
         "rate_limit_alert_threshold": rate_limit_alert_threshold,
@@ -218,6 +229,7 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
     verification_keys = runtime["manifest_verification_keys"]
     api_keys = runtime["api_keys"]
     api_clients = runtime["api_clients"]
+    api_identities = runtime["api_identities"]
     rate_limit_per_minute = runtime["rate_limit_per_minute"]
     auth_failure_threshold = runtime["auth_failure_alert_threshold"]
     rate_limit_alert_threshold = runtime["rate_limit_alert_threshold"]
@@ -284,6 +296,7 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
             f"{legacy_aliases['api_keys']} is present, but production API auth should migrate to FCD_API_KEYS.",
         )
     mapping_validation = validate_api_client_mappings(api_keys, api_clients)
+    identity_validation = validate_api_identity_mappings(api_keys, api_identities)
     record(
         "api-client-mappings-configured",
         bool(api_clients),
@@ -292,6 +305,36 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
             f"Explicit client mappings configured for {mapping_validation['mapped_count']} API credential(s)."
             if api_clients
             else "FCD_API_CLIENTS is required so every production API credential maps to one explicit client."
+        ),
+    )
+    record(
+        "api-identity-mappings-configured",
+        bool(api_identities),
+        "error",
+        (
+            f"Explicit actor identities configured for {identity_validation['mapped_count']} API credential(s)."
+            if api_identities
+            else "FCD_API_IDENTITIES is required so every production API credential maps to one non-secret actor identity."
+        ),
+    )
+    record(
+        "api-identity-mappings-complete",
+        len(identity_validation["missing_credentials"]) == 0,
+        "error",
+        (
+            "Every configured API credential has an explicit actor identity."
+            if len(identity_validation["missing_credentials"]) == 0
+            else f"{len(identity_validation['missing_credentials'])} configured API credential(s) lack an explicit actor identity."
+        ),
+    )
+    record(
+        "api-identity-mappings-known-credentials",
+        len(identity_validation["stale_credentials"]) == 0,
+        "error",
+        (
+            "All configured actor identities match current API credentials."
+            if len(identity_validation["stale_credentials"]) == 0
+            else f"{len(identity_validation['stale_credentials'])} identity mapping entry/entries do not match configured API credentials."
         ),
     )
     record(
@@ -388,6 +431,7 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
         "manifest_key_id": manifest_key_id,
         "verification_key_ids": sorted(verification_keys.keys()),
         "api_client_mapping_count": mapping_validation["mapped_count"],
+        "api_identity_mapping_count": identity_validation["mapped_count"],
         "rate_limit_per_minute": rate_limit_per_minute,
         "max_upload_bytes": max_upload_bytes,
         "allowed_upload_content_types": list(upload_types),

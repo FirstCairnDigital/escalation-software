@@ -1,6 +1,6 @@
 #
 # First Cairn Digital
-# P26003 bank-detail authentication hardening
+# P26003 separate API credentials from actor identities
 from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory, mkdtemp
@@ -30,6 +30,11 @@ class TestApiSecurity(unittest.TestCase):
                     "viewer-key": "viewer",
                     "operator-key": "operator",
                     "admin-key": "admin",
+                },
+                api_identities={
+                    "viewer-key": "ACTOR-VIEWER",
+                    "operator-key": "ACTOR-OPERATOR",
+                    "admin-key": "ACTOR-ADMIN",
                 },
                 rate_limit_per_minute=100,
                 auth_failure_alert_threshold=1,
@@ -82,9 +87,11 @@ class TestApiSecurity(unittest.TestCase):
                 },
             )
             self.assertEqual(create_resp.status_code, 200)
+            self.assertNotIn("operator-key", create_resp.text)
 
             get_resp = client.get("/invoices/inv-sec-1", headers={"x-api-key": "viewer-key"})
             self.assertEqual(get_resp.status_code, 200)
+            self.assertNotIn("viewer-key", get_resp.text)
 
             operator_metrics_forbidden = client.get("/metrics", headers={"x-api-key": "operator-key"})
             self.assertEqual(operator_metrics_forbidden.status_code, 403)
@@ -99,6 +106,12 @@ class TestApiSecurity(unittest.TestCase):
             self.assertEqual(metrics_body["alert_policy"]["auth_failure_alert_threshold"], 1)
             self.assertGreaterEqual(len(metrics_body["recent_audit_events"]), 2)
             self.assertEqual(metrics_body["recent_audit_events"][0]["event_type"], "AUTH_FAILURE")
+            rbac_event = next(item for item in metrics_body["recent_audit_events"] if item["event_type"] == "RBAC_FORBIDDEN")
+            self.assertEqual(rbac_event["identity"], "ACTOR-VIEWER")
+            metrics_text = json.dumps(metrics_body)
+            self.assertNotIn("viewer-key", metrics_text)
+            self.assertNotIn("operator-key", metrics_text)
+            self.assertNotIn("admin-key", metrics_text)
 
     def test_rate_limiting(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -147,6 +160,7 @@ class TestApiSecurity(unittest.TestCase):
             enabled=True,
             api_keys={"mapped-key": "viewer"},
             api_clients={},
+            api_identities={"mapped-key": "ACTOR-MAPPED"},
             require_explicit_client_mapping=True,
             rate_limit_per_minute=100,
         )
@@ -162,6 +176,122 @@ class TestApiSecurity(unittest.TestCase):
         self.assertEqual(decision.status_code, 403)
         self.assertEqual(decision.detail, "Authenticated credential is not mapped to a client.")
         self.assertEqual(decision.client_id, "")
+        self.assertEqual(decision.identity, "ACTOR-MAPPED")
+
+    def test_authenticated_request_uses_configured_actor_identity(self) -> None:
+        security = ApiSecurityController(
+            enabled=True,
+            api_keys={"mapped-key": "viewer"},
+            api_clients={"mapped-key": "CLIENT-A"},
+            api_identities={"mapped-key": "ACTOR-A"},
+            rate_limit_per_minute=100,
+        )
+
+        decision = security.evaluate_request(
+            method="GET",
+            path="/invoices/inv-sec-1",
+            api_key="mapped-key",
+            client_host="127.0.0.1",
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.identity, "ACTOR-A")
+        self.assertEqual(decision.client_id, "CLIENT-A")
+
+    def test_production_request_without_identity_mapping_is_rejected(self) -> None:
+        security = ApiSecurityController(
+            enabled=True,
+            api_keys={"mapped-key": "viewer"},
+            api_clients={"mapped-key": "CLIENT-A"},
+            api_identities={},
+            require_explicit_identity_mapping=True,
+            rate_limit_per_minute=100,
+        )
+
+        decision = security.evaluate_request(
+            method="GET",
+            path="/invoices/inv-sec-1",
+            api_key="mapped-key",
+            client_host="127.0.0.1",
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.status_code, 403)
+        self.assertEqual(decision.detail, "Authenticated credential is not mapped to an actor identity.")
+        self.assertNotEqual(decision.identity, "mapped-key")
+
+        metrics_text = json.dumps(security.metrics_snapshot())
+        self.assertNotIn("mapped-key", metrics_text)
+
+    def test_development_fallback_identity_preserves_default_client_without_leaking_key(self) -> None:
+        security = ApiSecurityController(
+            enabled=True,
+            api_keys={"dev-key": "operator"},
+            api_clients={},
+            api_identities={},
+            rate_limit_per_minute=100,
+        )
+
+        first = security.evaluate_request(
+            method="POST",
+            path="/invoices",
+            api_key="dev-key",
+            client_host="127.0.0.1",
+        )
+        second = security.evaluate_request(
+            method="POST",
+            path="/invoices",
+            api_key="dev-key",
+            client_host="127.0.0.1",
+        )
+
+        self.assertTrue(first.allowed)
+        self.assertEqual(first.client_id, "DEFAULT_CLIENT")
+        self.assertEqual(first.identity, second.identity)
+        self.assertNotEqual(first.identity, "dev-key")
+
+    def test_invalid_api_key_is_not_persisted_in_auth_audit(self) -> None:
+        security = ApiSecurityController(
+            enabled=True,
+            api_keys={"known-key": "viewer"},
+            api_clients={"known-key": "CLIENT-A"},
+            api_identities={"known-key": "ACTOR-A"},
+            rate_limit_per_minute=100,
+        )
+
+        decision = security.evaluate_request(
+            method="GET",
+            path="/invoices/inv-sec-1",
+            api_key="invalid-secret",
+            client_host="198.51.100.10",
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.status_code, 401)
+        self.assertNotEqual(decision.identity, "invalid-secret")
+        metrics_text = json.dumps(security.metrics_snapshot())
+        self.assertNotIn("invalid-secret", metrics_text)
+        self.assertIn("198.51.100.10", metrics_text)
+
+    def test_public_request_identity_ignores_supplied_api_key(self) -> None:
+        security = ApiSecurityController(
+            enabled=True,
+            api_keys={"known-key": "viewer"},
+            api_clients={"known-key": "CLIENT-A"},
+            api_identities={"known-key": "ACTOR-A"},
+            rate_limit_per_minute=100,
+        )
+
+        decision = security.evaluate_request(
+            method="GET",
+            path="/verify",
+            api_key="known-key",
+            client_host="203.0.113.7",
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.role, "public")
+        self.assertEqual(decision.identity, "public:203.0.113.7")
 
     def test_production_explicit_client_mapping_preserves_cross_client_isolation(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -181,6 +311,11 @@ class TestApiSecurity(unittest.TestCase):
                     "client-a-key": "CLIENT-A",
                     "client-b-key": "CLIENT-B",
                     "admin-key": "FCD-ADMIN",
+                },
+                api_identities={
+                    "client-a-key": "ACTOR-CLIENT-A",
+                    "client-b-key": "ACTOR-CLIENT-B",
+                    "admin-key": "ACTOR-ADMIN",
                 },
                 rate_limit_per_minute=100,
                 manifest_signing_key="production-signing-key",
@@ -238,10 +373,24 @@ class TestApiSecurity(unittest.TestCase):
             }
 
             with self.assertRaisesRegex(ValueError, "missing explicit client mappings"):
-                create_app(api_clients={}, **kwargs)
+                create_app(api_clients={}, api_identities={"mapped-key": "ACTOR-A"}, **kwargs)
 
             with self.assertRaisesRegex(ValueError, "do not match configured API credentials"):
-                create_app(api_clients={"mapped-key": "CLIENT-A", "stale-key": "CLIENT-B"}, **kwargs)
+                create_app(
+                    api_clients={"mapped-key": "CLIENT-A", "stale-key": "CLIENT-B"},
+                    api_identities={"mapped-key": "ACTOR-A"},
+                    **kwargs,
+                )
+
+            with self.assertRaisesRegex(ValueError, "missing explicit actor identities"):
+                create_app(api_clients={"mapped-key": "CLIENT-A"}, api_identities={}, **kwargs)
+
+            with self.assertRaisesRegex(ValueError, "identity mapping entry/entries do not match configured API credentials"):
+                create_app(
+                    api_clients={"mapped-key": "CLIENT-A"},
+                    api_identities={"mapped-key": "ACTOR-A", "stale-key": "ACTOR-B"},
+                    **kwargs,
+                )
 
     def test_public_portal_abuse_protection_scopes_by_case_and_action(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -325,6 +474,7 @@ class TestApiSecurity(unittest.TestCase):
                 auth_enabled=True,
                 api_keys={"admin-key": "admin"},
                 api_clients={"admin-key": "FCD-ADMIN"},
+                api_identities={"admin-key": "ACTOR-ADMIN"},
                 manifest_signing_key="production-signing-key",
                 manifest_key_id="fcd-kms-key-1",
             )
@@ -421,6 +571,11 @@ class TestApiSecurity(unittest.TestCase):
                     "requester-key": "CLIENT-A",
                     "approver-key": "CLIENT-A",
                     "viewer-key": "CLIENT-A",
+                },
+                api_identities={
+                    "requester-key": "ACTOR-REQUESTER",
+                    "approver-key": "ACTOR-APPROVER",
+                    "viewer-key": "ACTOR-VIEWER",
                 },
                 rate_limit_per_minute=100,
                 manifest_signing_key="production-signing-key",
@@ -541,19 +696,90 @@ class TestApiSecurity(unittest.TestCase):
             self.assertEqual(valid_resp.status_code, 200)
             self.assertEqual(valid_resp.json()["verification_method"], "ACCOUNT_HOLDER_NAME_CONSISTENCY_CHECK")
             self.assertEqual(valid_resp.json()["cop_state"], "COP_EXACT_MATCH")
+            self.assertNotIn("requester-key", valid_resp.text)
+            self.assertNotIn("approver-key", valid_resp.text)
 
             ledger_resp = client.get("/invoices/inv-bank-auth/compliance-ledger", headers={"x-api-key": "viewer-key"})
             self.assertEqual(ledger_resp.status_code, 200)
             events = ledger_resp.json()["entries"]
             approval_event = next(item for item in events if item["event_type"] == "BANK_DETAIL_DUAL_CONTROL_APPROVED")
             update_event = next(item for item in events if item["event_type"] == "BANK_DETAILS_UPDATED_PENDING_COP")
-            self.assertEqual(approval_event["details"]["approver_identity"], "approver-key")
-            self.assertEqual(update_event["details"]["requester_identity"], "requester-key")
-            self.assertEqual(update_event["details"]["approver_identity"], "approver-key")
+            self.assertEqual(approval_event["details"]["approver_identity"], "ACTOR-APPROVER")
+            self.assertEqual(update_event["details"]["requester_identity"], "ACTOR-REQUESTER")
+            self.assertEqual(update_event["details"]["approver_identity"], "ACTOR-APPROVER")
             self.assertEqual(update_event["details"]["approval_reference"], "BANK-REF-1")
 
             cop_text = json.dumps(valid_resp.json())
             self.assertNotIn("CONFIRMATION_OF_PAYEE", cop_text)
+            self.assertNotIn("requester-key", json.dumps(events))
+            self.assertNotIn("approver-key", json.dumps(events))
+
+    def test_bank_detail_dual_control_rejects_two_credentials_for_same_actor(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "bank-auth-same-actor.db")
+            app = create_app(
+                db_path=db_path,
+                artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                bundles_dir=str(Path(tmp_dir) / "bundles"),
+                auth_enabled=True,
+                api_keys={
+                    "requester-key": "operator",
+                    "approver-key": "admin",
+                },
+                api_clients={
+                    "requester-key": "CLIENT-A",
+                    "approver-key": "CLIENT-A",
+                },
+                api_identities={
+                    "requester-key": "ACTOR-SHARED",
+                    "approver-key": "ACTOR-SHARED",
+                },
+                rate_limit_per_minute=100,
+                manifest_signing_key="production-signing-key",
+                manifest_key_id="fcd-kms-key-1",
+            )
+            client = TestClient(app)
+
+            create_resp = client.post(
+                "/invoices",
+                headers={"x-api-key": "requester-key"},
+                json={
+                    "invoice_id": "inv-bank-same-actor",
+                    "currency": "GBP",
+                    "principal_amount": "100",
+                    "issue_date": "2026-01-01",
+                    "due_date": "2026-01-31",
+                    "jurisdiction": "ENGLAND_WALES",
+                    "debtor_type": "LIMITED",
+                },
+            )
+            self.assertEqual(create_resp.status_code, 200)
+
+            approval_resp = client.post(
+                "/invoices/inv-bank-same-actor/settlement-bank-details/approvals",
+                headers={"x-api-key": "approver-key"},
+                json={
+                    "approval_reference": "BANK-SHARED-1",
+                    "approval_method": "SERVER_SIDE_ADMIN_APPROVAL",
+                    "notes": "Approval recorded under the same actor identity.",
+                },
+            )
+            self.assertEqual(approval_resp.status_code, 200)
+
+            update_resp = client.post(
+                "/invoices/inv-bank-same-actor/settlement-bank-details",
+                headers={"x-api-key": "requester-key"},
+                json={
+                    "updated_by": "requester-key",
+                    "account_holder_name": "Client A Trading Ltd",
+                    "sort_code": "12-34-56",
+                    "account_number": "12345678",
+                    "expected_payee_name": "Client A Trading Ltd",
+                    "dual_control_approval_reference": "BANK-SHARED-1",
+                },
+            )
+            self.assertEqual(update_resp.status_code, 403)
+            self.assertIn("distinct authenticated identities", update_resp.json()["detail"])
 
     def test_tenant_isolation_blocks_cross_client_access(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -782,6 +1008,7 @@ class TestApiSecurity(unittest.TestCase):
                 bundles_dir=str(Path(tmp_dir) / "bundles"),
                 auth_enabled=True,
                 api_keys={"viewer-key": "viewer", "admin-key": "admin"},
+                api_identities={"viewer-key": "ACTOR-VIEWER", "admin-key": "ACTOR-ADMIN"},
                 max_upload_bytes=64,
                 manifest_signing_key="non-default-key",
                 manifest_key_id="fcd-kms-key-ready",
@@ -799,10 +1026,13 @@ class TestApiSecurity(unittest.TestCase):
                 validation_body = validation_resp.json()
                 self.assertTrue(validation_body["ready"])
                 self.assertEqual(validation_body["manifest_key_id"], "fcd-kms-key-ready")
+                self.assertEqual(validation_body["api_identity_mapping_count"], 2)
                 self.assertIn("database-connectivity", {entry["check"] for entry in validation_body["checks"]})
                 self.assertIn("append-only-triggers", {entry["check"] for entry in validation_body["checks"]})
                 self.assertGreaterEqual(validation_body["summary"]["total_checks"], 1)
                 self.assertIn("generated_at_utc", validation_body)
+                self.assertNotIn("viewer-key", json.dumps(validation_body))
+                self.assertNotIn("admin-key", json.dumps(validation_body))
 
                 report_resp = client.get(
                     "/deployment/startup-config-validation/report", headers={"x-api-key": "admin-key"}
@@ -832,15 +1062,16 @@ class TestApiSecurity(unittest.TestCase):
                 bundles_dir=str(Path(tmp_dir) / "bundles"),
                 auth_enabled=True,
                 api_keys={"viewer-key": "viewer", "admin-key": "admin"},
+                api_identities={"viewer-key": "ACTOR-VIEWER", "admin-key": "ACTOR-ADMIN"},
                 manifest_signing_key="non-default-key",
                 manifest_key_id="fcd-kms-key-ready",
             )
             with TestClient(app) as client:
-                verify_resp = client.get("/verify?case=FCD-R-2026-000001&code=ABCDEFGH")
+                verify_resp = client.get("/verify?case=FCD-R-2026-000001&code=ABCDEFGH", headers={"x-api-key": "viewer-key"})
                 self.assertEqual(verify_resp.status_code, 404)
-                portal_resp = client.get("/portal?case=FCD-R-2026-000001&code=ABCDEFGH")
+                portal_resp = client.get("/portal?case=FCD-R-2026-000001&code=ABCDEFGH", headers={"x-api-key": "viewer-key"})
                 self.assertEqual(portal_resp.status_code, 404)
-                payment_link_resp = client.get("/portal/payment-link?case=FCD-R-2026-000001&code=ABCDEFGH")
+                payment_link_resp = client.get("/portal/payment-link?case=FCD-R-2026-000001&code=ABCDEFGH", headers={"x-api-key": "viewer-key"})
                 self.assertEqual(payment_link_resp.status_code, 404)
 
     def test_invoice_workspace_escapes_hostile_invoice_id(self) -> None:

@@ -1,6 +1,6 @@
 #
 # First Cairn Digital
-# P26003 bounded hostile upload handling
+# P26003 separate API credentials from actor identities
 import asyncio
 from datetime import date, timedelta
 import json
@@ -2670,12 +2670,14 @@ class TestApi(unittest.TestCase):
                 "DATABASE_URL": "postgresql://user:pass@example.com:5432/app?sslmode=require",
                 "SBC_API_KEY": "sbc-key-123",
                 "FCD_API_CLIENTS": "legacy-credential:CLIENT-LEGACY",
+                "FCD_API_IDENTITIES": "legacy-credential:LEGACY-ACTOR",
                 "SBC_ENDPOINT": "https://sbc.example.com",
                 "CRYPTO_SIGNING_KEY": "A" * 32,
                 "DATA_RETENTION_CRON_SCHEDULE": "0 2 * * *",
             }
         )
         self.assertTrue(valid["valid"])
+        self.assertEqual(valid["api_identity_mapping_count"], 1)
 
         invalid = validate_production_config({})
         self.assertFalse(invalid["valid"])
@@ -2690,6 +2692,7 @@ class TestApi(unittest.TestCase):
                 "FCD_MANIFEST_VERIFY_KEYS": "fcd-kms-key-1:" + ("B" * 32),
                 "FCD_API_KEYS": "admin-key:admin,ops-key:operator,ro-key:viewer",
                 "FCD_API_CLIENTS": "admin-key:FCD-ADMIN,ops-key:CLIENT-OPS,ro-key:CLIENT-RO",
+                "FCD_API_IDENTITIES": "admin-key:ADMIN-ACTOR,ops-key:OPS-ACTOR,ro-key:RO-ACTOR",
                 "FCD_RATE_LIMIT_PER_MINUTE": "120",
                 "FCD_AUTH_FAILURE_ALERT_THRESHOLD": "10",
                 "FCD_RATE_LIMIT_ALERT_THRESHOLD": "10",
@@ -2705,6 +2708,7 @@ class TestApi(unittest.TestCase):
         self.assertTrue(valid["valid"])
         self.assertEqual(valid["manifest_key_id"], "fcd-kms-key-1")
         self.assertEqual(valid["data_retention_cron_schedule"], "0 2 * * *")
+        self.assertEqual(valid["api_identity_mapping_count"], 3)
 
     def test_validate_production_config_prefers_canonical_over_legacy_aliases(self) -> None:
         config = validate_production_config(
@@ -2715,6 +2719,7 @@ class TestApi(unittest.TestCase):
                 "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
                 "FCD_API_KEYS": "admin-key:admin",
                 "FCD_API_CLIENTS": "admin-key:FCD-ADMIN",
+                "FCD_API_IDENTITIES": "admin-key:ADMIN-ACTOR",
                 "SBC_API_KEY": "legacy-key",
                 "FCD_DATA_RETENTION_CRON_SCHEDULE": "0 2 * * *",
                 "DATA_RETENTION_CRON_SCHEDULE": "0 3 * * *",
@@ -2745,6 +2750,7 @@ class TestApi(unittest.TestCase):
                 "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
                 "FCD_API_KEYS": "admin-key:admin,ops-key:operator",
                 "FCD_API_CLIENTS": "admin-key:FCD-ADMIN",
+                "FCD_API_IDENTITIES": "admin-key:ADMIN-ACTOR,ops-key:OPS-ACTOR",
                 "FCD_RATE_LIMIT_PER_MINUTE": "120",
                 "FCD_AUTH_FAILURE_ALERT_THRESHOLD": "10",
                 "FCD_RATE_LIMIT_ALERT_THRESHOLD": "10",
@@ -2767,6 +2773,7 @@ class TestApi(unittest.TestCase):
                 "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
                 "FCD_API_KEYS": "admin-key:admin",
                 "FCD_API_CLIENTS": "admin-key:FCD-ADMIN,stale-key:CLIENT-B",
+                "FCD_API_IDENTITIES": "admin-key:ADMIN-ACTOR",
                 "FCD_RATE_LIMIT_PER_MINUTE": "120",
                 "FCD_AUTH_FAILURE_ALERT_THRESHOLD": "10",
                 "FCD_RATE_LIMIT_ALERT_THRESHOLD": "10",
@@ -2781,6 +2788,53 @@ class TestApi(unittest.TestCase):
         )
         self.assertFalse(stale_mapping["valid"])
         self.assertIn("do not match configured API credentials", "\n".join(stale_mapping["errors"]))
+
+    def test_validate_production_config_rejects_incomplete_or_stale_identity_mappings(self) -> None:
+        missing_identity = validate_production_config(
+            {
+                "FCD_APP_ENV": "production",
+                "FCD_MANIFEST_SIGNING_KEY": "A" * 32,
+                "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
+                "FCD_API_KEYS": "admin-key:admin,ops-key:operator",
+                "FCD_API_CLIENTS": "admin-key:FCD-ADMIN,ops-key:CLIENT-OPS",
+                "FCD_API_IDENTITIES": "admin-key:ADMIN-ACTOR",
+                "FCD_RATE_LIMIT_PER_MINUTE": "120",
+                "FCD_AUTH_FAILURE_ALERT_THRESHOLD": "10",
+                "FCD_RATE_LIMIT_ALERT_THRESHOLD": "10",
+                "FCD_SERVER_ERROR_ALERT_THRESHOLD": "5",
+                "FCD_MAX_UPLOAD_BYTES": "5242880",
+                "FCD_ALLOWED_UPLOAD_CONTENT_TYPES": "application/pdf,text/plain",
+                "FCD_ALLOWED_UPLOAD_EXTENSIONS": ".pdf,.txt",
+                "FCD_QUARANTINE_DIR": "data/quarantine",
+                "FCD_DATA_RETENTION_DAYS": "2190",
+                "FCD_DATA_RETENTION_CRON_SCHEDULE": "0 2 * * *",
+            }
+        )
+        self.assertFalse(missing_identity["valid"])
+        self.assertIn("lack an explicit actor identity", "\n".join(missing_identity["errors"]))
+
+        stale_identity = validate_production_config(
+            {
+                "FCD_APP_ENV": "production",
+                "FCD_MANIFEST_SIGNING_KEY": "A" * 32,
+                "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
+                "FCD_API_KEYS": "admin-key:admin",
+                "FCD_API_CLIENTS": "admin-key:FCD-ADMIN",
+                "FCD_API_IDENTITIES": "admin-key:ADMIN-ACTOR,stale-key:STALE-ACTOR",
+                "FCD_RATE_LIMIT_PER_MINUTE": "120",
+                "FCD_AUTH_FAILURE_ALERT_THRESHOLD": "10",
+                "FCD_RATE_LIMIT_ALERT_THRESHOLD": "10",
+                "FCD_SERVER_ERROR_ALERT_THRESHOLD": "5",
+                "FCD_MAX_UPLOAD_BYTES": "5242880",
+                "FCD_ALLOWED_UPLOAD_CONTENT_TYPES": "application/pdf,text/plain",
+                "FCD_ALLOWED_UPLOAD_EXTENSIONS": ".pdf,.txt",
+                "FCD_QUARANTINE_DIR": "data/quarantine",
+                "FCD_DATA_RETENTION_DAYS": "2190",
+                "FCD_DATA_RETENTION_CRON_SCHEDULE": "0 2 * * *",
+            }
+        )
+        self.assertFalse(stale_identity["valid"])
+        self.assertIn("identity mapping entry/entries do not match configured API credentials", "\n".join(stale_identity["errors"]))
 
     def test_ready_report_uses_runtime_configuration_without_exposing_secrets(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -2797,6 +2851,7 @@ class TestApi(unittest.TestCase):
                     auth_enabled=True,
                     api_keys={"admin-key": "admin"},
                     api_clients={"admin-key": "FCD-ADMIN"},
+                    api_identities={"admin-key": "ADMIN-ACTOR"},
                     rate_limit_per_minute=77,
                     max_upload_bytes=4321,
                     allowed_upload_content_types=("application/pdf",),
@@ -2814,6 +2869,7 @@ class TestApi(unittest.TestCase):
             payload = ready.json()
             self.assertEqual(payload["manifest_key_id"], "fcd-ready-key")
             self.assertEqual(payload["api_client_mapping_count"], 1)
+            self.assertEqual(payload["api_identity_mapping_count"], 1)
             self.assertEqual(payload["rate_limit_per_minute"], 77)
             self.assertEqual(payload["max_upload_bytes"], 4321)
             self.assertNotIn("A" * 32, str(payload))
