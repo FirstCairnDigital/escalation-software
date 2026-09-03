@@ -57,10 +57,6 @@ class PostgreSQLStore:
         self._database_url = database_url
         self.migration_dir = Path(migration_dir) if migration_dir else Path(__file__).resolve().parent / "migrations" / "postgresql"
 
-    @property
-    def database_url(self) -> str:
-        return self._database_url
-
     def _has_invoice_access(self, invoice_client_id: str) -> bool:
         role = current_role.get()
         if role == "admin":

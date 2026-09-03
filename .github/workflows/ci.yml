@@ -57,7 +57,7 @@ jobs:
       - name: Run PostgreSQL integration tests
         env:
           POSTGRES_TEST_DATABASE_URL: postgresql://fcd_test:super-secret-postgres-test-password@127.0.0.1:5432/fcd_test?sslmode=disable
-        run: python -m unittest discover -s tests -p "test_postgresql_persistence.py"
+        run: python -m unittest discover -s tests -p "test_postgresql*.py"
 
       - name: Validate packaging metadata
         run: pip check
