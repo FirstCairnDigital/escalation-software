@@ -6,6 +6,8 @@ from __future__ import annotations
 import os
 from typing import Any, Mapping
 
+from unpaid_invoice_escalator.persistence.database_config import resolve_database_config
+
 
 def _is_ssl_url(value: str) -> bool:
     lowered = value.lower()
@@ -69,10 +71,13 @@ def resolve_runtime_config(
     default_app_env: str = "development",
     auth_enabled: bool | None = None,
     database_url: str | None = None,
+    db_path: str | None = None,
 ) -> dict[str, Any]:
     effective_env = dict(env or os.environ)
-    if database_url is not None:
-        effective_env["DATABASE_URL"] = database_url
+    if database_url is not None and str(database_url).strip():
+        effective_env["DATABASE_URL"] = str(database_url).strip()
+    elif "DATABASE_URL" not in effective_env and db_path is not None and str(db_path).strip():
+        effective_env["DATABASE_URL"] = str(db_path).strip()
 
     app_env, _, _ = _env_value(effective_env, "FCD_APP_ENV", default=default_app_env)
     app_env = (app_env or default_app_env).strip() or default_app_env
@@ -112,6 +117,7 @@ def resolve_runtime_config(
         "DATA_RETENTION_CRON_SCHEDULE",
     )
     database_url_value, _, _ = _env_value(effective_env, "DATABASE_URL")
+    database_target = resolve_database_config(effective_env, db_path=db_path or "data/escalator.db")
     sbc_endpoint, _, _ = _env_value(effective_env, "SBC_ENDPOINT")
 
     def parse_positive_int(raw: str, *, field_name: str) -> int:
@@ -202,6 +208,10 @@ def resolve_runtime_config(
         "data_retention_days": data_retention_days,
         "data_retention_cron_schedule": data_retention_cron_schedule,
         "database_url": database_url_value or "",
+        "database_backend": database_target.backend,
+        "database_configured": bool(database_target.configured),
+        "database_tls_required": database_target.tls_required,
+        "database_tls_enabled": database_target.tls_enabled,
         "sbc_endpoint": sbc_endpoint,
         "legacy_aliases": legacy_aliases,
     }
@@ -241,6 +251,10 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
     data_retention_days = runtime["data_retention_days"]
     data_retention_cron_schedule = runtime["data_retention_cron_schedule"]
     database_url = runtime["database_url"]
+    database_backend = runtime.get("database_backend", "sqlite")
+    database_configured = bool(runtime.get("database_configured", bool(database_url)))
+    database_tls_required = bool(runtime.get("database_tls_required", False))
+    database_tls_enabled = bool(runtime.get("database_tls_enabled", False))
     sbc_endpoint = runtime["sbc_endpoint"]
     legacy_aliases = runtime["legacy_aliases"]
 
@@ -406,12 +420,16 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
             f"{legacy_aliases['data_retention_cron_schedule']} was used as a legacy alias; migrate to FCD_DATA_RETENTION_CRON_SCHEDULE.",
         )
     if database_url:
-        database_tls_ok = _is_ssl_url(database_url)
+        database_tls_ok = database_tls_enabled or database_tls_required or _is_ssl_url(database_url)
         record(
             "database-url",
             database_tls_ok,
             "warning",
-            "DATABASE_URL is configured with TLS/SSL." if database_tls_ok else "DATABASE_URL is present but does not enforce TLS/SSL.",
+            (
+                "Database configuration is protected with TLS/SSL."
+                if database_tls_ok
+                else "Database URL is present but does not enforce TLS/SSL."
+            ),
         )
     if sbc_endpoint:
         record(
@@ -439,7 +457,10 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
         "quarantine_dir": quarantine_dir,
         "data_retention_days": data_retention_days,
         "data_retention_cron_schedule": data_retention_cron_schedule,
-        "database_url": database_url,
+        "database_backend": database_backend,
+        "database_configured": database_configured,
+        "database_tls_required": database_tls_required,
+        "database_tls_enabled": database_tls_enabled,
         "sbc_api_key_present": bool(api_keys),
         "sbc_endpoint": sbc_endpoint,
         "crypto_signing_key_present": bool(manifest_signing_key),

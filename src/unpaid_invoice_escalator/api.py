@@ -45,6 +45,8 @@ from unpaid_invoice_escalator.models import (
     RetentionVariant,
     SettlementBankDetailRecord,
 )
+from unpaid_invoice_escalator.persistence.database_config import resolve_database_config
+from unpaid_invoice_escalator.persistence.factory import PostgreSQLPersistenceNotImplementedError, build_store_and_ledger
 from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
 from unpaid_invoice_escalator.rulepacks import RulePackLoader, RulePackValidationError
 from unpaid_invoice_escalator.services.dual_ledger_engine import DualLedgerEngine
@@ -991,6 +993,7 @@ def _validate_export_filename(filename: str, *, field_name: str) -> str:
 def create_app(
     *,
     db_path: str = "data/escalator.db",
+    database_url: str | None = None,
     artifacts_dir: str = "data/artifacts",
     bundles_dir: str = "data/bundles",
     manifest_signing_key: str = "dev-only-signing-key",
@@ -1033,9 +1036,20 @@ def create_app(
         configured_env["FCD_ALLOWED_UPLOAD_EXTENSIONS"] = ",".join(allowed_upload_extensions)
     if quarantine_dir is not None:
         configured_env["FCD_QUARANTINE_DIR"] = quarantine_dir
-    configured_env["DATABASE_URL"] = db_path
 
-    runtime_cfg = resolve_runtime_config(configured_env, default_app_env="development", auth_enabled=auth_enabled)
+    database_target = resolve_database_config(configured_env, db_path=db_path, database_url=database_url)
+    if database_url is not None and str(database_url).strip():
+        configured_env["DATABASE_URL"] = str(database_url).strip()
+    elif "DATABASE_URL" not in configured_env and str(db_path).strip():
+        configured_env["DATABASE_URL"] = str(db_path).strip()
+
+    runtime_cfg = resolve_runtime_config(
+        configured_env,
+        default_app_env="development",
+        auth_enabled=auth_enabled,
+        database_url=database_target.database_url,
+        db_path=db_path,
+    )
     effective_env = runtime_cfg["app_env"].lower()
     manifest_signing_key = runtime_cfg["manifest_signing_key"]
     manifest_key_id = runtime_cfg["manifest_key_id"]
@@ -1113,7 +1127,9 @@ def create_app(
         rate_limit_alert_threshold=effective_rate_limit_threshold,
         server_error_alert_threshold=effective_server_error_threshold,
     )
-    store = SQLiteStore(db_path)
+    if database_target.backend == "postgresql":
+        raise PostgreSQLPersistenceNotImplementedError("PostgreSQL persistence is not implemented yet.")
+    store = SQLiteStore(database_target.sqlite_path or db_path)
     ledger = SQLiteInvoiceLedger(store)
     rule_pack_loader = RulePackLoader()
     jurisdiction_engine = JurisdictionEngine(rule_pack_loader=rule_pack_loader)
