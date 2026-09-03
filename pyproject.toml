@@ -36,4 +36,5 @@ unpaid_invoice_escalator = [
     "rulepacks/*.json",
     "rulepacks/packs/*.json",
     "rulepacks/fee_packs/*.json",
+    "persistence/migrations/postgresql/*.sql",
 ]

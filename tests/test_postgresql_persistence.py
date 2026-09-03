@@ -5,6 +5,7 @@ import threading
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
+from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import uuid4
@@ -16,6 +17,12 @@ from unpaid_invoice_escalator.persistence.migrations.postgresql.postgresql_migra
 )
 from unpaid_invoice_escalator.persistence.postgresql_store import PostgreSQLStore
 from unpaid_invoice_escalator.services.postgresql_invoice_ledger import PostgreSQLInvoiceLedger
+
+
+def test_postgresql_migration_sql_is_packaged() -> None:
+    migration_file = files("unpaid_invoice_escalator.persistence.migrations.postgresql").joinpath("0001_initial.sql")
+    assert migration_file.is_file()
+    assert migration_file.read_text(encoding="utf-8")
 
 
 class PostgreSQLPersistenceIntegrationTests(unittest.TestCase):
