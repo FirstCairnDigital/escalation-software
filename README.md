@@ -13,6 +13,7 @@ Credit-control and evidence-assembly software for B2B invoice recovery workflows
 - Deterministic escalation state machine with hard-stop/off-ramp handling.
 - Append-only tamper-evident ledger with SHA-256 chain verification.
 - SQLite persistence with triggers preventing `UPDATE`/`DELETE` on evidence tables.
+- PostgreSQL 18 foundation work is in progress: migration runner, connection boundary, append-only protections, and ledger append semantics; production PostgreSQL persistence is not switched on yet for live startup.
 - Signed ledger manifests (JSON + PDF) and verification endpoint.
 - Late-payment calculator with BoE base-rate reference data and ledger logging.
 - Dual-ledger engine with strict debtor-claim and FCD-client-fee isolation.
@@ -29,12 +30,34 @@ Credit-control and evidence-assembly software for B2B invoice recovery workflows
 
 ## Requirements
 - Python 3.11+
+- PostgreSQL 18 test/development database for integration work
 
 Install dependencies:
 
 ```powershell
 pip install -e .
 ```
+
+### PostgreSQL 18 local integration database
+
+Use the official PostgreSQL 18 image for local validation and migration checks:
+
+```powershell
+docker run --rm -d --name p26003-postgres \
+  -e POSTGRES_DB=fcd_test \
+  -e POSTGRES_USER=fcd_test \
+  -e POSTGRES_PASSWORD=super-secret-postgres-test-password \
+  -p 5432:5432 \
+  postgres:18.6-alpine
+```
+
+Set the test database URL before running PostgreSQL integration tests:
+
+```powershell
+$env:POSTGRES_TEST_DATABASE_URL = "postgresql://fcd_test:super-secret-postgres-test-password@localhost:5432/fcd_test?sslmode=disable"
+```
+
+The application remains on SQLite for normal development startup. PostgreSQL persistence is not switched on for production startup until Phase 15B2/15C.
 
 ## Run the API
 

@@ -16,6 +16,20 @@ jobs:
   quality-gates:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_DB: fcd_test
+          POSTGRES_USER: fcd_test
+          POSTGRES_PASSWORD: super-secret-postgres-test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U fcd_test -d fcd_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
 
     steps:
       - name: Check out repository
@@ -39,6 +53,11 @@ jobs:
 
       - name: Run unit tests
         run: python -m unittest discover -s tests
+
+      - name: Run PostgreSQL integration tests
+        env:
+          POSTGRES_TEST_DATABASE_URL: postgresql://fcd_test:super-secret-postgres-test-password@127.0.0.1:5432/fcd_test?sslmode=disable
+        run: python -m unittest discover -s tests -p "test_postgresql_persistence.py"
 
       - name: Validate packaging metadata
         run: pip check
