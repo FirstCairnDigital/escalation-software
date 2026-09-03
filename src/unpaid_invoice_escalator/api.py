@@ -47,6 +47,7 @@ from unpaid_invoice_escalator.models import (
 )
 from unpaid_invoice_escalator.persistence.database_config import resolve_database_config
 from unpaid_invoice_escalator.persistence.factory import build_store_and_ledger
+from unpaid_invoice_escalator.persistence.postgresql_connection import postgresql_connection
 from unpaid_invoice_escalator.rulepacks import RulePackLoader, RulePackValidationError
 from unpaid_invoice_escalator.services.dual_ledger_engine import DualLedgerEngine
 from unpaid_invoice_escalator.services.case_health_check import CaseHealthCheck
@@ -90,6 +91,33 @@ from unpaid_invoice_escalator.ui import (
 
 SAFE_UPLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 UPLOAD_READ_CHUNK_BYTES = 64 * 1024
+POSTGRES_APPEND_ONLY_TABLES = (
+    "invoices",
+    "ledger_events",
+    "evidence_artifacts",
+    "debtor_ledger_entries",
+    "client_fee_entries",
+    "pre_overdue_hygiene_records",
+    "compliance_ledger_entries",
+    "audit_trail_entries",
+    "debtor_verification_cases",
+    "communications",
+    "communication_delivery_events",
+    "reported_payments",
+    "reported_payment_decisions",
+    "reported_payment_evidence_links",
+    "payment_plan_agreements",
+    "payment_plan_installments",
+    "payment_plan_payments",
+    "payment_plan_decisions",
+    "settlement_offers",
+    "settlement_acceptances",
+    "settlement_offer_finalizations",
+    "dispute_carve_outs",
+    "settlement_bank_detail_records",
+    "company_status_checks",
+    "restricted_case_notes",
+)
 
 
 @dataclass(frozen=True)
@@ -1037,16 +1065,11 @@ def create_app(
         configured_env["FCD_QUARANTINE_DIR"] = quarantine_dir
 
     database_target = resolve_database_config(configured_env, db_path=db_path, database_url=database_url)
-    if database_url is not None and str(database_url).strip():
-        configured_env["DATABASE_URL"] = str(database_url).strip()
-    elif "DATABASE_URL" not in configured_env and str(db_path).strip():
-        configured_env["DATABASE_URL"] = str(db_path).strip()
-
     runtime_cfg = resolve_runtime_config(
         configured_env,
         default_app_env="development",
         auth_enabled=auth_enabled,
-        database_url=database_target.database_url,
+        database_url=database_url,
         db_path=db_path,
     )
     effective_env = runtime_cfg["app_env"].lower()
@@ -1060,6 +1083,15 @@ def create_app(
         raise ValueError("Authentication is enabled but no API keys were configured.")
     if effective_env == "production" and manifest_signing_key == "dev-only-signing-key":
         raise ValueError("Production mode requires FCD_MANIFEST_SIGNING_KEY or explicit manifest_signing_key.")
+    if effective_env == "production":
+        if not database_target.configured or database_target.source == "db_path":
+            raise ValueError("Production requires an explicit DATABASE_URL; db_path fallback is not permitted.")
+        if database_target.backend != "postgresql":
+            raise ValueError("Production requires PostgreSQL persistence; SQLite is not permitted.")
+        if not (database_target.tls_required and database_target.tls_enabled):
+            raise ValueError(
+                "Production PostgreSQL DATABASE_URL must use sslmode=require, sslmode=verify-ca, or sslmode=verify-full."
+            )
     require_explicit_client_mapping = effective_env == "production" and effective_auth_enabled
     require_explicit_identity_mapping = effective_env == "production" and effective_auth_enabled
     client_mapping_validation = validate_api_client_mappings(configured_keys, configured_clients)
@@ -1332,16 +1364,24 @@ def create_app(
         def add_runtime_check(name: str, passed: bool, detail: str) -> None:
             checks.append({"check": name, "passed": passed, "severity": "error", "detail": detail})
 
-        try:
-            conn = sqlite3.connect(db_path)
+        if database_target.backend == "postgresql":
             try:
-                conn.execute("PRAGMA foreign_keys = ON")
-                conn.execute("SELECT 1").fetchone()
-            finally:
-                conn.close()
-            add_runtime_check("database-connectivity", True, "SQLite connection successful.")
-        except sqlite3.Error as exc:
-            add_runtime_check("database-connectivity", False, f"SQLite connectivity failed: {exc}")
+                with postgresql_connection(database_target.database_url) as conn:
+                    conn.execute("SELECT 1").fetchone()
+                add_runtime_check("database-connectivity", True, "PostgreSQL connectivity successful.")
+            except Exception:
+                add_runtime_check("database-connectivity", False, "PostgreSQL connectivity failed.")
+        else:
+            try:
+                conn = sqlite3.connect(db_path)
+                try:
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    conn.execute("SELECT 1").fetchone()
+                finally:
+                    conn.close()
+                add_runtime_check("database-connectivity", True, "SQLite connection successful.")
+            except sqlite3.Error as exc:
+                add_runtime_check("database-connectivity", False, f"SQLite connectivity failed: {exc}")
 
         for check_name, directory in (
             ("artifacts-directory-writable", artifacts_root),
@@ -1402,27 +1442,74 @@ def create_app(
             "trg_communication_delivery_events_no_update",
             "trg_communication_delivery_events_no_delete",
         )
-        try:
-            conn = sqlite3.connect(db_path)
+        if database_target.backend == "postgresql":
             try:
-                conn.execute("PRAGMA foreign_keys = ON")
-                rows = conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_%'"
-                ).fetchall()
-            finally:
-                conn.close()
-            trigger_names = {str(row[0]) for row in rows}
-            missing_triggers = sorted(name for name in required_append_only_triggers if name not in trigger_names)
-            if missing_triggers:
-                add_runtime_check(
-                    "append-only-triggers",
-                    False,
-                    "Missing append-only triggers: " + ", ".join(missing_triggers),
-                )
-            else:
-                add_runtime_check("append-only-triggers", True, "Append-only triggers detected for protected tables.")
-        except sqlite3.Error as exc:
-            add_runtime_check("append-only-triggers", False, f"Trigger verification failed: {exc}")
+                with postgresql_connection(database_target.database_url) as conn:
+                    schema_migrations = conn.execute(
+                        "SELECT COUNT(*) AS count FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'schema_migrations'"
+                    ).fetchone()
+                    if int(schema_migrations["count"]) == 0:
+                        add_runtime_check("schema-migrations", False, "PostgreSQL schema migrations table is missing.")
+                    else:
+                        applied = conn.execute("SELECT COUNT(*) AS count FROM schema_migrations").fetchone()
+                        add_runtime_check(
+                            "schema-migrations",
+                            int(applied["count"]) > 0,
+                            "PostgreSQL schema migrations are present."
+                            if int(applied["count"]) > 0
+                            else "PostgreSQL schema migrations have not been applied.",
+                        )
+                    rows = conn.execute(
+                        """
+                        SELECT c.relname AS table_name, t.tgname
+                        FROM pg_trigger t
+                        JOIN pg_class c ON c.oid = t.tgrelid
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname = 'public'
+                          AND NOT t.tgisinternal
+                          AND t.tgname LIKE '%_append_only_guard_%'
+                        """
+                    ).fetchall()
+                trigger_names = {str(row["tgname"]) for row in rows}
+                expected = {
+                    f"{table_name}_append_only_guard_update" for table_name in POSTGRES_APPEND_ONLY_TABLES
+                } | {
+                    f"{table_name}_append_only_guard_delete" for table_name in POSTGRES_APPEND_ONLY_TABLES
+                }
+                missing_triggers = sorted(name for name in expected if name not in trigger_names)
+                if missing_triggers:
+                    add_runtime_check(
+                        "append-only-triggers",
+                        False,
+                        "Missing PostgreSQL append-only protections for one or more protected tables.",
+                    )
+                else:
+                    add_runtime_check("append-only-triggers", True, "PostgreSQL append-only protections detected.")
+            except Exception:
+                add_runtime_check("schema-migrations", False, "PostgreSQL migration state check failed.")
+                add_runtime_check("append-only-triggers", False, "PostgreSQL append-only protections check failed.")
+        else:
+            try:
+                conn = sqlite3.connect(db_path)
+                try:
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    rows = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_%'"
+                    ).fetchall()
+                finally:
+                    conn.close()
+                trigger_names = {str(row[0]) for row in rows}
+                missing_triggers = sorted(name for name in required_append_only_triggers if name not in trigger_names)
+                if missing_triggers:
+                    add_runtime_check(
+                        "append-only-triggers",
+                        False,
+                        "Missing append-only triggers: " + ", ".join(missing_triggers),
+                    )
+                else:
+                    add_runtime_check("append-only-triggers", True, "Append-only triggers detected for protected tables.")
+            except sqlite3.Error as exc:
+                add_runtime_check("append-only-triggers", False, f"Trigger verification failed: {exc}")
 
         return checks
 
@@ -1437,6 +1524,10 @@ def create_app(
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "environment": effective_env,
             "auth_enabled": effective_auth_enabled,
+            "database_backend": database_target.backend,
+            "database_configured": bool(database_target.configured),
+            "database_tls_required": database_target.tls_required,
+            "database_tls_enabled": database_target.tls_enabled,
             "manifest_key_id": manifest_key_id,
             "verification_key_ids": sorted(verification_keys.keys()),
             "api_client_mapping_count": client_mapping_validation["mapped_count"],

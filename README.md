@@ -12,8 +12,9 @@ Credit-control and evidence-assembly software for B2B invoice recovery workflows
 - Versioned jurisdiction rule packs (England & Wales, Scotland, Northern Ireland).
 - Deterministic escalation state machine with hard-stop/off-ramp handling.
 - Append-only tamper-evident ledger with SHA-256 chain verification.
-- SQLite persistence with triggers preventing `UPDATE`/`DELETE` on evidence tables.
-- PostgreSQL 18 foundation work is in progress: migration runner, connection boundary, append-only protections, and ledger append semantics; production PostgreSQL persistence is not switched on yet for live startup.
+- SQLite persistence remains available for development/reference use.
+- PostgreSQL 18 is selectable through `DATABASE_URL`, runs versioned migrations at startup, and uses database-enforced append-only protections.
+- Production startup now requires PostgreSQL with TLS (`sslmode=require`, `sslmode=verify-ca`, or `sslmode=verify-full`) and refuses SQLite/db-path fallback.
 - Signed ledger manifests (JSON + PDF) and verification endpoint.
 - Late-payment calculator with BoE base-rate reference data and ledger logging.
 - Dual-ledger engine with strict debtor-claim and FCD-client-fee isolation.
@@ -57,7 +58,7 @@ Set the test database URL before running PostgreSQL integration tests:
 $env:POSTGRES_TEST_DATABASE_URL = "postgresql://fcd_test:super-secret-postgres-test-password@localhost:5432/fcd_test?sslmode=disable"
 ```
 
-The application remains on SQLite for normal development startup. PostgreSQL persistence is not switched on for production startup until Phase 15B2/15C.
+The application still defaults to SQLite for normal development startup when no `DATABASE_URL` is configured. Explicit PostgreSQL remains supported for local/CI integration work, and production requires PostgreSQL with TLS.
 
 ## Run the API
 
@@ -115,6 +116,7 @@ $env:FCD_DATA_RETENTION_CRON_SCHEDULE="0 2 * * *"
 
 Notes:
 - `FCD_APP_ENV=production` enforces non-default signing keys.
+- `DATABASE_URL` must be a PostgreSQL URL with `sslmode=require`, `sslmode=verify-ca`, or `sslmode=verify-full`.
 - API keys are supplied via `x-api-key` header.
 - Role levels: `viewer` (read), `operator` (write), `admin` (metrics/ops).
 - `FCD_API_CLIENTS` maps each API credential to one explicit client.

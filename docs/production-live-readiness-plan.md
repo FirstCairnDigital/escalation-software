@@ -59,6 +59,13 @@ Completion gate:
 
 Introduce a production persistence seam and move the data layer to PostgreSQL without changing the wider domain behaviour.
 
+Status:
+
+- 15A complete;
+- 15B1 complete;
+- 15B2 complete;
+- 15C complete.
+
 Required outputs:
 
 - define the persistence boundary and configuration seam;

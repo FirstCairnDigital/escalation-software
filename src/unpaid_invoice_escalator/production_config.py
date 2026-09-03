@@ -6,12 +6,7 @@ from __future__ import annotations
 import os
 from typing import Any, Mapping
 
-from unpaid_invoice_escalator.persistence.database_config import resolve_database_config
-
-
-def _is_ssl_url(value: str) -> bool:
-    lowered = value.lower()
-    return "sslmode=require" in lowered or "ssl=true" in lowered or "ssl=1" in lowered or "?sslmode=verify-full" in lowered
+from unpaid_invoice_escalator.persistence.database_config import DatabaseConfig, resolve_database_config
 
 
 def _csv_tokens(value: str) -> tuple[str, ...]:
@@ -74,11 +69,6 @@ def resolve_runtime_config(
     db_path: str | None = None,
 ) -> dict[str, Any]:
     effective_env = dict(env or os.environ)
-    if database_url is not None and str(database_url).strip():
-        effective_env["DATABASE_URL"] = str(database_url).strip()
-    elif "DATABASE_URL" not in effective_env and db_path is not None and str(db_path).strip():
-        effective_env["DATABASE_URL"] = str(db_path).strip()
-
     app_env, _, _ = _env_value(effective_env, "FCD_APP_ENV", default=default_app_env)
     app_env = (app_env or default_app_env).strip() or default_app_env
     effective_auth_enabled = auth_enabled if auth_enabled is not None else app_env.lower() == "production"
@@ -117,7 +107,24 @@ def resolve_runtime_config(
         "DATA_RETENTION_CRON_SCHEDULE",
     )
     database_url_value, _, _ = _env_value(effective_env, "DATABASE_URL")
-    database_target = resolve_database_config(effective_env, db_path=db_path or "data/escalator.db")
+    database_resolution_error = ""
+    try:
+        database_target = resolve_database_config(
+            effective_env,
+            db_path=db_path or "data/escalator.db",
+            database_url=database_url,
+        )
+    except ValueError as exc:
+        database_target = DatabaseConfig(
+            backend="invalid",
+            database_url=database_url_value or "",
+            sqlite_path=None,
+            configured=bool(database_url_value),
+            source="configured_database_url" if database_url_value else "db_path",
+            tls_required=False,
+            tls_enabled=False,
+        )
+        database_resolution_error = str(exc)
     sbc_endpoint, _, _ = _env_value(effective_env, "SBC_ENDPOINT")
 
     def parse_positive_int(raw: str, *, field_name: str) -> int:
@@ -210,8 +217,10 @@ def resolve_runtime_config(
         "database_url": database_url_value or "",
         "database_backend": database_target.backend,
         "database_configured": bool(database_target.configured),
+        "database_source": database_target.source,
         "database_tls_required": database_target.tls_required,
         "database_tls_enabled": database_target.tls_enabled,
+        "database_resolution_error": database_resolution_error,
         "sbc_endpoint": sbc_endpoint,
         "legacy_aliases": legacy_aliases,
     }
@@ -253,8 +262,10 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
     database_url = runtime["database_url"]
     database_backend = runtime.get("database_backend", "sqlite")
     database_configured = bool(runtime.get("database_configured", bool(database_url)))
+    database_source = str(runtime.get("database_source", "db_path"))
     database_tls_required = bool(runtime.get("database_tls_required", False))
     database_tls_enabled = bool(runtime.get("database_tls_enabled", False))
+    database_resolution_error = str(runtime.get("database_resolution_error", "") or "")
     sbc_endpoint = runtime["sbc_endpoint"]
     legacy_aliases = runtime["legacy_aliases"]
 
@@ -419,16 +430,46 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
             "warning",
             f"{legacy_aliases['data_retention_cron_schedule']} was used as a legacy alias; migrate to FCD_DATA_RETENTION_CRON_SCHEDULE.",
         )
+    record(
+        "database-configured",
+        database_configured and database_source != "db_path",
+        "error",
+        (
+            "Production DATABASE_URL is explicitly configured."
+            if database_configured and database_source != "db_path"
+            else "Production requires an explicit DATABASE_URL; db_path fallback is not permitted."
+        ),
+    )
+    record(
+        "database-backend",
+        database_backend == "postgresql" and not database_resolution_error,
+        "error",
+        (
+            "Production database backend is PostgreSQL."
+            if database_backend == "postgresql" and not database_resolution_error
+            else (database_resolution_error or "Production requires PostgreSQL; SQLite is not permitted.")
+        ),
+    )
+    database_tls_ok = database_backend == "postgresql" and database_tls_required and database_tls_enabled
+    record(
+        "database-tls",
+        database_tls_ok,
+        "error",
+        (
+            "Production PostgreSQL TLS is enabled."
+            if database_tls_ok
+            else "Production PostgreSQL DATABASE_URL must use sslmode=require, sslmode=verify-ca, or sslmode=verify-full."
+        ),
+    )
     if database_url:
-        database_tls_ok = database_tls_enabled or database_tls_required or _is_ssl_url(database_url)
         record(
-            "database-url",
-            database_tls_ok,
-            "warning",
+            "database-url-present",
+            not database_resolution_error,
+            "error",
             (
-                "Database configuration is protected with TLS/SSL."
-                if database_tls_ok
-                else "Database URL is present but does not enforce TLS/SSL."
+                "Database URL is present."
+                if not database_resolution_error
+                else database_resolution_error
             ),
         )
     if sbc_endpoint:
@@ -459,6 +500,7 @@ def validate_production_config(env: Mapping[str, Any] | None = None, *, auth_ena
         "data_retention_cron_schedule": data_retention_cron_schedule,
         "database_backend": database_backend,
         "database_configured": database_configured,
+        "database_source": database_source,
         "database_tls_required": database_tls_required,
         "database_tls_enabled": database_tls_enabled,
         "sbc_api_key_present": bool(api_keys),

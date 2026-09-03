@@ -2687,6 +2687,7 @@ class TestApi(unittest.TestCase):
         valid = validate_production_config(
             {
                 "FCD_APP_ENV": "production",
+                "DATABASE_URL": "postgresql://app:fake-password@db.example.com:5432/fcd?sslmode=require",
                 "FCD_MANIFEST_SIGNING_KEY": "A" * 32,
                 "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
                 "FCD_MANIFEST_VERIFY_KEYS": "fcd-kms-key-1:" + ("B" * 32),
@@ -2714,6 +2715,7 @@ class TestApi(unittest.TestCase):
         config = validate_production_config(
             {
                 "FCD_APP_ENV": "production",
+                "DATABASE_URL": "postgresql://app:fake-password@db.example.com:5432/fcd?sslmode=require",
                 "FCD_MANIFEST_SIGNING_KEY": "C" * 32,
                 "CRYPTO_SIGNING_KEY": "LEGACY-SECRET",
                 "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
@@ -2746,6 +2748,7 @@ class TestApi(unittest.TestCase):
         missing_mapping = validate_production_config(
             {
                 "FCD_APP_ENV": "production",
+                "DATABASE_URL": "postgresql://app:fake-password@db.example.com:5432/fcd?sslmode=require",
                 "FCD_MANIFEST_SIGNING_KEY": "A" * 32,
                 "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
                 "FCD_API_KEYS": "admin-key:admin,ops-key:operator",
@@ -2769,6 +2772,7 @@ class TestApi(unittest.TestCase):
         stale_mapping = validate_production_config(
             {
                 "FCD_APP_ENV": "production",
+                "DATABASE_URL": "postgresql://app:fake-password@db.example.com:5432/fcd?sslmode=require",
                 "FCD_MANIFEST_SIGNING_KEY": "A" * 32,
                 "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
                 "FCD_API_KEYS": "admin-key:admin",
@@ -2793,6 +2797,7 @@ class TestApi(unittest.TestCase):
         missing_identity = validate_production_config(
             {
                 "FCD_APP_ENV": "production",
+                "DATABASE_URL": "postgresql://app:fake-password@db.example.com:5432/fcd?sslmode=require",
                 "FCD_MANIFEST_SIGNING_KEY": "A" * 32,
                 "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
                 "FCD_API_KEYS": "admin-key:admin,ops-key:operator",
@@ -2816,6 +2821,7 @@ class TestApi(unittest.TestCase):
         stale_identity = validate_production_config(
             {
                 "FCD_APP_ENV": "production",
+                "DATABASE_URL": "postgresql://app:fake-password@db.example.com:5432/fcd?sslmode=require",
                 "FCD_MANIFEST_SIGNING_KEY": "A" * 32,
                 "FCD_MANIFEST_KEY_ID": "fcd-kms-key-1",
                 "FCD_API_KEYS": "admin-key:admin",
@@ -2857,7 +2863,7 @@ class TestApi(unittest.TestCase):
                     allowed_upload_content_types=("application/pdf",),
                     allowed_upload_extensions=(".pdf",),
                     quarantine_dir=str(Path(tmp_dir) / "quarantine"),
-                    app_env="production",
+                    app_env="development",
                 )
                 ready = TestClient(app).get("/ready")
             finally:

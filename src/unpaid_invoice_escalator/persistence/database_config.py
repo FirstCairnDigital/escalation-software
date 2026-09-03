@@ -77,7 +77,7 @@ def _postgres_tls_status(value: str) -> tuple[bool, bool]:
     if sslmode is None:
         sslmode = "disable"
     tls_required = sslmode in VALID_POSTGRES_TLS_MODES
-    tls_enabled = tls_required or sslmode in {"require"}
+    tls_enabled = tls_required
     return tls_required, tls_enabled
 
 
@@ -113,7 +113,7 @@ def resolve_database_config(
             backend="sqlite",
             database_url=candidate,
             sqlite_path=sqlite_path,
-            configured=True,
+            configured=source != "db_path",
             source=source,
             tls_required=False,
             tls_enabled=False,
@@ -125,7 +125,7 @@ def resolve_database_config(
             backend="postgresql",
             database_url=candidate,
             sqlite_path=None,
-            configured=True,
+            configured=source != "db_path",
             source=source,
             tls_required=tls_required,
             tls_enabled=tls_enabled,
@@ -139,7 +139,7 @@ def resolve_database_config(
             backend="sqlite",
             database_url=candidate,
             sqlite_path=candidate,
-            configured=True,
+            configured=source != "db_path",
             source=source,
             tls_required=False,
             tls_enabled=False,

@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory, mkdtemp
 import unittest
 import json
 import sqlite3
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -14,6 +15,7 @@ from unpaid_invoice_escalator.api import create_app
 from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
 from unpaid_invoice_escalator.security import ApiSecurityController
 from unpaid_invoice_escalator.services.debtor_verification_portal import DebtorVerificationPortal
+from unpaid_invoice_escalator.services.sqlite_invoice_ledger import SQLiteInvoiceLedger
 from unpaid_invoice_escalator.ui import render_invoice_workspace_html
 
 
@@ -296,31 +298,37 @@ class TestApiSecurity(unittest.TestCase):
     def test_production_explicit_client_mapping_preserves_cross_client_isolation(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "api-prod-tenant.db")
-            app = create_app(
-                db_path=db_path,
-                artifacts_dir=str(Path(tmp_dir) / "artifacts"),
-                bundles_dir=str(Path(tmp_dir) / "bundles"),
-                app_env="production",
-                auth_enabled=True,
-                api_keys={
-                    "client-a-key": "operator",
-                    "client-b-key": "operator",
-                    "admin-key": "admin",
-                },
-                api_clients={
-                    "client-a-key": "CLIENT-A",
-                    "client-b-key": "CLIENT-B",
-                    "admin-key": "FCD-ADMIN",
-                },
-                api_identities={
-                    "client-a-key": "ACTOR-CLIENT-A",
-                    "client-b-key": "ACTOR-CLIENT-B",
-                    "admin-key": "ACTOR-ADMIN",
-                },
-                rate_limit_per_minute=100,
-                manifest_signing_key="production-signing-key",
-                manifest_key_id="fcd-kms-key-1",
-            )
+            def sqlite_factory(**_: object) -> tuple[SQLiteStore, SQLiteInvoiceLedger]:
+                store = SQLiteStore(db_path)
+                return store, SQLiteInvoiceLedger(store)
+
+            with patch("unpaid_invoice_escalator.api.build_store_and_ledger", side_effect=sqlite_factory):
+                app = create_app(
+                    db_path=db_path,
+                    database_url="postgresql://app:fake-password@db.example.com:5432/fcd?sslmode=require",
+                    artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                    bundles_dir=str(Path(tmp_dir) / "bundles"),
+                    app_env="production",
+                    auth_enabled=True,
+                    api_keys={
+                        "client-a-key": "operator",
+                        "client-b-key": "operator",
+                        "admin-key": "admin",
+                    },
+                    api_clients={
+                        "client-a-key": "CLIENT-A",
+                        "client-b-key": "CLIENT-B",
+                        "admin-key": "FCD-ADMIN",
+                    },
+                    api_identities={
+                        "client-a-key": "ACTOR-CLIENT-A",
+                        "client-b-key": "ACTOR-CLIENT-B",
+                        "admin-key": "ACTOR-ADMIN",
+                    },
+                    rate_limit_per_minute=100,
+                    manifest_signing_key="production-signing-key",
+                    manifest_key_id="fcd-kms-key-1",
+                )
             client = TestClient(app)
 
             create_a = client.post(
@@ -362,6 +370,7 @@ class TestApiSecurity(unittest.TestCase):
             db_path = str(Path(tmp_dir) / "api-prod-mapping.db")
             kwargs = {
                 "db_path": db_path,
+                "database_url": "postgresql://app:fake-password@db.example.com:5432/fcd?sslmode=require",
                 "artifacts_dir": str(Path(tmp_dir) / "artifacts"),
                 "bundles_dir": str(Path(tmp_dir) / "bundles"),
                 "app_env": "production",
@@ -459,6 +468,7 @@ class TestApiSecurity(unittest.TestCase):
             with self.assertRaises(ValueError):
                 create_app(
                     db_path=db_path,
+                    database_url="postgresql://app:fake-password@db.example.com:5432/fcd?sslmode=require",
                     artifacts_dir=str(Path(tmp_dir) / "artifacts"),
                     bundles_dir=str(Path(tmp_dir) / "bundles"),
                     app_env="production",
@@ -466,18 +476,24 @@ class TestApiSecurity(unittest.TestCase):
                     api_keys={"admin-key": "admin"},
                 )
 
-            app = create_app(
-                db_path=db_path,
-                artifacts_dir=str(Path(tmp_dir) / "artifacts"),
-                bundles_dir=str(Path(tmp_dir) / "bundles"),
-                app_env="production",
-                auth_enabled=True,
-                api_keys={"admin-key": "admin"},
-                api_clients={"admin-key": "FCD-ADMIN"},
-                api_identities={"admin-key": "ACTOR-ADMIN"},
-                manifest_signing_key="production-signing-key",
-                manifest_key_id="fcd-kms-key-1",
-            )
+            def sqlite_factory(**_: object) -> tuple[SQLiteStore, SQLiteInvoiceLedger]:
+                store = SQLiteStore(db_path)
+                return store, SQLiteInvoiceLedger(store)
+
+            with patch("unpaid_invoice_escalator.api.build_store_and_ledger", side_effect=sqlite_factory):
+                app = create_app(
+                    db_path=db_path,
+                    database_url="postgresql://app:fake-password@db.example.com:5432/fcd?sslmode=require",
+                    artifacts_dir=str(Path(tmp_dir) / "artifacts"),
+                    bundles_dir=str(Path(tmp_dir) / "bundles"),
+                    app_env="production",
+                    auth_enabled=True,
+                    api_keys={"admin-key": "admin"},
+                    api_clients={"admin-key": "FCD-ADMIN"},
+                    api_identities={"admin-key": "ACTOR-ADMIN"},
+                    manifest_signing_key="production-signing-key",
+                    manifest_key_id="fcd-kms-key-1",
+                )
             client = TestClient(app)
             metrics_resp = client.get("/metrics", headers={"x-api-key": "admin-key"})
             self.assertEqual(metrics_resp.status_code, 200)
