@@ -49,6 +49,7 @@ from unpaid_invoice_escalator.models import (
 )
 from unpaid_invoice_escalator.persistence.migrations.postgresql.postgresql_migrations import PostgreSQLMigrationRunner
 from unpaid_invoice_escalator.persistence.postgresql_connection import postgresql_connection
+from unpaid_invoice_escalator.services.invoice_ledger import InvoiceLedger
 from unpaid_invoice_escalator.tenant_context import current_client_id, current_role
 
 
@@ -206,6 +207,16 @@ class PostgreSQLStore:
                         f"Concurrent ledger mutation detected for invoice {event.invoice_id}: "
                         f"expected previous hash {expected_previous_hash!r}, got {event.previous_hash!r}."
                     )
+                hash_value = event.hash or InvoiceLedger._hash_event(
+                    event_id=event.event_id,
+                    invoice_id=event.invoice_id,
+                    timestamp=event.timestamp,
+                    actor=event.actor,
+                    event_type=event.event_type,
+                    data_payload=event.data_payload,
+                    previous_hash=event.previous_hash,
+                )
+                payload_for_insert = json.dumps(event.data_payload, sort_keys=True, separators=(",", ":"), default=str)
                 conn.execute(
                     """
                     INSERT INTO ledger_events (
@@ -219,9 +230,9 @@ class PostgreSQLStore:
                         event.timestamp,
                         event.actor.value,
                         event.event_type,
-                        event.data_payload,
+                        payload_for_insert,
                         event.previous_hash,
-                        event.hash,
+                        hash_value,
                     ),
                 )
 
@@ -460,7 +471,7 @@ class PostgreSQLStore:
                         contractual_recovery_clause_present, proof_of_delivery_required, suggested_clause_text,
                         suggested_clause_requires_legal_review, checklist_complete, missing_items_json,
                         warning_tier, format_warnings_json, notes
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         record.record_id,
@@ -483,9 +494,9 @@ class PostgreSQLStore:
                         record.suggested_clause_text,
                         record.suggested_clause_requires_legal_review,
                         record.checklist_complete,
-                        list(record.missing_items),
+                        json.dumps(list(record.missing_items), separators=(",", ":")),
                         record.warning_tier,
-                        list(record.format_warnings),
+                        json.dumps(list(record.format_warnings), separators=(",", ":")),
                         record.notes,
                     ),
                 )
@@ -550,7 +561,7 @@ class PostgreSQLStore:
                         entry.invoice_id,
                         entry.timestamp,
                         entry.event_type,
-                        entry.details,
+                        json.dumps(entry.details, sort_keys=True, separators=(",", ":"), default=str),
                     ),
                 )
 
@@ -569,7 +580,7 @@ class PostgreSQLStore:
                         entry.category,
                         entry.action,
                         entry.actor,
-                        entry.details,
+                        json.dumps(entry.details, sort_keys=True, separators=(",", ":"), default=str),
                     ),
                 )
 
@@ -1062,24 +1073,25 @@ class PostgreSQLStore:
             return
         with self.connection() as conn:
             with conn.transaction():
-                conn.executemany(
-                    """
-                    INSERT INTO payment_plan_installments (
-                        installment_id, plan_id, invoice_id, due_date, amount_gbp, sequence_number
-                    ) VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    [
-                        (
-                            item.installment_id,
-                            item.plan_id,
-                            item.invoice_id,
-                            item.due_date,
-                            item.amount_gbp,
-                            item.sequence_number,
-                        )
-                        for item in installments
-                    ],
-                )
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        """
+                        INSERT INTO payment_plan_installments (
+                            installment_id, plan_id, invoice_id, due_date, amount_gbp, sequence_number
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        [
+                            (
+                                item.installment_id,
+                                item.plan_id,
+                                item.invoice_id,
+                                item.due_date,
+                                item.amount_gbp,
+                                item.sequence_number,
+                            )
+                            for item in installments
+                        ],
+                    )
 
     def payment_plan_agreements_for_invoice(self, invoice_id: str) -> tuple[PaymentPlanAgreement, ...]:
         with self.connection() as conn:
@@ -1521,7 +1533,7 @@ class PostgreSQLStore:
                         check.official_register_url,
                         check.review_due_date,
                         check.notes,
-                        list(check.restrictions_recommended),
+                        json.dumps(list(check.restrictions_recommended), separators=(",", ":")),
                     ),
                 )
 

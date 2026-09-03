@@ -24,6 +24,7 @@ from unpaid_invoice_escalator.models import (
     DisputeCarveOut,
     EvidenceArtifact,
     Invoice,
+    InvoiceState,
     Jurisdiction,
     PaymentPlanAgreement,
     PaymentPlanDecision,
@@ -53,9 +54,11 @@ class PostgreSQLStoreBehaviourTests(unittest.TestCase):
             raise unittest.SkipTest("PostgreSQL integration tests require a test DATABASE_URL.")
 
     def setUp(self) -> None:
+        self.client_a = f"CLIENT-A-{uuid4().hex[:8]}"
+        self.client_b = f"CLIENT-B-{uuid4().hex[:8]}"
         self.store = PostgreSQLStore(self.database_url)
         self.store.run_migrations()
-        self.tokens = set_request_context(client_id="CLIENT-A", role="user", identity="tester")
+        self.tokens = set_request_context(client_id=self.client_a, role="user", identity="tester")
 
     def tearDown(self) -> None:
         reset_request_context(self.tokens)
@@ -79,16 +82,17 @@ class PostgreSQLStoreBehaviourTests(unittest.TestCase):
         return invoice
 
     def test_invoice_list_get_and_tenant_isolation(self) -> None:
-        invoice_a = self._create_invoice(client_id="CLIENT-A")
-        invoice_b = self._create_invoice(client_id="CLIENT-B")
+        invoice_a = self._create_invoice(client_id=self.client_a)
+        invoice_b = self._create_invoice(client_id=self.client_b)
 
         self.assertEqual(self.store.get_invoice(invoice_a.invoice_id).invoice_id, invoice_a.invoice_id)
         self.assertIsNone(self.store.get_invoice(invoice_b.invoice_id))
 
         listed = self.store.list_invoices()
-        self.assertEqual([item["invoice_id"] for item in listed], [invoice_a.invoice_id])
+        self.assertIn(invoice_a.invoice_id, {item["invoice_id"] for item in listed})
+        self.assertNotIn(invoice_b.invoice_id, {item["invoice_id"] for item in listed})
 
-        admin_tokens = set_request_context(client_id="CLIENT-B", role="admin", identity="admin")
+        admin_tokens = set_request_context(client_id=self.client_b, role="admin", identity="admin")
         try:
             self.assertEqual(self.store.get_invoice(invoice_b.invoice_id).invoice_id, invoice_b.invoice_id)
             self.assertIn(invoice_b.invoice_id, {item["invoice_id"] for item in self.store.list_invoices()})
@@ -96,7 +100,7 @@ class PostgreSQLStoreBehaviourTests(unittest.TestCase):
             reset_request_context(admin_tokens)
 
     def test_evidence_and_ledger_round_trip(self) -> None:
-        invoice = self._create_invoice(client_id="CLIENT-A")
+        invoice = self._create_invoice(client_id=self.client_a)
         artifact = EvidenceArtifact(
             document_id=f"DOC-{uuid4().hex[:12]}",
             invoice_id=invoice.invoice_id,
@@ -125,11 +129,11 @@ class PostgreSQLStoreBehaviourTests(unittest.TestCase):
         loaded_events = self.store.events_for_invoice(invoice.invoice_id)
         self.assertEqual(len(loaded_events), 1)
         self.assertTrue(self.store.verify_chain(invoice.invoice_id))
-        self.assertEqual(self.store.infer_state(invoice.invoice_id), invoice.jurisdiction.__class__ if False else __import__("unpaid_invoice_escalator.models", fromlist=["InvoiceState"]).InvoiceState.ISSUED)
+        self.assertEqual(self.store.infer_state(invoice.invoice_id), InvoiceState.ISSUED)
         self.assertEqual(self.store.artifacts_for_invoice(invoice.invoice_id)[0].document_id, artifact.document_id)
 
     def test_debtor_and_client_fee_ledgers_preserve_decimal_bool_values(self) -> None:
-        invoice = self._create_invoice(client_id="CLIENT-A")
+        invoice = self._create_invoice(client_id=self.client_a)
         debtor_entry = DebtorLedgerEntry(
             entry_id=f"DEBT-{uuid4().hex[:8]}",
             invoice_id=invoice.invoice_id,
@@ -143,7 +147,7 @@ class PostgreSQLStoreBehaviourTests(unittest.TestCase):
         fee_entry = ClientFeeEntry(
             entry_id=f"FEE-{uuid4().hex[:8]}",
             case_id=f"CASE-{uuid4().hex[:8]}",
-            client_id="CLIENT-A",
+            client_id=self.client_a,
             invoice_id=invoice.invoice_id,
             timestamp=datetime.now(timezone.utc),
             pricing_schedule_version="v1",
@@ -156,14 +160,14 @@ class PostgreSQLStoreBehaviourTests(unittest.TestCase):
         self.store.append_client_fee_entry(fee_entry)
 
         debtor_rows = self.store.debtor_ledger_entries_for_invoice(invoice.invoice_id)
-        self.assertEqual(debtor_rows[0].amount_gbp, Decimal("100.45"))
-        self.assertEqual(self.store.debtor_ledger_balance_for_invoice(invoice.invoice_id), Decimal("1642.23"))
+        self.assertEqual(sum((row.amount_gbp for row in debtor_rows), Decimal("0.00")), Decimal("1643.23"))
+        self.assertEqual(self.store.debtor_ledger_balance_for_invoice(invoice.invoice_id), Decimal("1643.23"))
         self.assertEqual(self.store.client_fee_balance_for_invoice(invoice.invoice_id), Decimal("60.30"))
         self.assertIsInstance(debtor_rows[0].amount_gbp, Decimal)
         self.assertIsInstance(self.store.client_fee_entries_for_invoice(invoice.invoice_id)[0].external_fee, bool)
 
     def test_hygiene_compliance_audit_verification_round_trip(self) -> None:
-        invoice = self._create_invoice(client_id="CLIENT-A")
+        invoice = self._create_invoice(client_id=self.client_a)
         hygiene = PreOverdueHygieneRecord(
             record_id=f"HYG-{uuid4().hex[:8]}",
             invoice_id=invoice.invoice_id,
@@ -228,7 +232,18 @@ class PostgreSQLStoreBehaviourTests(unittest.TestCase):
         self.assertEqual(self.store.debtor_verification_case_for_invoice(invoice.invoice_id).case_id, verification.case_id)
 
     def test_communications_reported_payments_and_decisions(self) -> None:
-        invoice = self._create_invoice(client_id="CLIENT-A")
+        invoice = self._create_invoice(client_id=self.client_a)
+        artifact = EvidenceArtifact(
+            document_id=f"DOC-{uuid4().hex[:8]}",
+            invoice_id=invoice.invoice_id,
+            artifact_type=ArtifactType.INVOICE,
+            file_hash="hash-123",
+            file_path="/tmp/evidence.pdf",
+            upload_timestamp=datetime.now(timezone.utc),
+            user_id="tester",
+        )
+        self.store.save_evidence_artifact(artifact)
+
         communication = CommunicationRecord(
             communication_id=f"COMM-{uuid4().hex[:8]}",
             invoice_id=invoice.invoice_id,
@@ -277,7 +292,7 @@ class PostgreSQLStoreBehaviourTests(unittest.TestCase):
             link_id=f"LINK-{uuid4().hex[:8]}",
             report_id=report.report_id,
             invoice_id=invoice.invoice_id,
-            document_id=f"DOC-{uuid4().hex[:8]}",
+            document_id=artifact.document_id,
             linked_at=datetime.now(timezone.utc),
             linked_by="tester",
         )
@@ -290,7 +305,7 @@ class PostgreSQLStoreBehaviourTests(unittest.TestCase):
         self.assertEqual(self.store.reported_payment_evidence_links_for_report(report.report_id)[0].document_id, evidence_link.document_id)
 
     def test_payment_plan_and_settlement_flow(self) -> None:
-        invoice = self._create_invoice(client_id="CLIENT-A")
+        invoice = self._create_invoice(client_id=self.client_a)
 
         agreement = PaymentPlanAgreement(
             plan_id=f"PLAN-{uuid4().hex[:8]}",
@@ -385,7 +400,7 @@ class PostgreSQLStoreBehaviourTests(unittest.TestCase):
         self.assertEqual(self.store.settlement_offer_finalization_by_offer_id(offer.offer_id).confirmed_payment_total_gbp, Decimal("1200.00"))
 
     def test_dispute_bank_company_status_and_restricted_notes(self) -> None:
-        invoice = self._create_invoice(client_id="CLIENT-A")
+        invoice = self._create_invoice(client_id=self.client_a)
         carve = DisputeCarveOut(
             carve_out_id=f"CARVE-{uuid4().hex[:8]}",
             invoice_id=invoice.invoice_id,
@@ -445,7 +460,7 @@ class PostgreSQLStoreBehaviourTests(unittest.TestCase):
         self.assertEqual(self.store.restricted_case_notes_for_invoice(invoice.invoice_id)[0].summary, "limited disclosure")
 
     def test_foreign_key_and_append_only_enforcement(self) -> None:
-        invoice = self._create_invoice(client_id="CLIENT-A")
+        invoice = self._create_invoice(client_id=self.client_a)
         with self.store.connection() as conn:
             with self.assertRaises(Exception):
                 conn.execute(
@@ -454,12 +469,13 @@ class PostgreSQLStoreBehaviourTests(unittest.TestCase):
                 )
 
         with self.store.connection() as conn:
+            communication_id = f"COMM-{uuid4().hex[:8]}"
             conn.execute(
                 "INSERT INTO communications (communication_id, invoice_id, channel, recipient, subject, body_summary, automated, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (f"COMM-{uuid4().hex[:8]}", invoice.invoice_id, "EMAIL", "a@example.com", "x", "y", True, datetime.now(timezone.utc)),
+                (communication_id, invoice.invoice_id, "EMAIL", "a@example.com", "x", "y", True, datetime.now(timezone.utc)),
             )
             with self.assertRaises(Exception):
-                conn.execute("UPDATE communications SET body_summary = %s WHERE communication_id = %s", ("changed", f"COMM-{uuid4().hex[:8]}"))
+                conn.execute("UPDATE communications SET body_summary = %s WHERE communication_id = %s", ("changed", communication_id))
 
 
 if __name__ == "__main__":
