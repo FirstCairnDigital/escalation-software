@@ -13,6 +13,22 @@ from unpaid_invoice_escalator.production_config import validate_production_confi
 
 
 class PersistenceConfigurationTests(unittest.TestCase):
+    def test_create_app_sqlite_uses_factory_path_and_starts(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            db_path = str(Path(tmp_dir) / "dev.db")
+            app = create_app(db_path=db_path)
+            client = TestClient(app)
+            resp = client.get("/health")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json()["status"], "ok")
+
+    def test_create_app_postgresql_configuration_fails_via_factory(self) -> None:
+        with self.assertRaises(PostgreSQLPersistenceNotImplementedError):
+            create_app(
+                db_path="data/fallback.db",
+                database_url="postgresql://app:super-secret-database-password@db.example.com:5432/fcd?sslmode=require",
+            )
+
     def test_development_db_path_stays_sqlite(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = str(Path(tmp_dir) / "dev.db")

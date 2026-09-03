@@ -46,8 +46,7 @@ from unpaid_invoice_escalator.models import (
     SettlementBankDetailRecord,
 )
 from unpaid_invoice_escalator.persistence.database_config import resolve_database_config
-from unpaid_invoice_escalator.persistence.factory import PostgreSQLPersistenceNotImplementedError, build_store_and_ledger
-from unpaid_invoice_escalator.persistence.sqlite_store import SQLiteStore
+from unpaid_invoice_escalator.persistence.factory import build_store_and_ledger
 from unpaid_invoice_escalator.rulepacks import RulePackLoader, RulePackValidationError
 from unpaid_invoice_escalator.services.dual_ledger_engine import DualLedgerEngine
 from unpaid_invoice_escalator.services.case_health_check import CaseHealthCheck
@@ -1127,10 +1126,11 @@ def create_app(
         rate_limit_alert_threshold=effective_rate_limit_threshold,
         server_error_alert_threshold=effective_server_error_threshold,
     )
-    if database_target.backend == "postgresql":
-        raise PostgreSQLPersistenceNotImplementedError("PostgreSQL persistence is not implemented yet.")
-    store = SQLiteStore(database_target.sqlite_path or db_path)
-    ledger = SQLiteInvoiceLedger(store)
+    store, ledger = build_store_and_ledger(
+        env=configured_env,
+        db_path=db_path,
+        database_url=database_url,
+    )
     rule_pack_loader = RulePackLoader()
     jurisdiction_engine = JurisdictionEngine(rule_pack_loader=rule_pack_loader)
     runner = EscalationRunner(ledger=ledger, jurisdiction_engine=jurisdiction_engine)
